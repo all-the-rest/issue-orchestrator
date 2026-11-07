@@ -27,6 +27,7 @@ function json(args: string[]) {
 }
 
 const MERGE_FLAGS = { squash: '--squash', merge: '--merge', rebase: '--rebase' };
+const CHANGE_LOOKUP_LIMIT = 1000;
 
 export const github = {
   name: 'github',
@@ -63,9 +64,21 @@ export const github = {
     gh(['issue', 'edit', String(number), '--repo', project, '--remove-label', label]);
   },
 
+  hasLabel({ project, name }) {
+    const labels = json(['label', 'list', '--repo', project, '--limit', '1000', '--json', 'name']);
+    return Array.isArray(labels) && labels.some((label) => label.name === name);
+  },
+
+  getLabel({ project, name }) {
+    const labels = json([
+      'label', 'list', '--repo', project, '--limit', '1000', '--json', 'name,color,description',
+    ]);
+    return Array.isArray(labels) ? labels.find((label) => label.name === name) ?? null : null;
+  },
+
   comment({ project, number, body, kind = 'issue' }) {
     const command = kind === 'change' ? 'pr' : 'issue';
-    if (/<!--\s*git-issue-agent:[a-z-]+/.test(body)) {
+    if (/<!--\s*(?:git-issue-agent:[a-z-]+|issue-orchestrator:idempotency=)/.test(body)) {
       const existing = json([
         command, 'view', String(number), '--repo', project, '--json', 'comments',
       ]);
@@ -152,6 +165,29 @@ export const github = {
     return result.status;
   },
 
+  findChange({ project, head, base }) {
+    const existing = json([
+      'pr', 'list', '--repo', project, '--head', head, '--base', base, '--state', 'all',
+      '--limit', String(CHANGE_LOOKUP_LIMIT),
+      '--json', 'number,url,headRefName,baseRefName,state',
+    ]);
+    if (!Array.isArray(existing)) throw new Error('GitHub returned an invalid change-request list');
+    // gh paginates up to --limit; a full page at this safety cap may be truncated.
+    if (existing.length >= CHANGE_LOOKUP_LIMIT) {
+      throw new Error(`change-request lookup reached ${CHANGE_LOOKUP_LIMIT} results; refusing a potentially truncated match set`);
+    }
+    const matches = existing.filter((change) => change.headRefName === head && change.baseRefName === base);
+    if (matches.length > 1) {
+      throw new Error(`multiple change requests match ${head} -> ${base}; refusing ambiguous reuse`);
+    }
+    if (matches.length === 0) return null;
+    const [match] = matches;
+    if (match.state !== 'OPEN') {
+      throw new Error(`matching change request #${match.number} is ${match.state ?? 'in an unknown state'}; refusing duplicate creation`);
+    }
+    return { url: match.url ?? null, number: match.number, head, base, state: match.state, reused: true };
+  },
+
   merge({ project, number, method = 'squash', headSha }) {
     const flag = MERGE_FLAGS[method];
     if (!flag) throw new Error(`Unsupported merge method "${method}" (use squash, merge or rebase)`);
@@ -161,12 +197,8 @@ export const github = {
   },
 
   createChange({ project, head, base, title, bodyFile, draft = false }) {
-    const existing = json([
-      'pr', 'list', '--repo', project, '--head', head, '--base', base, '--state', 'open',
-      '--json', 'number,url,headRefName,baseRefName',
-    ]);
-    const match = existing.find((change) => change.headRefName === head && change.baseRefName === base);
-    if (match) return { url: match.url ?? null, number: match.number, head, base, reused: true };
+    const existing = this.findChange({ project, head, base });
+    if (existing) return existing;
     const args = [
       'pr', 'create', '--repo', project, '--head', head, '--base', base,
       '--title', title, '--body-file', bodyFile,

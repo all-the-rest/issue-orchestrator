@@ -7,6 +7,8 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { SQLiteStore } from '../dist/core/persistence.js';
+import { runJournaledSideEffect, sideEffectKey } from '../dist/core/side-effects.js';
+import { isAllowedWorkflowTransition, WORKFLOW_STATES } from '../dist/core/state-machine.js';
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'issue-orchestrator-sqlite-'));
 const SOURCE = pathToFileURL(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../dist/core/persistence.js')).href;
@@ -91,12 +93,13 @@ try {
   const tables = new Set(store.rows("SELECT name FROM sqlite_master WHERE type='table'").map((row) => row.name));
   for (const table of [
     'projects', 'work_items', 'events', 'jobs', 'job_transitions', 'agent_sessions',
-    'checks', 'artifacts', 'agent_servers', 'schema_migrations',
+    'checks', 'artifacts', 'agent_servers', 'schema_migrations', 'workflow_transitions', 'side_effect_journal',
   ]) assert.ok(tables.has(table), `migration should create ${table}`);
   const columns = (table) => new Set(store.rows(`PRAGMA table_info(${table})`).map((row) => row.name));
   for (const column of ['claimed_by', 'claimed_at', 'heartbeat_at', 'lease_expires_at', 'attempts', 'max_attempts', 'error_class']) {
     assert.ok(columns('jobs').has(column), `jobs should store ${column}`);
   }
+  assert.ok(columns('jobs').has('workflow_state'), 'jobs should store guarded workflow progress');
   for (const column of ['session_id', 'branch', 'base_sha', 'head_sha', 'change_number', 'evidence_commit', 'error_class']) {
     assert.ok(columns('agent_sessions').has(column), `agent_sessions should store ${column}`);
   }
@@ -106,22 +109,34 @@ try {
   assert.equal(Number(store.rows('PRAGMA foreign_keys')[0].foreign_keys), 1);
   assert.equal(store.rows('PRAGMA journal_mode')[0].journal_mode, 'wal');
   assert.equal(Number(store.rows('PRAGMA busy_timeout')[0].timeout), 5000);
-  assert.equal(store.rows('SELECT version FROM schema_migrations').length, 1);
+  assert.equal(store.rows('SELECT version FROM schema_migrations').length, 2);
   store.close();
   store = new SQLiteStore(migrationFile);
-  assert.equal(store.rows('SELECT version FROM schema_migrations').length, 1, 'reopening must not reapply migrations');
+  assert.equal(store.rows('SELECT version FROM schema_migrations').length, 2, 'reopening must not reapply migrations');
   store.close();
   ok('empty database receives all schema migrations with WAL/foreign keys, and restart is idempotent');
+
+  const upgradeFile = path.join(TMP, 'v1-upgrade', 'orchestrator.sqlite3');
+  store = new SQLiteStore(upgradeFile);
+  const upgradeJob = store.claimWorkItem('example/project', 299, { workerId: 'v1-upgrade' });
+  store.db.prepare("UPDATE jobs SET stage='evidence-published' WHERE id=?").run(upgradeJob.id);
+  store.db.exec('DROP TABLE side_effect_journal; DROP TABLE workflow_transitions; ALTER TABLE jobs DROP COLUMN workflow_state; DELETE FROM schema_migrations WHERE version=2');
+  store.close();
+  store = new SQLiteStore(upgradeFile);
+  assert.equal(store.rows('SELECT workflow_state FROM jobs WHERE id=?', upgradeJob.id)[0].workflow_state, 'EVIDENCE_PUBLISHED');
+  assert.equal(store.rows('SELECT MAX(version) AS version FROM schema_migrations')[0].version, 2);
+  store.close();
+  ok('v1 jobs retain their workflow meaning when the additive migration is applied');
 
   const futureSchema = path.join(TMP, 'future-schema', 'orchestrator.sqlite3');
   fs.mkdirSync(path.dirname(futureSchema), { recursive: true });
   const futureDb = new DatabaseSync(futureSchema);
   futureDb.exec('CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)');
-  futureDb.prepare('INSERT INTO schema_migrations(version, applied_at) VALUES (2, ?)').run(new Date().toISOString());
+  futureDb.prepare('INSERT INTO schema_migrations(version, applied_at) VALUES (3, ?)').run(new Date().toISOString());
   futureDb.close();
   assert.throws(() => new SQLiteStore(futureSchema), /newer than supported version/);
   const stillFutureDb = new DatabaseSync(futureSchema);
-  assert.equal(Number(stillFutureDb.prepare('SELECT MAX(version) AS version FROM schema_migrations').get().version), 2);
+  assert.equal(Number(stillFutureDb.prepare('SELECT MAX(version) AS version FROM schema_migrations').get().version), 3);
   stillFutureDb.close();
   ok('a database with a newer schema version is rejected without being downgraded');
 
@@ -238,6 +253,7 @@ try {
   const exhausted = store.reapExpiredLeases(Date.parse(lastAllowedAttempt.lease_expires_at) + 1000);
   assert.equal(exhausted[0].state, 'FAILED');
   assert.equal(store.rows('SELECT state FROM work_items WHERE external_id=?', '201')[0].state, 'BLOCKED');
+  assert.equal(store.rows('SELECT workflow_state FROM jobs')[0].workflow_state, 'FAILED');
   assert.equal(store.claimWorkItem('example/project', 201), null);
   assert.equal(store.counts().jobs, 1, 'an exhausted item must not get a fresh job implicitly');
   assert.equal(store.rows('SELECT state, attempts FROM jobs')[0].state, 'FAILED');
@@ -249,6 +265,144 @@ try {
   assert.equal(store.counts().jobs, 1);
   store.close();
   ok('max-attempt failure stays blocked across retries and later events without an explicit requeue');
+
+  const workflowDb = path.join(TMP, 'workflow', 'orchestrator.sqlite3');
+  let workflowStore = new SQLiteStore(workflowDb);
+  const workflowJob = workflowStore.claimWorkItem('example/project', 250, { workerId: 'workflow-test' });
+  assert.ok(workflowJob);
+  const owner = workflowJob.owner_token;
+  const actors = ['cli', 'agent', 'human'];
+  for (const from of WORKFLOW_STATES) {
+    workflowStore.db.prepare('UPDATE jobs SET workflow_state=? WHERE owner_token=?').run(from, owner);
+    for (const to of WORKFLOW_STATES) {
+      for (const actor of actors) {
+        if (isAllowedWorkflowTransition(from, to, actor)) continue;
+        assert.throws(
+          () => workflowStore.transitionWorkflow(owner, to, actor, 'invalid matrix edge'),
+          /Invalid workflow transition/,
+          `${actor} must not transition ${from} -> ${to}`,
+        );
+      }
+    }
+  }
+  const validEdges = [
+    ['NEW', 'TRIAGED', 'agent'],
+    ['TRIAGED', 'READY', 'agent'],
+    ['READY', 'CLAIMED', 'cli'],
+    ['CLAIMED', 'TRIAGED', 'agent'],
+    ['TRIAGED', 'ISOLATED', 'agent'],
+    ['ISOLATED', 'BEFORE_CAPTURED', 'agent'],
+    ['BEFORE_CAPTURED', 'IMPLEMENTING', 'agent'],
+    ['IMPLEMENTING', 'IMPLEMENTED', 'agent'],
+  ];
+  workflowStore.db.prepare("UPDATE jobs SET workflow_state='NEW' WHERE owner_token=?").run(owner);
+  for (const [from, to, actor] of validEdges) {
+    assert.equal(workflowStore.workflowStateForOwner(owner), from);
+    assert.equal(workflowStore.transitionWorkflow(owner, to, actor, 'table-driven valid edge'), true);
+    workflowStore.close();
+    workflowStore = new SQLiteStore(workflowDb);
+    assert.equal(workflowStore.workflowStateForOwner(owner), to, 'workflow state survives restart after every transition');
+  }
+  workflowStore.db.prepare("UPDATE jobs SET workflow_state='CLAIMED' WHERE owner_token=?").run(owner);
+  assert.throws(
+    () => workflowStore.transitionWorkflow(owner, 'ISOLATED', 'agent', 'skip triage'),
+    /Invalid workflow transition/,
+    'isolation must not skip the triaged state',
+  );
+  workflowStore.db.prepare("UPDATE jobs SET workflow_state='IMPLEMENTED' WHERE owner_token=?").run(owner);
+  assert.throws(() => workflowStore.transitionWorkflow(owner, 'CHANGE_OPEN', 'cli', 'missing PR metadata'), /requires a persisted change number/);
+  workflowStore.transitionWorkflow(owner, 'BLOCKED', 'cli', 'terminal outcome');
+  assert.throws(() => workflowStore.transitionWorkflow(owner, 'NEEDS_INFO', 'human', 'second outcome'), /Invalid workflow transition/);
+  assert.equal(workflowStore.workflowStateForOwner(owner), 'BLOCKED', 'terminal outcomes cannot be overwritten');
+  workflowStore.close();
+  ok('table-driven guarded transitions reject every invalid state/actor edge and persist each valid step across restarts');
+
+  const journalDb = path.join(TMP, 'journal-crash', 'orchestrator.sqlite3');
+  let journalStore = new SQLiteStore(journalDb);
+  const journalJob = journalStore.claimWorkItem('example/project', 251, { workerId: 'journal-test' });
+  const journalOwner = journalJob.owner_token;
+  const identity = { target: 'issue#251', body_hash: 'sha256:fixture' };
+  const commentKey = sideEffectKey(journalStore, journalOwner, 'comment', identity);
+  const commentIntent = { ...identity, marker: commentKey };
+  journalStore.beginSideEffect({
+    ownerToken: journalOwner, idempotencyKey: commentKey, kind: 'comment', intent: commentIntent,
+  });
+  journalStore.close(); // crash after durable intent, before external write
+  let externalComment = false;
+  let commentWrites = 0;
+  journalStore = new SQLiteStore(journalDb);
+  const firstResume = runJournaledSideEffect({
+    store: journalStore,
+    ownerToken: journalOwner,
+    idempotencyKey: commentKey,
+    kind: 'comment',
+    intent: commentIntent,
+    reconcile: () => externalComment
+      ? { state: 'applied', result: { marker: commentKey } }
+      : { state: 'absent' },
+    apply: () => { commentWrites++; externalComment = true; return { created: true }; },
+  });
+  assert.equal(firstResume.reconciled, false);
+  assert.equal(commentWrites, 1);
+  assert.equal(journalStore.sideEffectsForJob(Number(journalJob.id))[0].status, 'COMPLETED');
+  journalStore.close();
+  journalStore = new SQLiteStore(journalDb);
+  const repeatedResume = runJournaledSideEffect({
+    store: journalStore,
+    ownerToken: journalOwner,
+    idempotencyKey: commentKey,
+    kind: 'comment',
+    intent: commentIntent,
+    reconcile: () => externalComment
+      ? { state: 'applied', result: { marker: commentKey } }
+      : { state: 'absent' },
+    apply: () => { commentWrites++; externalComment = true; return { created: true }; },
+  });
+  assert.equal(repeatedResume.reconciled, true);
+  assert.equal(commentWrites, 1, 'a reconciled comment is never written twice');
+
+  const changeIdentity = { head: 'fix/251', base: 'main' };
+  const changeKey = sideEffectKey(journalStore, journalOwner, 'change-create', changeIdentity);
+  journalStore.beginSideEffect({
+    ownerToken: journalOwner,
+    idempotencyKey: changeKey,
+    kind: 'change-create',
+    intent: changeIdentity,
+  });
+  let externalChangeExists = true; // crash after PR creation, before result journaling
+  journalStore.close();
+  journalStore = new SQLiteStore(journalDb);
+  let duplicateChangeCreates = 0;
+  const recoveredChange = runJournaledSideEffect({
+    store: journalStore,
+    ownerToken: journalOwner,
+    idempotencyKey: changeKey,
+    kind: 'change-create',
+    intent: changeIdentity,
+    reconcile: () => externalChangeExists
+      ? { state: 'applied', result: { number: 19, head: 'fix/251' } }
+      : { state: 'absent' },
+    apply: () => { duplicateChangeCreates++; externalChangeExists = true; },
+  });
+  assert.equal(recoveredChange.reconciled, true);
+  assert.equal(duplicateChangeCreates, 0, 'existing external change request is adopted rather than recreated');
+
+  const unknownKey = sideEffectKey(journalStore, journalOwner, 'evidence', { head: 'unknown' });
+  assert.throws(() => runJournaledSideEffect({
+    store: journalStore,
+    ownerToken: journalOwner,
+    idempotencyKey: unknownKey,
+    kind: 'evidence',
+    intent: { head: 'unknown' },
+    reconcile: () => ({ state: 'unknown', reason: 'remote unavailable' }),
+    apply: () => { throw new Error('must not write'); },
+  }), /Cannot safely reconcile/);
+  assert.equal(journalStore.sideEffectsForJob(Number(journalJob.id)).find((effect) => effect.idempotencyKey === unknownKey).status, 'UNCERTAIN');
+  assert.throws(() => journalStore.beginSideEffect({
+    ownerToken: journalOwner, idempotencyKey: commentKey, kind: 'comment', intent: { different: true },
+  }), /idempotency key collision/);
+  journalStore.close();
+  ok('crash-injected side-effect intents reconcile comments and change requests without duplicate writes and fail closed on unknown state');
 
   const legacyHome = path.join(TMP, 'legacy');
   const legacyDb = path.join(legacyHome, 'orchestrator.sqlite3');

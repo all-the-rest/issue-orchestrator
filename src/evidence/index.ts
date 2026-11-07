@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
+import { isDeepStrictEqual } from 'node:util';
 
 const MAX_FILE_BYTES = 50 * 1024 * 1024;
 const MAX_TOTAL_BYTES = 100 * 1024 * 1024;
@@ -90,6 +90,33 @@ function assertArtifactFormat(name, contents) {
   }
 }
 
+export function validateEvidenceDirectory(dir, issue) {
+  if (!Number.isSafeInteger(Number(issue)) || Number(issue) <= 0) throw new Error('issue must be a positive number');
+  if (!dir || !fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) {
+    throw new Error(`Evidence directory not found: ${dir}`);
+  }
+  const files = walk(dir).sort();
+  if (files.length === 0) throw new Error(`No files in evidence directory: ${dir}`);
+  const sides = new Set(files.map((file) => file.split('/')[0]));
+  if (!sides.has('before') || !sides.has('after')) {
+    throw new Error('Evidence must contain files under both before/ and after/');
+  }
+  let totalBytes = 0;
+  const targets = new Set();
+  for (const relative of files) {
+    const contents = fs.readFileSync(path.join(dir, ...relative.split('/')));
+    assertNoSecrets(relative, contents);
+    assertArtifactFormat(relative, contents);
+    if (contents.length > MAX_FILE_BYTES) {
+      throw new Error(`${relative} is ${(contents.length / 1024 / 1024).toFixed(1)} MB; compress it below 50 MB`);
+    }
+    totalBytes += contents.length;
+    if (totalBytes > MAX_TOTAL_BYTES) throw new Error('Evidence exceeds the total cap of 100 MB');
+    targets.add(`issue-${issue}-${relative.replace(/[^A-Za-z0-9._/-]+/g, '-').replaceAll('/', '-')}`);
+  }
+  if (targets.size !== files.length) throw new Error('Evidence file names collide after safe-path normalization');
+}
+
 export function verifyOrigin(project, root = git(['rev-parse', '--show-toplevel'])) {
   let remote;
   try {
@@ -137,11 +164,163 @@ export function verifyOrigin(project, root = git(['rev-parse', '--show-toplevel'
   return { remote, pushUrl };
 }
 
+export function reconcileEvidenceBranch({ project, issue, change, head, branch, expectedManifest, rawUrl }) {
+  const root = git(['rev-parse', '--show-toplevel']);
+  verifyOrigin(project, root);
+  const url = `https://github.com/${project}.git`;
+  const ref = `refs/heads/${branch}`;
+  const advertised = git(['ls-remote', '--heads', url, ref], { cwd: root });
+  if (!advertised) return null;
+  const remoteSha = advertised.split(/\s+/)[0];
+  if (!/^[a-f0-9]{40}$/i.test(remoteSha)) throw new Error('remote evidence branch returned an invalid commit SHA');
+  git(['fetch', '--no-tags', url, ref], { cwd: root });
+  const fetchedSha = git(['rev-parse', 'FETCH_HEAD'], { cwd: root });
+  if (fetchedSha !== remoteSha) throw new Error('remote evidence branch changed during reconciliation');
+
+  let manifestText;
+  let manifest;
+  try {
+    manifestText = git(['show', `${remoteSha}:manifest.json`], { cwd: root });
+    manifest = JSON.parse(manifestText);
+  } catch (error) {
+    throw new Error(`existing evidence branch has no valid manifest: ${(error as Error).message}`);
+  }
+  if (manifest.schema !== 1 || manifest.project !== project || Number(manifest.issue) !== Number(issue) ||
+      Number(manifest.change) !== Number(change) || manifest.head !== head.toLowerCase() ||
+      !Array.isArray(manifest.files) || manifest.files.length === 0) {
+    throw new Error('existing evidence branch manifest does not match this job; refusing to publish a duplicate');
+  }
+  if (!expectedManifest || !isDeepStrictEqual(manifest, expectedManifest)) {
+    throw new Error('existing evidence branch does not match the locally expected manifest and artifact hashes');
+  }
+
+  const treeOutput = git(['ls-tree', '-r', '-z', remoteSha], { cwd: root });
+  const tree = new Map();
+  if (!treeOutput.endsWith('\0')) throw new Error('evidence branch tree has malformed NUL-delimited records');
+  const records = treeOutput.slice(0, -1).split('\0');
+  if (records.length === 0 || records.some((record) => !record)) {
+    throw new Error('evidence branch tree has an empty or malformed record');
+  }
+  for (const record of records) {
+    const separator = record.indexOf('\t');
+    if (separator <= 0 || separator === record.length - 1) {
+      throw new Error('evidence branch tree contains a malformed entry');
+    }
+    const metadata = record.slice(0, separator).match(/^(\d{6}) (blob) ([a-f0-9]{40})$/i);
+    const filePath = record.slice(separator + 1);
+    if (!metadata || metadata[1] !== '100644' || tree.has(filePath)) {
+      throw new Error('evidence branch tree contains an unsupported or duplicate entry');
+    }
+    tree.set(filePath, { mode: metadata[1], sha: metadata[3] });
+  }
+  const expectedPaths = new Set(['manifest.json']);
+  for (const file of manifest.files) {
+    if (!file || typeof file.name !== 'string' || !file.name || expectedPaths.has(file.name)) {
+      throw new Error('evidence branch manifest has an invalid or duplicate artifact path');
+    }
+    expectedPaths.add(file.name);
+  }
+  if (tree.size !== expectedPaths.size || [...tree.keys()].some((filePath) => !expectedPaths.has(filePath))) {
+    throw new Error('evidence branch tree path set does not exactly match its manifest');
+  }
+  const manifestEntry = tree.get('manifest.json');
+  const canonicalManifest = `${JSON.stringify(manifest, null, 2)}\n`;
+  if (!manifestEntry || manifestEntry.mode !== '100644' ||
+      git(['hash-object', '--stdin'], { cwd: root, input: canonicalManifest }) !== manifestEntry.sha ||
+      tree.size !== manifest.files.length + 1) {
+    throw new Error('evidence branch manifest or tree is inconsistent');
+  }
+  const sides = new Set();
+  const names = new Set();
+  for (const file of manifest.files) {
+    const sourceParts = typeof file.source === 'string' ? file.source.split('/') : [];
+    if (sourceParts.length < 2 || !['before', 'after'].includes(sourceParts[0]) ||
+        sourceParts.some((part) => !part || part === '.' || part === '..') ||
+        typeof file.name !== 'string' || file.name !== `issue-${issue}-${file.source.replace(/[^A-Za-z0-9._/-]+/g, '-').replaceAll('/', '-')}` ||
+        names.has(file.name)) {
+      throw new Error('evidence branch contains an unsafe or duplicate manifest path');
+    }
+    const entry = tree.get(file.name);
+    if (!entry || entry.mode !== '100644' || entry.sha !== file.sha ||
+        !Number.isSafeInteger(file.bytes) || file.bytes <= 0 ||
+        Number(git(['cat-file', '-s', entry.sha], { cwd: root })) !== file.bytes ||
+        !/^[a-f0-9]{40}$/i.test(file.sha ?? '')) {
+      throw new Error(`evidence branch artifact does not match its manifest: ${file.name}`);
+    }
+    names.add(file.name);
+    if (typeof file.source === 'string') sides.add(file.source.split('/')[0]);
+  }
+  if (!sides.has('before') || !sides.has('after')) throw new Error('evidence branch must contain before/ and after/ artifacts');
+  return {
+    project,
+    issue: Number(issue),
+    change: Number(change),
+    head: head.toLowerCase(),
+    branch,
+    commit: remoteSha,
+    manifest: rawUrl({ project, ref: remoteSha, path: 'manifest.json' }),
+    files: manifest.files.map((file) => ({
+      source: file.source,
+      name: file.name,
+      bytes: file.bytes,
+      kind: file.kind,
+      url: rawUrl({ project, ref: remoteSha, path: file.name }),
+    })),
+  };
+}
+
 /**
  * Publish immutable, SHA-pinned evidence linked to one issue, PR and source
  * head. The configured GitHub project is checked against origin; the push URL
  * itself is canonical and never inferred from an arbitrary remote.
  */
+export function prepareEvidenceManifest({ project, issue, change, head, dir }) {
+  if (!project || !Number.isSafeInteger(Number(issue)) || Number(issue) <= 0) {
+    throw new Error('a project and positive issue number are required');
+  }
+  if (!Number.isSafeInteger(Number(change)) || Number(change) <= 0) {
+    throw new Error('--change must be a positive change-request number');
+  }
+  if (!/^[a-f0-9]{40}$/i.test(head ?? '')) throw new Error('--head must be a full 40-character commit SHA');
+  if (!dir || !fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) {
+    throw new Error(`Evidence directory not found: ${dir}`);
+  }
+
+  const root = git(['rev-parse', '--show-toplevel']);
+  verifyOrigin(project, root);
+  validateEvidenceDirectory(dir, Number(issue));
+  const files = walk(dir).sort();
+  let totalBytes = 0;
+  const entries = files.map((relative) => {
+    const abs = path.join(dir, ...relative.split('/'));
+    const contents = fs.readFileSync(abs);
+    assertNoSecrets(relative, contents);
+    assertArtifactFormat(relative, contents);
+    const bytes = contents.length;
+    if (bytes > MAX_FILE_BYTES) {
+      throw new Error(`${relative} is ${(bytes / 1024 / 1024).toFixed(1)} MB; compress it below 50 MB`);
+    }
+    totalBytes += bytes;
+    if (totalBytes > MAX_TOTAL_BYTES) throw new Error('Evidence exceeds the total cap of 100 MB');
+    const safePath = relative.replace(/[^A-Za-z0-9._/-]+/g, '-');
+    const target = `issue-${issue}-${safePath.replaceAll('/', '-')}`;
+    const sha = git(['hash-object', '-w', '--stdin'], { cwd: root, input: contents });
+    return { source: relative, name: target, sha, bytes, kind: kind(relative) };
+  });
+  if (new Set(entries.map((entry) => entry.name)).size !== entries.length) {
+    throw new Error('Evidence file names collide after safe-path normalization');
+  }
+  const manifest = {
+    schema: 1,
+    project,
+    issue: Number(issue),
+    change: Number(change),
+    head: head.toLowerCase(),
+    files: entries,
+  };
+  return { root, entries, manifest };
+}
+
 export function publishEvidence({
   project,
   issue,
@@ -149,6 +328,8 @@ export function publishEvidence({
   head,
   dir,
   branchPrefix = 'agent-evidence',
+  branch,
+  preparedEvidence,
   rawUrl,
 }) {
   if (!project || !Number.isSafeInteger(Number(issue)) || Number(issue) <= 0) {
@@ -164,47 +345,20 @@ export function publishEvidence({
   if (!/^[A-Za-z0-9._/-]+$/.test(branchPrefix) || branchPrefix.includes('..')) {
     throw new Error('unsafe evidence branch prefix');
   }
-
-  const root = git(['rev-parse', '--show-toplevel']);
+  const expectedPrefix = `${branchPrefix}-issue-${issue}-head-${head.slice(0, 12)}-`;
+  if (typeof branch !== 'string' || !branch.startsWith(expectedPrefix) ||
+      !/^[A-Za-z0-9._/-]+$/.test(branch) || branch.includes('..')) {
+    throw new Error('evidence branch is not bound to the configured job identity');
+  }
+  const prepared = preparedEvidence ?? prepareEvidenceManifest({ project, issue, change, head, dir });
+  const { root, entries, manifest } = prepared;
+  if (manifest.project !== project || Number(manifest.issue) !== Number(issue) ||
+      Number(manifest.change) !== Number(change) || manifest.head !== head.toLowerCase()) {
+    throw new Error('prepared evidence manifest does not match this job');
+  }
   verifyOrigin(project, root);
-  const files = walk(dir).sort();
-  if (files.length === 0) throw new Error(`No files in evidence directory: ${dir}`);
-  const sides = new Set(files.map((file) => file.split('/')[0]));
-  if (!sides.has('before') || !sides.has('after')) {
-    throw new Error('Evidence must contain files under both before/ and after/');
-  }
-
-  let totalBytes = 0;
-  const entries = files.map((relative) => {
-    const abs = path.join(dir, ...relative.split('/'));
-    const contents = fs.readFileSync(abs);
-    assertNoSecrets(relative, contents);
-    assertArtifactFormat(relative, contents);
-    const bytes = contents.length;
-    if (bytes > MAX_FILE_BYTES) {
-      throw new Error(`${relative} is ${(bytes / 1024 / 1024).toFixed(1)} MB; compress it below 50 MB`);
-    }
-    totalBytes += bytes;
-    if (totalBytes > MAX_TOTAL_BYTES) {
-      throw new Error(`Evidence exceeds the total cap of 100 MB`);
-    }
-    const safePath = relative.replace(/[^A-Za-z0-9._/-]+/g, '-');
-    const target = `issue-${issue}-${safePath.replaceAll('/', '-')}`;
-    const sha = git(['hash-object', '-w', '--stdin'], { cwd: root, input: contents });
-    return { source: relative, name: target, sha, bytes, kind: kind(relative) };
-  });
-  if (new Set(entries.map((entry) => entry.name)).size !== entries.length) {
-    throw new Error('Evidence file names collide after safe-path normalization');
-  }
-
-  const manifest = {
-    schema: 1,
-    project,
-    issue: Number(issue),
-    change: Number(change),
-    head: head.toLowerCase(),
-    files: entries,
-  };
+  const reconciled = reconcileEvidenceBranch({ project, issue, change, head, branch, expectedManifest: manifest, rawUrl });
+  if (reconciled) return reconciled;
   const manifestBytes = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`);
   const manifestSha = git(['hash-object', '-w', '--stdin'], { cwd: root, input: manifestBytes });
   const treeEntries = [
@@ -230,7 +384,6 @@ export function publishEvidence({
     throw new Error(`git commit-tree failed: ${(committed.stderr || '').trim()}`);
   }
   const commit = (committed.stdout || '').trim();
-  const branch = `${branchPrefix}-issue-${issue}-head-${head.slice(0, 12)}-${randomUUID().slice(0, 8)}`;
   git(['push', `https://github.com/${project}.git`, `${commit}:refs/heads/${branch}`], { cwd: root });
 
   return {

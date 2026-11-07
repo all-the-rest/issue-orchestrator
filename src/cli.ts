@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { COMMANDS, HELP, CliError, parseArgs } from './core/commands.js';
+import { COMMANDS, HELP, CliError, parseArgs, reconcilePendingSideEffects } from './core/commands.js';
 import { withMutationGuard } from './core/config.js';
 import { VERSION } from './version.js';
 
@@ -28,8 +28,14 @@ function main(): number {
   const handler = COMMANDS[command];
   if (!handler) throw new CliError(`Unknown command "${command}"\n\n${HELP}`);
 
-  const invoke = () => handler(opts) ?? 0;
-  return GUARDED.has(command) ? withMutationGuard(invoke) : invoke();
+  if (GUARDED.has(command)) {
+    return withMutationGuard(() => {
+      opts.reconciliation = reconcilePendingSideEffects(opts);
+      return handler(opts) ?? 0;
+    });
+  }
+  opts.reconciliation = withMutationGuard(() => reconcilePendingSideEffects(opts));
+  return handler(opts) ?? 0;
 }
 
 let exitCode = 0;
