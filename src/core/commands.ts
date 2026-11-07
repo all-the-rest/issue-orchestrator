@@ -2,7 +2,6 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { spawnSync } from 'node:child_process';
 import { isDeepStrictEqual } from 'node:util';
 import {
   configPath,
@@ -20,13 +19,13 @@ import {
   quarantineCorruptLegacyLock,
   parseJsonc,
 } from './config.js';
-import { getProvider } from '../providers/index.js';
+import { getCodeHost, getTracker } from '../providers/index.js';
+import { git } from '../git/index.js';
 import {
   containsSecretLikeContent,
   publishEvidence,
   prepareEvidenceManifest,
   reconcileEvidenceBranch,
-  verifyOrigin,
 } from '../evidence/index.js';
 import { getRuntimeStore } from './persistence.js';
 import { runJournaledSideEffect, sideEffectKey, type SideEffectObservation } from './side-effects.js';
@@ -52,7 +51,8 @@ const HELP = `Usage: issue-orchestrator <command> [args] [--config <path>]
   list [--project <p>] [--all-authors] [--limit <n>]
                                   open issues in queue order
   view <project> <issue>          issue body + comments, trusted flagged
-  account <user> [--provider <p>] verify the active provider CLI account
+  account <user> [--provider <p>] [--tracker <p>] [--code-host <p>]
+                                  verify the configured provider CLI account(s)
   origin-check <project>           verify current Git remotes before pushing
   claim <project> <issue> [--branch <b>] [--owner-token <token>] [--force --confirm-stale]
                                   claim, or resume with this run's owner token
@@ -141,13 +141,27 @@ function context(cfg, project) {
   } catch (error) {
     throw new CliError(error.message);
   }
-  return { rc, provider: getProvider(rc.provider) };
+  return { rc, tracker: getTracker(rc.tracker), codeHost: getCodeHost(rc.code_host) };
 }
 
-function verifyAccount(provider, rc) {
-  if (!rc.account) throw new CliError(`No account configured for ${rc.project}`);
-  if (!provider.verifyAccount) throw new CliError(`Provider ${provider.name} cannot verify CLI account identity`);
-  provider.verifyAccount(rc.account);
+function verifyAccount(tracker, codeHost, rc) {
+  const trackerAccount = rc.tracker_account ?? rc.account;
+  const codeHostAccount = rc.code_host_account ?? rc.account;
+  if (!trackerAccount && !codeHostAccount) throw new CliError(`No account configured for ${rc.project}`);
+  let verified = false;
+  if (tracker.name === 'github' && trackerAccount) {
+    tracker.verifyAccount(trackerAccount);
+    verified = true;
+  }
+  if (codeHost.name === 'github' && codeHostAccount &&
+      (tracker.name !== codeHost.name || trackerAccount !== codeHostAccount)) {
+    codeHost.verifyAccount(codeHostAccount);
+    verified = true;
+  }
+  if (!verified) {
+    if (typeof codeHost.verifyAccount !== 'function') throw new CliError(`Code host ${codeHost.name} cannot verify CLI account identity`);
+    codeHost.verifyAccount(codeHostAccount ?? trackerAccount);
+  }
 }
 
 function bodyFromFile(file) {
@@ -163,6 +177,21 @@ function assertOwner(lock, opts, operation) {
   const token = opts['owner-token'];
   if (!token || token === true || token !== lock.owner_token) {
     throw new CliError(`${operation} requires this run's --owner-token; the queue lock is owned by another run`);
+  }
+}
+
+function assertProviderIdentity(lock, rc, operation) {
+  let persistedProvider;
+  try {
+    persistedProvider = getRuntimeStore().providerForOwner(lock.owner_token);
+  } catch (error) {
+    throw new CliError(`${operation} refused: could not verify the active job's persisted provider (${error.message})`);
+  }
+  if (lock.provider !== rc.provider || persistedProvider !== rc.provider || lock.provider !== persistedProvider) {
+    throw new CliError(
+      `${operation} refused: configured tracker/code-host pair "${rc.provider}" does not match ` +
+      `active lock provider "${lock.provider}" and persisted job provider "${persistedProvider}"`,
+    );
   }
 }
 
@@ -185,6 +214,13 @@ function ownedLock(opts, { project, issue, change }: any = {}) {
   if (change !== undefined && Number(lock.change_number) !== Number(change)) {
     throw new CliError(`Active lock belongs to change request #${lock.change_number ?? 'unset'}, not #${change}`);
   }
+  let rc;
+  try {
+    rc = repoConfig(requireConfig(opts), lock.repo);
+  } catch (error) {
+    throw new CliError(error.message);
+  }
+  assertProviderIdentity(lock, rc, 'This operation');
   return lock;
 }
 
@@ -220,8 +256,12 @@ function labelNames(issue) {
   return issue.labels.map((label) => typeof label === 'string' ? label : label?.name).filter(Boolean);
 }
 
-function observeIssueLabel(provider, project, issue, label, action): SideEffectObservation {
-  const current = labelNames(provider.viewIssue({ project, number: issue }));
+function authorLogin(author) {
+  return typeof author === 'string' ? author : author?.login ?? null;
+}
+
+function observeIssueLabel(tracker, project, issue, label, action): SideEffectObservation {
+  const current = labelNames(tracker.getWorkItem({ project, number: issue }));
   if (!current) return { state: 'unknown', reason: 'tracker did not report issue labels' };
   const present = current.includes(label);
   return (action === 'add' ? present : !present)
@@ -229,16 +269,17 @@ function observeIssueLabel(provider, project, issue, label, action): SideEffectO
     : { state: 'absent' };
 }
 
-function journalIssueLabel({ lock, provider, project, issue, label, action }) {
+function journalIssueLabel({ lock, tracker, project, issue, label, action }) {
   return journaledWrite({
     lock,
     kind: `issue-label-${action}`,
     identity: { project, issue, label, action },
     intent: { project, issue, label, action },
-    reconcile: () => observeIssueLabel(provider, project, issue, label, action),
-    apply: () => action === 'add'
-      ? provider.addLabel({ project, number: issue, label })
-      : provider.removeLabel({ project, number: issue, label }),
+    reconcile: () => observeIssueLabel(tracker, project, issue, label, action),
+    apply: () => tracker.setLabels({
+      project, number: issue,
+      ...(action === 'add' ? { add: [label] } : { remove: [label] }),
+    }),
   });
 }
 
@@ -249,22 +290,22 @@ function finishRecoveredMergeLabels(store, effect, lock, opts) {
     throw new CliError('recovered merge has no complete project, issue or recovery owner');
   }
   const cfg = loadConfig(effect.configFile ?? configFile(opts));
-  const { rc, provider } = context(cfg, project);
+  const { rc, tracker, codeHost } = context(cfg, project);
   if (!rc.enabled) throw new CliError(`${project} is disabled; merge recovery will retain its lock until re-enabled`);
   if (rc.provider !== effect.provider) {
     throw new CliError(`provider changed from ${effect.provider} to ${rc.provider}; merge recovery labels were not finalized`);
   }
-  verifyAccount(provider, rc);
+  verifyAccount(tracker, codeHost, rc);
 
   const requiredLabelKeys = [];
   if (rc.labels.working) {
     const identity = { project, issue, label: rc.labels.working, action: 'remove' };
-    journalIssueLabel({ lock, provider, project, issue, label: rc.labels.working, action: 'remove' });
+    journalIssueLabel({ lock, tracker, project, issue, label: rc.labels.working, action: 'remove' });
     requiredLabelKeys.push(sideEffectKey(store, lock.owner_token, 'issue-label-remove', identity));
   }
   if (rc.labels.done) {
     const identity = { project, issue, label: rc.labels.done, action: 'add' };
-    journalIssueLabel({ lock, provider, project, issue, label: rc.labels.done, action: 'add' });
+    journalIssueLabel({ lock, tracker, project, issue, label: rc.labels.done, action: 'add' });
     requiredLabelKeys.push(sideEffectKey(store, lock.owner_token, 'issue-label-add', identity));
   }
   if (!store.finalizeMergedRecovery(lock.owner_token, effect.idempotencyKey, requiredLabelKeys)) {
@@ -273,18 +314,18 @@ function finishRecoveredMergeLabels(store, effect, lock, opts) {
   return true;
 }
 
-function observeComment(provider, project, number, kind, marker, expectedAuthor, expectedContentHash): SideEffectObservation {
-  const view = kind === 'change'
-    ? provider.viewChange({ project, number })
-    : provider.viewIssue({ project, number });
-  if (!Array.isArray(view?.comments)) return { state: 'unknown', reason: 'tracker did not report comments' };
-  const marked = view.comments.filter((comment) => typeof comment?.body === 'string' && comment.body.includes(marker));
+function observeComment(tracker, codeHost, project, number, kind, marker, expectedAuthor, expectedContentHash): SideEffectObservation {
+  const comments = kind === 'change'
+    ? codeHost.getChange({ project, number }).comments
+    : tracker.getComments({ project, number });
+  if (!Array.isArray(comments)) return { state: 'unknown', reason: `${kind === 'change' ? 'code host' : 'tracker'} did not report comments` };
+  const marked = comments.filter((comment) => typeof comment?.body === 'string' && comment.body.includes(marker));
   if (marked.length === 0) return { state: 'absent' };
   if (marked.length !== 1 || !expectedAuthor || !/^[a-f0-9]{64}$/i.test(expectedContentHash ?? '')) {
     return { state: 'unknown', reason: 'comment marker is duplicated or its intended author/content is unavailable' };
   }
   const comment = marked[0];
-  const author = comment.author?.login ?? comment.author;
+  const author = authorLogin(comment.author);
   const contentHash = createHash('sha256').update(comment.body).digest('hex');
   if (typeof author !== 'string' || author.toLowerCase() !== expectedAuthor.toLowerCase() || contentHash !== expectedContentHash) {
     return { state: 'unknown', reason: 'comment marker exists but its author or exact rendered content does not match the journaled intent' };
@@ -292,7 +333,7 @@ function observeComment(provider, project, number, kind, marker, expectedAuthor,
   return { state: 'applied', result: { project, number, kind, marker, author, content_sha256: contentHash } };
 }
 
-function journalComment({ lock, provider, project, number, kind, body, author }) {
+function journalComment({ lock, tracker, codeHost, project, number, kind, body, author }) {
   const bodyHash = createHash('sha256').update(body).digest('hex');
   const content = `${body}${body.endsWith('\n') ? '' : '\n'}\n`;
   const identity = { project, number, kind, body_sha256: bodyHash, actor: author };
@@ -309,16 +350,18 @@ function journalComment({ lock, provider, project, number, kind, body, author })
     idempotencyKey: key,
     kind: 'comment',
     intent,
-    reconcile: () => observeComment(provider, project, number, kind, marker, author, renderedHash),
-    apply: () => provider.comment({ project, number, body: renderedContent, kind }),
+    reconcile: () => observeComment(tracker, codeHost, project, number, kind, marker, author, renderedHash),
+    apply: () => kind === 'change'
+      ? codeHost.publishComment({ project, number, body: renderedContent })
+      : tracker.publishComment({ project, number, body: renderedContent }),
   });
 }
 
-function observeRepoLabel(provider, project, name, expected): SideEffectObservation {
-  if (typeof provider.getLabel !== 'function') {
-    return { state: 'unknown', reason: `provider ${provider.name} cannot inspect repository labels` };
+function observeRepoLabel(tracker, project, name, expected): SideEffectObservation {
+  if (typeof tracker.getLabel !== 'function') {
+    return { state: 'unknown', reason: `tracker ${tracker.name} cannot inspect repository labels` };
   }
-  const current = provider.getLabel({ project, name });
+  const current = tracker.getLabel({ project, name });
   if (!current) return { state: 'absent' };
   const matches = String(current.color ?? '').replace(/^#/, '').toUpperCase() === String(expected.color).toUpperCase() &&
     current.description === expected.description;
@@ -336,11 +379,11 @@ function inspectPendingSideEffect(effect, opts): SideEffectObservation {
 
   try {
     const cfg = loadConfig(effect.configFile ?? opts.config);
-    const { rc, provider } = context(cfg, project);
+    const { rc, tracker, codeHost } = context(cfg, project);
     if (rc.provider !== effect.provider) {
       return { state: 'unknown', reason: `configured provider changed from ${effect.provider} to ${rc.provider}` };
     }
-    verifyAccount(provider, rc);
+    verifyAccount(tracker, codeHost, rc);
 
     switch (effect.kind) {
       case 'issue-label-add':
@@ -349,29 +392,30 @@ function inspectPendingSideEffect(effect, opts): SideEffectObservation {
           return { state: 'unknown', reason: 'issue-label intent is incomplete' };
         }
         return observeIssueLabel(
-          provider, project, Number(intent.issue), intent.label,
+          tracker, project, Number(intent.issue), intent.label,
           effect.kind === 'issue-label-add' ? 'add' : 'remove',
         );
       case 'comment': {
         if (!Number.isSafeInteger(Number(intent.number)) || !['issue', 'change'].includes(intent.kind) ||
-            typeof intent.actor !== 'string' || intent.actor !== rc.account) {
+            typeof intent.actor !== 'string' ||
+            intent.actor !== (intent.kind === 'issue' ? rc.tracker_account : rc.code_host_account)) {
           return { state: 'unknown', reason: 'comment intent has no trusted configured actor' };
         }
         const marker = `<!-- issue-orchestrator:idempotency=${effect.idempotencyKey} -->`;
         return observeComment(
-          provider, project, Number(intent.number), intent.kind, marker,
+          tracker, codeHost, project, Number(intent.number), intent.kind, marker,
           intent.actor, intent.content_sha256,
         );
       }
       case 'ensure-label':
-        return observeRepoLabel(provider, project, intent.name, intent);
+        return observeRepoLabel(tracker, project, intent.name, intent);
       case 'change-create': {
-        if (typeof provider.findChange !== 'function' || typeof provider.viewChange !== 'function') {
-          return { state: 'unknown', reason: `provider ${provider.name} cannot inspect change requests` };
+        if (typeof codeHost.findChange !== 'function' || typeof codeHost.getChange !== 'function') {
+          return { state: 'unknown', reason: `code host ${codeHost.name} cannot inspect change requests` };
         }
-        const existing = provider.findChange({ project, head: intent.head, base: intent.base });
+        const existing = codeHost.findChange({ project, head: intent.head, base: intent.base });
         if (!existing) return { state: 'absent' };
-        const view = provider.viewChange({ project, number: Number(existing.number) });
+        const view = codeHost.getChange({ project, number: Number(existing.number) });
         if (view.state !== 'OPEN' || view.headRefName !== intent.head || view.headRefOid !== intent.head_sha ||
             view.baseRefName !== intent.base || !closesIssue(view.body, intent.issue)) {
           return { state: 'unknown', reason: 'existing change request does not match the journaled issue, branch, base and head' };
@@ -379,8 +423,8 @@ function inspectPendingSideEffect(effect, opts): SideEffectObservation {
         return { state: 'applied', result: existing };
       }
       case 'merge': {
-        if (typeof provider.viewChange !== 'function') {
-          return { state: 'unknown', reason: `provider ${provider.name} cannot inspect change requests` };
+        if (typeof codeHost.getChange !== 'function') {
+          return { state: 'unknown', reason: `code host ${codeHost.name} cannot inspect change requests` };
         }
         if (!Number.isSafeInteger(Number(effect.issue)) || Number(effect.issue) <= 0 ||
             !Number.isSafeInteger(Number(effect.changeNumber)) || Number(effect.changeNumber) <= 0 ||
@@ -396,15 +440,15 @@ function inspectPendingSideEffect(effect, opts): SideEffectObservation {
             typeof intent.owner_token !== 'string' || !intent.owner_token) {
           return { state: 'unknown', reason: 'merge intent does not match the persisted issue, PR, branch, base, head and owner' };
         }
-        const current = provider.viewChange({ project, number: Number(intent.number) });
+        const current = codeHost.getChange({ project, number: Number(intent.number) });
         if (Number(current.number) !== expectedNumber || current.headRefOid?.toLowerCase() !== expectedHead ||
             current.headRefName !== effect.branch || current.baseRefName !== rc.base_branch ||
             !closesIssue(current.body, expectedIssue)) {
           return { state: 'unknown', reason: 'observed PR does not match the exact persisted job, issue, branch, base and head' };
         }
-        const issue = provider.viewIssue({ project, number: expectedIssue });
+        const issue = tracker.getWorkItem({ project, number: expectedIssue });
         if (Number(issue.number) !== expectedIssue) {
-          return { state: 'unknown', reason: 'provider returned a different linked issue during merge recovery' };
+          return { state: 'unknown', reason: 'tracker returned a different linked issue during merge recovery' };
         }
         try {
           assertTrustedIssue(rc, issue, { allowClosed: true });
@@ -424,8 +468,8 @@ function inspectPendingSideEffect(effect, opts): SideEffectObservation {
         return { state: 'unknown', reason: `change request is ${current.state} or its head no longer matches` };
       }
       case 'evidence': {
-        if (typeof provider.rawUrl !== 'function') {
-          return { state: 'unknown', reason: `provider ${provider.name} cannot inspect remote evidence` };
+        if (typeof codeHost.evidenceUrl !== 'function') {
+          return { state: 'unknown', reason: `code host ${codeHost.name} cannot inspect remote evidence` };
         }
         if (!intent.expected_manifest || typeof intent.branch !== 'string') {
           return { state: 'unknown', reason: 'evidence intent lacks its locally expected manifest or scoped branch' };
@@ -437,7 +481,7 @@ function inspectPendingSideEffect(effect, opts): SideEffectObservation {
           head: intent.head,
           branch: intent.branch,
           expectedManifest: intent.expected_manifest,
-          rawUrl: (args) => provider.rawUrl(args),
+          rawUrl: (args) => codeHost.evidenceUrl(args),
         });
         return result ? { state: 'applied', result } : { state: 'absent' };
       }
@@ -549,7 +593,7 @@ function assertTrustedIssue(rc, issue, { allowClosed = false } = {}) {
   if (allowClosed && issue.state && !['OPEN', 'CLOSED'].includes(issue.state)) {
     throw new CliError(`Issue #${issue.number ?? '?'} has an unknown state; refused`);
   }
-  const author = issue.author?.login ?? issue.author ?? null;
+  const author = authorLogin(issue.author);
   if (!author || !rc.trusted_authors.includes(author)) {
     throw new CliError(`Issue #${issue.number ?? '?'} is not authored by a configured trusted author; refused`);
   }
@@ -579,15 +623,15 @@ function markerText(kind, head, issue, change, evidenceCommit = '') {
 
 function hasTrustedMarker(view, marker, authors) {
   return (view.comments ?? []).some((comment) =>
-    authors.has(comment.author?.login) && (comment.body ?? '').includes(marker)
+    authors.has(authorLogin(comment.author)) && (comment.body ?? '').includes(marker)
   );
 }
 
 function latestTrustedApproval(view, trustedAuthors, headSha) {
-  const prAuthor = view.author?.login;
+  const prAuthor = authorLogin(view.author);
   const latestByAuthor = new Map();
   for (const review of view.reviews ?? []) {
-    const login = review.author?.login;
+    const login = authorLogin(review.author);
     if (!login || login === prAuthor || !trustedAuthors.has(login) || !review.submittedAt) continue;
     const prior = latestByAuthor.get(login);
     if (!prior || Date.parse(review.submittedAt) > Date.parse(prior.submittedAt)) latestByAuthor.set(login, review);
@@ -622,7 +666,11 @@ function cmdStatus(opts) {
     return {
       project,
       provider: rc.provider,
+      tracker: rc.tracker,
+      code_host: rc.code_host,
       account: rc.account,
+      tracker_account: rc.tracker_account,
+      code_host_account: rc.code_host_account,
       enabled: rc.enabled,
       local_only: rc.local_only,
       auto_merge: rc.auto_merge,
@@ -642,6 +690,8 @@ function cmdStatus(opts) {
   console.log(JSON.stringify({
     config: cfg.__file,
     provider: cfg.provider ?? 'github',
+    tracker: cfg.tracker ?? cfg.defaults?.tracker ?? cfg.provider ?? 'github',
+    code_host: cfg.code_host ?? cfg.defaults?.code_host ?? cfg.provider ?? 'github',
     model: cfg.model ?? null,
     accounts: cfg.accounts ?? [],
     trusted_authors: cfg.trusted_authors ?? [],
@@ -662,10 +712,10 @@ function cmdList(opts) {
   const issues = [];
 
   for (const project of projects) {
-    const { rc, provider } = context(cfg, project);
+    const { rc, tracker, codeHost } = context(cfg, project);
     if (!rc.enabled) continue;
-    verifyAccount(provider, rc);
-    const raw = provider.listIssues({ project, limit: Number(opts.limit ?? 100) });
+    verifyAccount(tracker, codeHost, rc);
+    const raw = tracker.listWorkItems({ project, limit: Number(opts.limit ?? 100) });
     const blocked = new Set(
       [rc.labels.working, rc.labels.done, rc.labels.blocked, rc.labels.review, rc.labels.needs_info]
         .filter(Boolean),
@@ -675,7 +725,7 @@ function cmdList(opts) {
         typeof label === 'string' ? label : label.name
       ));
       if (labels.some((label) => blocked.has(label))) continue;
-      const author = item.author?.login ?? item.author ?? null;
+      const author = authorLogin(item.author);
       if (containsSecretLikeContent(item.title ?? '')) {
         throw new CliError(`Issue #${item.number} title looks like it contains a credential; discovery refused`);
       }
@@ -707,10 +757,10 @@ function cmdList(opts) {
 function cmdView(opts) {
   const cfg = requireConfig(opts);
   const [project, number] = requirePositional(opts._.slice(0, 2), 'view <project> <issue>');
-  const { rc, provider } = context(cfg, project);
+  const { rc, tracker, codeHost } = context(cfg, project);
   assertEnabled(rc, project);
-  verifyAccount(provider, rc);
-  const issue = provider.viewIssue({ project, number: Number(number) });
+  verifyAccount(tracker, codeHost, rc);
+  const issue = tracker.getWorkItem({ project, number: Number(number) });
   assertTrustedIssue(rc, issue);
   if (containsSecretLikeFields(issue)) {
     throw new CliError(`Issue #${number} contains credential-like content; refusing to expose it to the model`);
@@ -718,7 +768,7 @@ function cmdView(opts) {
   const trusted = new Set(rc.trusted_authors);
   const comments = (issue.comments ?? []).map((comment) => ({
     ...comment,
-    trusted: trusted.has(comment.author?.login),
+    trusted: trusted.has(authorLogin(comment.author)),
   }));
   console.log(JSON.stringify({
     ...issue,
@@ -730,23 +780,27 @@ function cmdView(opts) {
 
 function cmdAccount(opts) {
   const cfg = requireConfig(opts);
-  const [user] = requirePositional(opts._, 'account <user> [--provider <p>]');
+  const [user] = requirePositional(opts._, 'account <user> [--provider <p>] [--tracker <p>] [--code-host <p>]');
   if (!(cfg.accounts ?? []).includes(user)) throw new CliError(`account "${user}" is not listed in config.accounts`);
-  const provider = getProvider(opts.provider ?? cfg.provider ?? 'github');
-  if (!provider.verifyAccount) throw new CliError(`Provider ${provider.name} cannot verify CLI account identity`);
-  provider.verifyAccount(user);
-  console.log(JSON.stringify({ provider: provider.name, account: user }, null, 2));
+  const legacy = opts.provider ?? cfg.provider;
+  const tracker = opts.tracker ?? cfg.tracker ?? cfg.defaults?.tracker ?? legacy ?? 'github';
+  const codeHost = opts['code-host'] ?? cfg.code_host ?? cfg.defaults?.code_host ?? legacy ?? 'github';
+  const trackerPort = getTracker(tracker);
+  const codeHostPort = getCodeHost(codeHost);
+  verifyAccount(trackerPort, codeHostPort, {
+    project: 'account command', tracker_account: user, code_host_account: user,
+  });
+  console.log(JSON.stringify({ tracker, code_host: codeHost, account: user }, null, 2));
   return 0;
 }
 
 function cmdOriginCheck(opts) {
   const cfg = requireConfig(opts);
   const [project] = requirePositional(opts._, 'origin-check <project>');
-  const { rc, provider } = context(cfg, project);
+  const { rc, tracker, codeHost } = context(cfg, project);
   assertEnabled(rc, project);
-  if (rc.provider !== 'github') throw new CliError(`origin-check is not implemented for ${rc.provider}`);
-  verifyAccount(provider, rc);
-  const result = verifyOrigin(project);
+  verifyAccount(tracker, codeHost, rc);
+  const result = codeHost.verifyRepository({ project });
   console.log(JSON.stringify({ project, verified: true, remote: result.remote, push_url: result.pushUrl }, null, 2));
   return 0;
 }
@@ -757,7 +811,7 @@ function cmdClaim(opts) {
     opts._.slice(0, 2),
     'claim <project> <issue> [--branch <b>] [--owner-token <token>] [--force]',
   );
-  const { rc, provider } = context(cfg, project);
+  const { rc, tracker, codeHost } = context(cfg, project);
   assertEnabled(rc, project);
   if (opts.force && !opts['confirm-stale']) {
     throw new CliError('claim --force requires --confirm-stale after verifying the previous run has stopped');
@@ -767,8 +821,9 @@ function cmdClaim(opts) {
 
   const lockFile = lockPath(configFile(opts));
   const previous = readLock(lockFile, configFile(opts));
-  verifyAccount(provider, rc);
-  const issueData = provider.viewIssue({ project, number });
+  if (previous?.repo === project) assertProviderIdentity(previous, rc, 'claim');
+  verifyAccount(tracker, codeHost, rc);
+  const issueData = tracker.getWorkItem({ project, number });
   assertTrustedIssue(rc, issueData);
 
   const sameClaim = previous && previous.repo === project && Number(previous.issue) === number;
@@ -786,7 +841,7 @@ function cmdClaim(opts) {
     state.last_run = updated.updated_at;
     writeState(state, configFile(opts));
     if (rc.labels.working) journalIssueLabel({
-      lock: updated, provider, project, issue: number, label: rc.labels.working, action: 'add',
+      lock: updated, tracker, project, issue: number, label: rc.labels.working, action: 'add',
     });
     console.log(JSON.stringify(updated, null, 2));
     return 0;
@@ -805,7 +860,7 @@ function cmdClaim(opts) {
     repo: project,
     issue: number,
     branch: opts.branch ?? null,
-    account: rc.account,
+    account: rc.code_host_account ?? rc.account,
     config_file: path.resolve(configFile(opts)),
     owner_token: randomUUID(),
     stage: 'claimed',
@@ -826,7 +881,7 @@ function cmdClaim(opts) {
   // Keep the owner lock if a tracker write fails; a retry with the same token
   // is idempotent and cannot be mistaken for an independent scheduler.
   if (rc.labels.working) journalIssueLabel({
-    lock, provider, project, issue: number, label: rc.labels.working, action: 'add',
+    lock, tracker, project, issue: number, label: rc.labels.working, action: 'add',
   });
   console.log(JSON.stringify(lock, null, 2));
   return 0;
@@ -836,7 +891,7 @@ function cmdResumeLock(opts) {
   const cfg = requireConfig(opts);
   const [project, issue] = requirePositional(opts._.slice(0, 2), 'resume-lock <project> <issue> --confirm-stale');
   if (!opts['confirm-stale']) throw new CliError('resume-lock requires --confirm-stale after verifying the previous run has stopped');
-  const { rc, provider } = context(cfg, project);
+  const { rc, tracker, codeHost } = context(cfg, project);
   assertEnabled(rc, project);
   const number = Number(issue);
   if (!Number.isSafeInteger(number) || number <= 0) throw new CliError(`Invalid issue number: ${issue}`);
@@ -848,12 +903,13 @@ function cmdResumeLock(opts) {
   if (lock.config_file && path.resolve(lock.config_file) !== path.resolve(configFile(opts))) {
     throw new CliError('active lock belongs to another config; resume refused');
   }
-  verifyAccount(provider, rc);
-  assertTrustedIssue(rc, provider.viewIssue({ project, number }));
+  assertProviderIdentity(lock, rc, 'resume-lock');
+  verifyAccount(tracker, codeHost, rc);
+  assertTrustedIssue(rc, tracker.getWorkItem({ project, number }));
   const resumed = {
     ...lock,
     owner_token: randomUUID(),
-    account: rc.account,
+    account: rc.code_host_account ?? rc.account,
     config_file: path.resolve(configFile(opts)),
     resumed_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
@@ -957,13 +1013,14 @@ function cmdRelease(opts) {
       throw new CliError('active lock belongs to another config; release refused');
     }
     const cfg = requireConfig(opts);
-    const { rc, provider } = context(cfg, lock.repo);
+    const { rc, tracker, codeHost } = context(cfg, lock.repo);
     if (!rc.enabled) {
       throw new CliError(`${lock.repo} is disabled; re-enable it before release, or use release --force to clear without tracker writes`);
     }
+    assertProviderIdentity(lock, rc, 'release');
     lock = saveCheckpoint(lock, 'release-pending', { release_result: result }, opts);
-    verifyAccount(provider, rc);
-    releaseContext = { rc, provider };
+    verifyAccount(tracker, codeHost, rc);
+    releaseContext = { rc, tracker };
   }
   if (result !== 'none') {
     const outcome = result === 'done' ? 'DONE' : result === 'blocked' ? 'BLOCKED' :
@@ -983,9 +1040,9 @@ function cmdRelease(opts) {
     }
   }
   if (releaseContext) {
-    const { rc, provider } = releaseContext;
+    const { rc, tracker } = releaseContext;
     if (rc.labels.working) journalIssueLabel({
-      lock, provider, project: lock.repo, issue: lock.issue, label: rc.labels.working, action: 'remove',
+      lock, tracker, project: lock.repo, issue: lock.issue, label: rc.labels.working, action: 'remove',
     });
     const target = result === 'done'
       ? rc.labels.done
@@ -997,7 +1054,7 @@ function cmdRelease(opts) {
             ? rc.labels.needs_info
             : null;
     if (target) journalIssueLabel({
-      lock, provider, project: lock.repo, issue: lock.issue, label: target, action: 'add',
+      lock, tracker, project: lock.repo, issue: lock.issue, label: target, action: 'add',
     });
   }
 
@@ -1016,12 +1073,12 @@ function cmdLabel(opts) {
   if (!project || !issue || !['add', 'remove'].includes(action) || labelParts.length === 0) {
     throw new CliError('usage: label <project> <issue> add|remove <label>');
   }
-  const { rc, provider } = context(cfg, project);
+  const { rc, tracker, codeHost } = context(cfg, project);
   assertEnabled(rc, project);
   const lock = ownedLock(opts, { project, issue: Number(issue) });
-  verifyAccount(provider, rc);
+  verifyAccount(tracker, codeHost, rc);
   const label = labelParts.join(' ');
-  journalIssueLabel({ lock, provider, project, issue: Number(issue), label, action });
+  journalIssueLabel({ lock, tracker, project, issue: Number(issue), label, action });
   console.log(JSON.stringify({ project, issue: Number(issue), action, label }, null, 2));
   return 0;
 }
@@ -1035,14 +1092,17 @@ function cmdComment(opts) {
   const kind = opts.kind ?? 'issue';
   if (!['issue', 'change'].includes(kind)) throw new CliError('--kind must be issue or change');
   const body = bodyFromFile(opts['body-file']);
-  const { rc, provider } = context(cfg, project);
+  const { rc, tracker, codeHost } = context(cfg, project);
   assertEnabled(rc, project);
   if (!Number.isSafeInteger(Number(number)) || Number(number) <= 0) throw new CliError('invalid issue/change number');
   const lock = kind === 'issue'
     ? ownedLock(opts, { project, issue: Number(number) })
     : ownedLock(opts, { project, change: Number(number) });
-  verifyAccount(provider, rc);
-  journalComment({ lock, provider, project, number: Number(number), kind, body, author: rc.account });
+  verifyAccount(tracker, codeHost, rc);
+  journalComment({
+    lock, tracker, codeHost, project, number: Number(number), kind, body,
+    author: kind === 'issue' ? rc.tracker_account : rc.code_host_account,
+  });
   console.log(JSON.stringify({ commented: true, project, number: Number(number), kind }, null, 2));
   return 0;
 }
@@ -1059,7 +1119,7 @@ function cmdChangeCreate(opts) {
   }
   if (containsSecretLikeContent(opts.title)) throw new CliError('Refusing a change-request title that looks like a credential');
   const body = bodyFromFile(opts['body-file']);
-  const { rc, provider } = context(cfg, project);
+  const { rc, tracker, codeHost } = context(cfg, project);
   assertEnabled(rc, project);
   const lock = ownedLock(opts, { project });
   if (!['IMPLEMENTED', 'CHANGE_OPEN'].includes(getRuntimeStore().workflowStateForOwner(lock.owner_token))) {
@@ -1072,23 +1132,28 @@ function cmdChangeCreate(opts) {
     throw new CliError(`--base must match configured base branch ${rc.base_branch}`);
   }
   if (!closesIssue(body, lock.issue)) throw new CliError(`change request body must contain Closes #${lock.issue}`);
-  if (rc.provider !== 'github') throw new CliError(`change creation is not implemented for ${rc.provider}`);
-  verifyOrigin(project);
-  const branch = spawnSync('git', ['branch', '--show-current'], { encoding: 'utf8' });
-  const head = spawnSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' });
-  const dirty = spawnSync('git', ['status', '--porcelain'], { encoding: 'utf8' });
-  if (branch.status !== 0 || head.status !== 0 || dirty.status !== 0) throw new CliError('change-create must run inside the issue worktree');
-  if (branch.stdout.trim() !== lock.branch) throw new CliError(`current branch is ${branch.stdout.trim() || '(detached)'}, expected ${lock.branch}`);
-  if (dirty.stdout.trim()) throw new CliError('change-create refuses a dirty worktree; commit or remove uncommitted changes first');
-  const headSha = head.stdout.trim();
+  codeHost.verifyRepository({ project });
+  let branch: string;
+  let headSha: string;
+  let dirty: string;
+  try {
+    branch = git(['branch', '--show-current']);
+    headSha = git(['rev-parse', 'HEAD']);
+    dirty = git(['status', '--porcelain']);
+  } catch {
+    throw new CliError('change-create must run inside the issue worktree');
+  }
+  if (branch !== lock.branch) throw new CliError(`current branch is ${branch || '(detached)'}, expected ${lock.branch}`);
+  if (dirty) throw new CliError('change-create refuses a dirty worktree; commit or remove uncommitted changes first');
   if (!validSha(headSha)) throw new CliError('could not determine the issue branch head SHA');
-  const pushed = spawnSync('git', ['ls-remote', '--heads', 'origin', `refs/heads/${lock.branch}`], { encoding: 'utf8' });
-  if (pushed.status !== 0) throw new CliError('could not verify the pushed issue branch on origin');
-  const pushedSha = pushed.stdout.trim().split(/\s+/)[0];
+  let pushed: string;
+  try { pushed = git(['ls-remote', '--heads', 'origin', `refs/heads/${lock.branch}`]); }
+  catch { throw new CliError('could not verify the pushed issue branch on origin'); }
+  const pushedSha = pushed.split(/\s+/)[0];
   if (!validSha(pushedSha) || pushedSha !== headSha) {
     throw new CliError('origin branch SHA does not match the current worktree head; change request refused');
   }
-  verifyAccount(provider, rc);
+  verifyAccount(tracker, codeHost, rc);
   saveCheckpoint(lock, 'change-pending', { branch: String(opts.head), head_sha: headSha }, opts);
   const intent = {
     project,
@@ -1106,19 +1171,19 @@ function cmdChangeCreate(opts) {
     identity: intent,
     intent,
     reconcile: () => {
-      if (typeof provider.findChange !== 'function') {
-        return { state: 'unknown', reason: `provider ${provider.name} cannot inspect change requests` };
+      if (typeof codeHost.findChange !== 'function') {
+        return { state: 'unknown', reason: `code host ${codeHost.name} cannot inspect change requests` };
       }
-      const existing = provider.findChange({ project, head: String(opts.head), base: String(opts.base) });
+      const existing = codeHost.findChange({ project, head: String(opts.head), base: String(opts.base) });
       if (!existing) return { state: 'absent' };
-      const view = provider.viewChange({ project, number: Number(existing.number) });
+      const view = codeHost.getChange({ project, number: Number(existing.number) });
       if (view.state !== 'OPEN' || view.headRefName !== String(opts.head) || view.headRefOid !== headSha ||
           view.baseRefName !== String(opts.base) || !closesIssue(view.body, lock.issue)) {
         return { state: 'unknown', reason: 'an open change request exists but does not match this issue, branch, base and head' };
       }
       return { state: 'applied', result: existing };
     },
-    apply: () => provider.createChange({
+    apply: () => codeHost.createChange({
       project,
       head: String(opts.head),
       base: String(opts.base),
@@ -1151,19 +1216,19 @@ function cmdChecks(opts) {
     opts._.slice(0, 2),
     'checks <project> <number> [--watch] [--interval <s>]',
   );
-  const { rc, provider } = context(cfg, project);
+  const { rc, tracker, codeHost } = context(cfg, project);
   assertEnabled(rc, project);
-  verifyAccount(provider, rc);
-  const before = provider.viewChange({ project, number: Number(number) });
-  if (!validSha(before.headRefOid)) throw new CliError('provider did not report a full current head SHA');
-  const raw = provider.checks({
+  verifyAccount(tracker, codeHost, rc);
+  const before = codeHost.getChange({ project, number: Number(number) });
+  if (!validSha(before.headRefOid)) throw new CliError('code host did not report a full current head SHA');
+  const raw = codeHost.getChecks({
     project,
     number: Number(number),
     required: true,
     watch: !!opts.watch,
     interval: Number(opts.interval ?? 10),
   });
-  const after = provider.viewChange({ project, number: Number(number) });
+  const after = codeHost.getChange({ project, number: Number(number) });
   const changedDuringChecks = after.headRefOid !== before.headRefOid;
   // A killed process or an undocumented status is never "green".
   const status = !changedDuringChecks && (raw === 0 || raw === 8) ? raw : 1;
@@ -1182,12 +1247,12 @@ function cmdChecks(opts) {
 function cmdMerge(opts) {
   const cfg = requireConfig(opts);
   const [project, number] = requirePositional(opts._.slice(0, 2), 'merge <project> <number>');
-  const { rc, provider } = context(cfg, project);
+  const { rc, tracker, codeHost } = context(cfg, project);
   assertEnabled(rc, project);
   if (!rc.auto_merge) {
     throw new CliError(`auto_merge is false for ${project}; leave the change request for a human`);
   }
-  verifyAccount(provider, rc);
+  verifyAccount(tracker, codeHost, rc);
 
   const changeNumber = Number(number);
   const lock = ownedLock(opts, { project, change: changeNumber });
@@ -1204,7 +1269,7 @@ function cmdMerge(opts) {
 
   // Fail closed: a provider that does not report these fields is not evidence
   // that the change request is mergeable.
-  const view = provider.viewChange({ project, number: changeNumber });
+  const view = codeHost.getChange({ project, number: changeNumber });
   const alreadyMerged = view.state === 'MERGED';
   if ((!alreadyMerged && view.state !== 'OPEN') || view.isDraft !== false) {
     throw new CliError(`change request is ${view.state}${view.isDraft ? ' (draft)' : ''}; merge refused`);
@@ -1228,7 +1293,7 @@ function cmdMerge(opts) {
   }
 
   const markerAuthors = new Set(rc.trusted_authors);
-  if (rc.account) markerAuthors.add(rc.account);
+  if (rc.code_host_account) markerAuthors.add(rc.code_host_account);
   const reviewMarker = markerText('review-approved', lock.head_sha, lock.issue, changeNumber);
   const testsMarker = markerText('tests', lock.head_sha, lock.issue, changeNumber);
   const evidenceMarker = markerText('evidence', lock.head_sha, lock.issue, changeNumber, lock.evidence_commit);
@@ -1244,7 +1309,7 @@ function cmdMerge(opts) {
   if (!hasTrustedMarker(view, evidenceMarker, markerAuthors)) {
     throw new CliError('missing exact-head evidence marker by a trusted author; merge refused');
   }
-  provider.verifyEvidence({
+  codeHost.verifyEvidence({
     project,
     commit: lock.evidence_commit,
     issue: lock.issue,
@@ -1252,7 +1317,7 @@ function cmdMerge(opts) {
     head: lock.head_sha,
   });
 
-  const status = provider.checks({ project, number: changeNumber, required: true });
+  const status = codeHost.getChecks({ project, number: changeNumber, required: true });
   if (status !== 0) {
     throw new CliError(
       status === 8
@@ -1260,7 +1325,7 @@ function cmdMerge(opts) {
         : 'required checks are not green or unavailable; merge refused',
     );
   }
-  const finalView = provider.viewChange({ project, number: changeNumber });
+  const finalView = codeHost.getChange({ project, number: changeNumber });
   const expectedState = alreadyMerged ? 'MERGED' : 'OPEN';
   if (finalView.headRefOid !== lock.head_sha || finalView.state !== expectedState || finalView.isDraft !== false ||
       finalView.headRefName !== lock.branch || finalView.baseRefName !== rc.base_branch ||
@@ -1281,7 +1346,7 @@ function cmdMerge(opts) {
   if (workflowState === 'REVIEWING') {
     store.recordWorkflowCheck(lock.owner_token, 'review-approval', 'approved', lock.head_sha, {
       change: changeNumber,
-      reviewers: [...new Set((finalView.reviews ?? []).map((review) => review.author?.login).filter(Boolean))],
+      reviewers: [...new Set((finalView.reviews ?? []).map((review) => authorLogin(review.author)).filter(Boolean))],
     });
     store.transitionWorkflow(lock.owner_token, 'REVIEW_APPROVED', 'cli', 'trusted exact-head approval verified');
     workflowState = 'REVIEW_APPROVED';
@@ -1324,7 +1389,7 @@ function cmdMerge(opts) {
     throw new CliError('existing merge intent has an inconsistent idempotency key; refusing merge');
   }
   const reconcileMerge = () => {
-    const current = provider.viewChange({ project, number: changeNumber });
+    const current = codeHost.getChange({ project, number: changeNumber });
     if (current.state === 'MERGED' && current.headRefOid === lock.head_sha) {
       return { state: 'applied' as const, result: { state: current.state, head_sha: current.headRefOid } };
     }
@@ -1363,10 +1428,10 @@ function cmdMerge(opts) {
     identity: mergeIntent,
     intent: mergeIntent,
     reconcile: reconcileMerge,
-    apply: () => provider.merge({ project, number: changeNumber, method: rc.merge_method, headSha: lock.head_sha }),
+    apply: () => codeHost.merge({ project, number: changeNumber, method: rc.merge_method, headSha: lock.head_sha }),
   });
   const result = merged.value as Record<string, any>;
-  const mergedView = provider.viewChange({ project, number: changeNumber });
+  const mergedView = codeHost.getChange({ project, number: changeNumber });
   if (mergedView.state !== 'MERGED' || mergedView.headRefOid !== lock.head_sha) {
     throw new CliError('provider merge response could not be reconciled with the external change request');
   }
@@ -1397,7 +1462,7 @@ function cmdEvidence(opts) {
   );
   if (!opts.dir || opts.dir === true) throw new CliError('--dir is required');
   if (opts['allow-secret-like']) throw new CliError('--allow-secret-like was removed; redact evidence instead of bypassing secret checks');
-  const { rc, provider } = context(cfg, project);
+  const { rc, tracker, codeHost } = context(cfg, project);
   assertEnabled(rc, project);
   const lock = ownedLock(opts, { project, issue: Number(issue) });
   if (!['CHANGE_OPEN', 'EVIDENCE_PUBLISHED'].includes(getRuntimeStore().workflowStateForOwner(lock.owner_token))) {
@@ -1406,14 +1471,15 @@ function cmdEvidence(opts) {
   if (!Number.isSafeInteger(Number(lock.change_number)) || Number(lock.change_number) <= 0) {
     throw new CliError('create the change request before publishing evidence');
   }
-  verifyAccount(provider, rc);
-  const view = provider.viewChange({ project, number: Number(lock.change_number) });
+  verifyAccount(tracker, codeHost, rc);
+  const view = codeHost.getChange({ project, number: Number(lock.change_number) });
   if (view.state !== 'OPEN' || !validSha(view.headRefOid) || view.headRefName !== lock.branch ||
       view.baseRefName !== rc.base_branch || !closesIssue(view.body, lock.issue)) {
     throw new CliError('change request does not match the active issue/branch/base; evidence refused');
   }
-  const localHead = spawnSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' });
-  if (localHead.status !== 0 || localHead.stdout.trim() !== view.headRefOid) {
+  let localHead: string;
+  try { localHead = git(['rev-parse', 'HEAD']); } catch { localHead = ''; }
+  if (localHead !== view.headRefOid) {
     throw new CliError('local worktree head differs from the change request; evidence refused');
   }
   const evidenceIdentity = {
@@ -1457,7 +1523,7 @@ function cmdEvidence(opts) {
         ...evidenceIdentity,
         branch: evidenceBranch,
         expectedManifest: preparedEvidence.manifest,
-        rawUrl: (args) => provider.rawUrl(args),
+        rawUrl: (args) => codeHost.evidenceUrl(args),
       });
       return result ? { state: 'applied', result } : { state: 'absent' };
     },
@@ -1470,7 +1536,7 @@ function cmdEvidence(opts) {
       branchPrefix: rc.evidence_branch_prefix,
       branch: evidenceBranch,
       preparedEvidence,
-      rawUrl: (args) => provider.rawUrl(args),
+      rawUrl: (args) => codeHost.evidenceUrl(args),
     }),
   });
   const result = publication.value as Record<string, any>;
@@ -1498,9 +1564,11 @@ function cmdEnsureLabels(opts) {
 
   const created = [];
   for (const project of projects) {
-    const { rc, provider } = context(cfg, project);
+    const { rc, tracker, codeHost } = context(cfg, project);
     if (!rc.enabled) continue;
-    verifyAccount(provider, rc);
+    const activeLock = readLock(lockPath(configFile(opts)), configFile(opts));
+    if (activeLock?.repo === project) assertProviderIdentity(activeLock, rc, 'ensure-labels');
+    verifyAccount(tracker, codeHost, rc);
     for (const [role, definition] of Object.entries(definitions)) {
       const name = rc.labels[role];
       if (!name) continue;
@@ -1512,8 +1580,8 @@ function cmdEnsureLabels(opts) {
         idempotencyKey,
         kind: 'ensure-label',
         intent,
-        reconcile: () => observeRepoLabel(provider, project, name, definition),
-        apply: () => provider.ensureLabel(intent),
+        reconcile: () => observeRepoLabel(tracker, project, name, definition),
+        apply: () => tracker.ensureLabel(intent),
       });
       created.push({ project, name, role });
       if (!opts.json) console.log(`${project}: ${name} (${role})`);

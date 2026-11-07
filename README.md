@@ -5,7 +5,7 @@ change requests. The deterministic work — queue, state, labels, git, gates,
 evidence, merge checks — belongs in software. The LLM does only the semantic
 work: triage, implementation, verification and review.
 
-OpenCode is the first agent backend, not a dependency of the core.
+OpenCode is the first intended agent backend, not a dependency of the core.
 
 > **Status:** early `v0.1`. The deterministic core has been extracted from the
 > `git-issue-agent` skill. SQLite persistence is in place; the `run` loop and
@@ -16,7 +16,7 @@ OpenCode is the first agent backend, not a dependency of the core.
 - Node.js 24 or newer
 - pnpm 11 (`packageManager` is pinned in `package.json`)
 - `git`
-- the provider CLI you configure: `gh` for GitHub, `glab` for GitLab (later)
+- the provider CLI you configure: `gh` for GitHub (GitLab and Jira adapters are fail-closed stubs)
 
 ## Development
 
@@ -86,7 +86,8 @@ the owning worktree. Evidence intents pin the locally prepared manifest/file
 hashes and a random job-specific branch suffix, so a self-consistent but
 unrelated ref is not adopted. PR reuse inspects all states and refuses lookups
 that reach its 1,000-result safety cap rather than assume the match set is
-complete. GitLab remains an unimplemented provider slot.
+complete. Provider ports, capability descriptors, configuration, and the
+support matrix are documented in [`docs/providers.md`](docs/providers.md).
 Actor values guard internal transitions, but they are local process roles, not
 cryptographic identities; trusted human approval is established from the
 configured GitHub reviewer checks.
@@ -96,7 +97,8 @@ configured GitHub reviewer checks.
 ```
 src/cli.ts        argument dispatch, --help/--version
 src/core/         commands, config, SQLite persistence and migrations
-src/providers/    Tracker/CodeHost adapters (github implemented, gitlab slot)
+src/providers/    Tracker/CodeHost/AgentRunner ports and provider adapters
+src/git/          isolated Git process and origin operations
 src/evidence/     artifact validation, secret scanning, evidence publishing
 ```
 

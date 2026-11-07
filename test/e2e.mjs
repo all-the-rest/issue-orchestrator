@@ -16,6 +16,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { SQLiteStore } from '../dist/core/persistence.js';
 import { parseJsonc } from '../dist/core/config.js';
+import { getAgentRunner, getCodeHost, getTracker, UnsupportedCapabilityError } from '../dist/providers/index.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const CLI = path.join(ROOT, 'dist', 'cli.js');
@@ -98,6 +99,13 @@ function json(result) {
 
 function write(file, value) {
   fs.writeFileSync(file, typeof value === 'string' ? value : `${JSON.stringify(value, null, 2)}\n`);
+}
+
+function sourceFiles(dir) {
+  return fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+    const file = path.join(dir, entry.name);
+    return entry.isDirectory() ? sourceFiles(file) : [file];
+  });
 }
 
 function git(args, { cwd, input } = {}) {
@@ -420,8 +428,62 @@ assert.equal(status.model, 'test/model');
 assert.equal(status.projects.find((p) => p.project === 'reisi007/paused').enabled, false);
 assert.equal(status.projects.find((p) => p.project === 'reisi007/paused').auto_merge, false);
 assert.equal(status.projects.find((p) => p.project === 'reisi007/demo').auto_merge, true);
+assert.equal(status.projects.find((p) => p.project === 'reisi007/demo').tracker, 'github');
+assert.equal(status.projects.find((p) => p.project === 'reisi007/demo').code_host, 'github');
 assert.equal(status.lock, null);
 ok('status reports config, model, enabled auto-merge default, disabled-project state and no lock');
+
+assert.equal(getTracker('github').capabilities.capabilities.labels, true);
+assert.deepEqual(getCodeHost('github').capabilities.capabilities.mergeMethods, ['squash', 'merge', 'rebase']);
+for (const [adapter, port, operation] of [
+  [getTracker('jira'), 'Tracker', 'getWorkItem'],
+  [getTracker('gitlab'), 'Tracker', 'listWorkItems'],
+  [getCodeHost('jira'), 'CodeHost', 'createChange'],
+  [getCodeHost('gitlab'), 'CodeHost', 'getChecks'],
+  [getAgentRunner('opencode'), 'AgentRunner', 'run'],
+]) {
+  assert.throws(() => adapter[operation]({}), (error) => (
+    error instanceof UnsupportedCapabilityError && error.port === port && error.capability === operation
+  ));
+}
+assert.throws(() => getTracker('github').updateWorkItem({
+  project: 'reisi007/demo', number: 1, fields: { unsupported: true },
+}), (error) => error instanceof UnsupportedCapabilityError);
+const pairedConfig = path.join(TMP, 'jira-github-config.jsonc');
+write(pairedConfig, fs.readFileSync(CONFIG, 'utf8').replace(
+  '"reisi007/demo": { "account": "reisi007", "enabled": true, "local_only": true },',
+  '"reisi007/demo": { "account": "reisi007", "enabled": true, "local_only": true, "tracker": "jira", "code_host": "github" },',
+));
+const pairedStatus = json(runOk(['status'], { env: { ISSUE_ORCHESTRATOR_CONFIG: pairedConfig } }));
+const pairedProject = pairedStatus.projects.find((project) => project.project === 'reisi007/demo');
+assert.equal(pairedProject.tracker, 'jira');
+assert.equal(pairedProject.code_host, 'github');
+assert.equal(pairedProject.provider, 'jira+github');
+const globalPairConfig = path.join(TMP, 'global-jira-github-config.jsonc');
+write(globalPairConfig, fs.readFileSync(CONFIG, 'utf8').replace(
+  '"provider": "github",', '"tracker": "jira",\n  "code_host": "github",',
+));
+const globalPair = json(runOk(['status'], { env: { ISSUE_ORCHESTRATOR_CONFIG: globalPairConfig } }))
+  .projects.find((project) => project.project === 'reisi007/demo');
+assert.equal(globalPair.tracker, 'jira');
+assert.equal(globalPair.code_host, 'github');
+const unsupportedClaim = runRefused(['claim', 'reisi007/demo', '1'], {
+  env: { ISSUE_ORCHESTRATOR_CONFIG: pairedConfig },
+});
+assert.match(unsupportedClaim.err, /Provider "jira" does not support Tracker capability "getWorkItem"/);
+ok('typed unsupported capabilities fail closed and Jira tracker can pair with GitHub code host in config');
+
+const sourceRoot = path.join(ROOT, 'src');
+const providerCliViolations = sourceFiles(sourceRoot)
+  .filter((file) => !path.relative(sourceRoot, file).startsWith(`providers${path.sep}`))
+  .filter((file) => /\b(?:spawnSync|spawn|execFileSync|execSync)\s*\(\s*['"](?:gh|glab)['"]/.test(fs.readFileSync(file, 'utf8')));
+assert.deepEqual(providerCliViolations, [], 'provider CLIs may only be invoked inside src/providers');
+ok('provider CLI process invocation stays inside src/providers');
+const gitProcessViolations = sourceFiles(sourceRoot)
+  .filter((file) => !path.relative(sourceRoot, file).startsWith(`git${path.sep}`))
+  .filter((file) => /\b(?:spawnSync|spawn|execFileSync|execSync)\s*\(\s*['"]git['"]/.test(fs.readFileSync(file, 'utf8')));
+assert.deepEqual(gitProcessViolations, [], 'Git processes may only be invoked inside src/git');
+ok('Git process invocation stays inside src/git');
 
 const listed = json(runOk(['list']));
 assert.deepEqual(listed.map((issue) => issue.number), [1, 2]);
@@ -565,6 +627,38 @@ ok('release clears the lock and moves working -> review');
 
 const resumeStart = json(runOk(['claim', 'reisi007/demo', '1']));
 runRefused(['resume-lock', 'reisi007/demo', '1']);
+const resumeConfig = fs.readFileSync(CONFIG, 'utf8');
+write(CONFIG, resumeConfig.replace(
+  '"reisi007/demo": { "account": "reisi007", "enabled": true, "local_only": true },',
+  '"reisi007/demo": { "account": "reisi007", "enabled": true, "local_only": true, "tracker": "jira", "code_host": "github" },',
+));
+const activeProviderBeforeMismatch = readLock();
+const ghCallsBeforeMismatch = fs.readFileSync(GH_LOG, 'utf8');
+const mismatchResume = runRefused(['resume-lock', 'reisi007/demo', '1', '--confirm-stale']);
+assert.match(mismatchResume.err, /configured tracker\/code-host pair "jira\+github" does not match/);
+assert.equal(fs.readFileSync(GH_LOG, 'utf8'), ghCallsBeforeMismatch,
+  'provider-pair mismatch must be detected before account or tracker reads during resume');
+assert.equal(readLock().owner_token, activeProviderBeforeMismatch.owner_token);
+assert.equal(readLock().provider, activeProviderBeforeMismatch.provider);
+const mismatchedLabel = runRefused([
+  'label', 'reisi007/demo', '1', 'add', 'agent:wrong-provider', '--owner-token', resumeStart.owner_token,
+]);
+assert.match(mismatchedLabel.err, /configured tracker\/code-host pair/);
+const mismatchedClaim = runRefused([
+  'claim', 'reisi007/demo', '1', '--owner-token', resumeStart.owner_token,
+]);
+assert.match(mismatchedClaim.err, /configured tracker\/code-host pair/);
+const mismatchedRelease = runRefused([
+  'release', '--result', 'blocked', '--owner-token', resumeStart.owner_token,
+]);
+assert.match(mismatchedRelease.err, /configured tracker\/code-host pair/);
+const mismatchedLabelSetup = runRefused(['ensure-labels', '--project', 'reisi007/demo', '--json']);
+assert.match(mismatchedLabelSetup.err, /configured tracker\/code-host pair/);
+assert.equal(readLock().owner_token, activeProviderBeforeMismatch.owner_token,
+  'mismatched release must leave active ownership intact');
+assert.equal(fs.readFileSync(GH_LOG, 'utf8'), ghCallsBeforeMismatch,
+  'active-lock mutations must not write or inspect a different provider pair');
+write(CONFIG, resumeConfig);
 const resumed = json(runOk(['resume-lock', 'reisi007/demo', '1', '--confirm-stale']));
 assert.notEqual(resumed.owner_token, resumeStart.owner_token);
 runRefused(['checkpoint', 'triaged', '--owner-token', resumeStart.owner_token]);
