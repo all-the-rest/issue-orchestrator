@@ -13,8 +13,10 @@ import {
   readLock,
   acquireLock,
   writeLock,
+  resumeLock,
   clearLock,
   lockPath,
+  quarantineCorruptLegacyLock,
   parseJsonc,
 } from './config.js';
 import { getProvider } from '../providers/index.js';
@@ -63,7 +65,7 @@ const HELP = `Usage: issue-orchestrator <command> [args] [--config <path>]
   help
 
 Global: --config <path> isolates configuration/state; --json forces JSON output
-for commands that print text by default. The active-work lock is
+for commands that print text by default. The SQLite-backed active-work queue is
 shared by all configs under the runtime home. The active provider CLI
 identity must match the configured account; the agent never switches accounts
 or extracts credentials.
@@ -155,7 +157,7 @@ function assertOwner(lock, opts, operation) {
 function ownedLock(opts, { project, issue, change }: any = {}) {
   let lock;
   try {
-    lock = readLock(lockPath(configFile(opts)));
+    lock = readLock(lockPath(configFile(opts)), configFile(opts));
   } catch (error) {
     throw new CliError(`Lock is corrupt: ${error.message}; inspect it before recovery`);
   }
@@ -270,7 +272,7 @@ function cmdStatus(opts) {
       base_branch: rc.base_branch,
     };
   });
-  const currentLock = readLock(lockPath(configFile(opts)));
+  const currentLock = readLock(lockPath(configFile(opts)), configFile(opts));
   const publicLock = currentLock ? { ...currentLock, owner_token: undefined } : null;
   const activeState = state.active ? { ...state.active, owner_token: undefined } : null;
   console.log(JSON.stringify({
@@ -398,13 +400,7 @@ function cmdClaim(opts) {
   if (!Number.isInteger(number) || number <= 0) throw new CliError(`Invalid issue number: ${issue}`);
 
   const lockFile = lockPath(configFile(opts));
-  let previous = null;
-  try {
-    previous = readLock(lockFile);
-  } catch (error) {
-    if (!opts.force) throw new CliError(`Lock is corrupt: ${error.message}; release --force to clear`);
-    fs.unlinkSync(lockFile);
-  }
+  const previous = readLock(lockFile, configFile(opts));
   verifyAccount(provider, rc);
   const issueData = provider.viewIssue({ project, number });
   assertTrustedIssue(rc, issueData);
@@ -450,7 +446,7 @@ function cmdClaim(opts) {
     local_only: rc.local_only,
   };
   try {
-    acquireLock(lock, { file: lockFile, force: !!opts.force });
+    acquireLock(lock, { force: !!opts.force, expectedOwnerToken: previous?.owner_token });
   } catch (error) {
     throw new CliError(error.message);
   }
@@ -475,7 +471,7 @@ function cmdResumeLock(opts) {
   const number = Number(issue);
   if (!Number.isSafeInteger(number) || number <= 0) throw new CliError(`Invalid issue number: ${issue}`);
   const lockFile = lockPath(configFile(opts));
-  const lock = readLock(lockFile);
+  const lock = readLock(lockFile, configFile(opts));
   if (!lock || lock.repo !== project || Number(lock.issue) !== number) {
     throw new CliError(`No matching active lock for ${project}#${number}`);
   }
@@ -492,7 +488,7 @@ function cmdResumeLock(opts) {
     resumed_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
   };
-  writeLock(resumed, lockFile);
+  resumeLock(lock.owner_token, resumed);
   const state = readState(configFile(opts));
   state.active = resumed;
   state.last_run = resumed.updated_at;
@@ -533,18 +529,30 @@ function cmdRelease(opts) {
   const lockFile = lockPath(configFile(opts));
   let lock;
   try {
-    lock = readLock(lockFile);
+    lock = readLock(lockFile, configFile(opts));
   } catch (error) {
-    if (!opts.force) {
-      throw new CliError(`Lock is corrupt: ${error.message}; release --force to clear`);
+    if (!String(error.message).startsWith('Legacy lock is corrupt:')) {
+      throw new CliError(error.message);
     }
-    if (!opts['confirm-stale']) throw new CliError('release --force requires --confirm-stale before clearing a corrupt lock');
-    fs.unlinkSync(lockFile);
-    const state = readState(configFile(opts));
-    state.active = null;
-    state.last_run = new Date().toISOString();
-    writeState(state, configFile(opts));
-    console.log(JSON.stringify({ released: true, force: true, reason: 'corrupt lock cleared' }, null, 2));
+    if (!opts.force) {
+      throw new CliError(`Lock is corrupt: ${error.message}; release --force to quarantine after confirming the old run stopped`);
+    }
+    if (!opts['confirm-stale']) {
+      throw new CliError('release --force requires --confirm-stale before quarantining a corrupt legacy lock');
+    }
+    let quarantine;
+    try {
+      quarantine = quarantineCorruptLegacyLock(configFile(opts));
+    } catch (quarantineError) {
+      throw new CliError(quarantineError.message);
+    }
+    console.log(JSON.stringify({
+      released: true,
+      force: true,
+      reason: 'corrupt legacy lock quarantined',
+      quarantine: quarantine.lock,
+      state_backup: quarantine.state,
+    }, null, 2));
     return 0;
   }
 
@@ -586,8 +594,7 @@ function cmdRelease(opts) {
     if (target) provider.addLabel({ project: lock.repo, number: lock.issue, label: target });
   }
 
-  if (opts.force) fs.unlinkSync(lockFile);
-  else clearLock(lockFile, lock.owner_token);
+  clearLock(lockFile, lock.owner_token, result);
   const state = readState(configFile(opts));
   state.active = null;
   state.last_run = new Date().toISOString();

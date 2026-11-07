@@ -1,7 +1,12 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { randomUUID } from 'node:crypto';
+import {
+  databasePath,
+  getRuntimeStore,
+  importLegacyState,
+  quarantineCorruptLegacyLock as quarantineLegacyLock,
+} from './persistence.js';
 
 export function configDir() {
   const home = process.env.ISSUE_ORCHESTRATOR_HOME ?? process.env.GIT_ISSUE_AGENT_HOME;
@@ -17,19 +22,9 @@ export function configPath() {
     : path.join(configDir(), 'config.jsonc');
 }
 
-// A `--config <path>` run keeps state next to that file; lock ownership stays
-// shared under the runtime home to serialize across configs.
-export function statePath(configFile) {
-  if (!configFile) return path.join(configDir(), 'state.json');
-  const absolute = path.resolve(configFile);
-  const base = path.basename(absolute).replace(/\.[^.]+$/, '');
-  return path.join(path.dirname(absolute), base === 'config' ? 'state.json' : `${base}.state.json`);
-}
-
-// The active-work lock is shared by every config in one runtime home. A
-// --config file isolates configuration/state, not concurrent queue ownership.
+// All configs share the SQLite queue database under the runtime home.
 export function lockPath(_configFile?: string) {
-  return path.join(configDir(), 'lock.json');
+  return databasePath();
 }
 
 // Position of the next non-whitespace, non-comment character, so a trailing
@@ -249,71 +244,40 @@ export function enabledRepos(cfg) {
 }
 
 export function readState(configFile) {
-  const file = statePath(configFile);
-  if (!fs.existsSync(file)) return { active: null, last_run: null };
-  const state = JSON.parse(fs.readFileSync(file, 'utf8'));
-  if (!state || typeof state !== 'object' || Array.isArray(state)) {
-    throw new Error(`State is corrupt: ${file}`);
-  }
-  return state;
-}
-
-function writeAtomic(file, value) {
-  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-  const temp = `${file}.${process.pid}.${randomUUID()}.tmp`;
-  try {
-    fs.writeFileSync(temp, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600, flag: 'wx' });
-    fs.renameSync(temp, file);
-    try { fs.chmodSync(file, 0o600); } catch { /* permissions are best effort on non-POSIX hosts */ }
-  } finally {
-    try { fs.unlinkSync(temp); } catch { /* renamed or absent */ }
-  }
+  const file = configFile ?? configPath();
+  importLegacyState(file);
+  return getRuntimeStore().readState(file);
 }
 
 export function writeState(state, configFile) {
-  writeAtomic(statePath(configFile), state);
+  getRuntimeStore().writeState(state, configFile ?? configPath());
 }
 
-export function readLock(file = lockPath()) {
-  if (!fs.existsSync(file)) return null;
-  return JSON.parse(fs.readFileSync(file, 'utf8'));
+export function readLock(_file = lockPath(), configFile?: string) {
+  if (configFile) importLegacyState(configFile);
+  return getRuntimeStore().readLock();
 }
 
-export function acquireLock(lock, { file = lockPath(), force = false } = {}) {
-  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-  if (force && fs.existsSync(file)) fs.unlinkSync(file);
-
-  let fd;
-  try {
-    fd = fs.openSync(file, 'wx', 0o600);
-  } catch (error) {
-    if (error.code === 'EEXIST') {
-      const current = readLock(file);
-      throw new Error(
-        `Queue is locked by ${current?.repo}#${current?.issue} since ${current?.claimed_at}; ` +
-        'release --force only for a stale run'
-      );
-    }
-    throw error;
-  }
-  try {
-    fs.writeFileSync(fd, `${JSON.stringify(lock, null, 2)}\n`);
-    fs.fsyncSync(fd);
-  } finally {
-    fs.closeSync(fd);
-  }
+export function acquireLock(lock, { force = false, expectedOwnerToken }: { force?: boolean; expectedOwnerToken?: string } = {}) {
+  return getRuntimeStore().acquireLock(lock, force, expectedOwnerToken);
 }
 
-export function writeLock(lock, file = lockPath()) {
-  writeAtomic(file, lock);
+export function writeLock(lock, _file = lockPath()) {
+  return getRuntimeStore().updateLock(lock);
 }
 
-export function clearLock(file = lockPath(), ownerToken) {
-  if (!fs.existsSync(file)) return false;
-  const current = readLock(file);
-  if (ownerToken && current.owner_token !== ownerToken) {
-    throw new Error('Queue lock ownership changed; refusing to clear another run\'s lock');
-  }
-  fs.unlinkSync(file);
-  return true;
+export function resumeLock(previousToken, lock) {
+  return getRuntimeStore().resumeLock(previousToken, lock);
+}
+
+export function clearLock(_file = lockPath(), ownerToken, result = 'none') {
+  return getRuntimeStore().clearLock(ownerToken, result);
+}
+
+export function withMutationGuard<T>(fn: () => T): T {
+  return getRuntimeStore({ importLegacy: false }).withMutationGuard(fn);
+}
+
+export function quarantineCorruptLegacyLock(configFile: string) {
+  return quarantineLegacyLock(configFile);
 }

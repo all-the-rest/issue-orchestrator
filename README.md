@@ -8,8 +8,8 @@ work: triage, implementation, verification and review.
 OpenCode is the first agent backend, not a dependency of the core.
 
 > **Status:** early `v0.1`. The deterministic core has been extracted from the
-> `git-issue-agent` skill; persistence, the `run` loop and the agent runner land
-> in the follow-up issues of milestone `v0.1`.
+> `git-issue-agent` skill. SQLite persistence is in place; the `run` loop and
+> agent runner land in follow-up issues of milestone `v0.1`.
 
 ## Requirements
 
@@ -48,14 +48,20 @@ Exit codes: `0` done/green, `1` refused/failed, `2` config missing or invalid,
 `8` checks pending.
 
 Configuration lives in `~/.config/issue-orchestrator/config.jsonc` unless
-`ISSUE_ORCHESTRATOR_CONFIG` or `--config` points elsewhere. The active-work lock
-is shared by every config under `ISSUE_ORCHESTRATOR_HOME`.
+`ISSUE_ORCHESTRATOR_CONFIG` or `--config` points elsewhere. Runtime data lives
+in `orchestrator.sqlite3` under `ISSUE_ORCHESTRATOR_HOME`; all configs share
+that transactional queue. Existing `state.json` and `lock.json` files are
+imported once on first use. SQLite uses WAL, foreign keys,
+and a busy timeout; work claims and event enqueueing are transactional.
+If a legacy `lock.json` is malformed, normal commands fail closed; after
+verifying the old run has stopped, `release --force --confirm-stale` archives
+the malformed lock and matching state file instead of deleting them.
 
 ## Architecture
 
 ```
-src/cli.ts        argument dispatch, mutation guard, --help/--version
-src/core/         commands, config, cross-process mutation guard
+src/cli.ts        argument dispatch, --help/--version
+src/core/         commands, config, SQLite persistence and migrations
 src/providers/    Tracker/CodeHost adapters (github implemented, gitlab slot)
 src/evidence/     artifact validation, secret scanning, evidence publishing
 ```

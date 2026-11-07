@@ -14,6 +14,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { SQLiteStore } from '../dist/core/persistence.js';
 import { parseJsonc } from '../dist/core/config.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -106,11 +107,12 @@ function git(args, { cwd } = {}) {
 }
 
 function lockPath() {
-  return path.join(TMP, 'lock.json');
+  return path.join(TMP, 'orchestrator.sqlite3');
 }
 
 function readLock() {
-  return JSON.parse(fs.readFileSync(lockPath(), 'utf8'));
+  const store = new SQLiteStore(lockPath());
+  try { return store.readLock(); } finally { store.close(); }
 }
 
 // --- fixtures ---------------------------------------------------------------
@@ -453,7 +455,7 @@ ok('claim refuses a disabled project');
 runRefused(['release', '--result', 'review', '--owner-token', 'not-the-owner']);
 const released = json(runOk(['release', '--result', 'review', '--owner-token', firstClaim.owner_token]));
 assert.equal(released.result, 'review');
-assert.equal(fs.existsSync(lockPath()), false);
+assert.equal(readLock(), null);
 const ghLog = fs.readFileSync(GH_LOG, 'utf8');
 assert.match(ghLog, /--remove-label agent:working/);
 assert.match(ghLog, /--add-label agent:review/);
@@ -476,47 +478,6 @@ write(CONFIG, enabledConfig);
 runOk(['release', '--owner-token', resumed.owner_token]);
 ok('resume rotates ownership, disabled release preserves the lock, configs share one lock, and status redacts the token');
 
-const guardFile = `${lockPath()}.guard`;
-write(guardFile, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
-const blocked = run(['claim', 'reisi007/demo', '1']);
-assert.notEqual(blocked.code, 0, 'a live mutation guard must refuse a second mutation');
-assert.match(blocked.err, /another queue mutation is in progress/);
-assert.ok(fs.existsSync(guardFile), 'a refused mutation must not remove the live holder\'s guard');
-fs.rmSync(guardFile);
-
-write(guardFile, JSON.stringify({ pid: 2147483647, at: '2000-01-01T00:00:00.000Z' }));
-const reclaimed = json(runOk(['claim', 'reisi007/demo', '1']));
-assert.equal(fs.existsSync(guardFile), false, 'a dead holder\'s guard must be reclaimed');
-runOk(['release', '--owner-token', reclaimed.owner_token]);
-
-// An unreadable guard has no pid to probe: it falls back to the age rule.
-write(guardFile, '{ not json');
-runRefused(['claim', 'reisi007/demo', '1']);
-assert.ok(fs.existsSync(guardFile), 'a fresh unreadable guard must still block');
-const stale = new Date(Date.now() - 6 * 60 * 1000);
-fs.utimesSync(guardFile, stale, stale);
-const aged = json(runOk(['claim', 'reisi007/demo', '1']));
-assert.equal(fs.existsSync(guardFile), false, 'a stale unreadable guard must be removed after the mutation');
-runOk(['release', '--owner-token', aged.owner_token]);
-ok('mutation guard blocks a live holder, reclaims a dead holder immediately, and ages out an unreadable guard');
-
-// Two processes race to reclaim the same dead holder; only one may enter.
-write(guardFile, JSON.stringify({ pid: 2147483647, at: '2000-01-01T00:00:00.000Z' }));
-const reclaimRace = await Promise.all([
-  runAsync(['claim', 'reisi007/demo', '1'], {
-    env: { FAKE_ISSUE_VIEW_STARTED: path.join(TMP, 'race-started'), FAKE_ISSUE_VIEW_DELAY: '0.4' },
-  }),
-  runAsync(['claim', 'reisi007/demo', '2']),
-]);
-assert.equal(reclaimRace.filter((item) => item.code === 0).length, 1, 'exactly one stale-guard reclaimer may enter');
-assert.equal(reclaimRace.filter((item) => item.code !== 0).length, 1, 'the losing reclaimer must refuse');
-assert.match(reclaimRace.find((item) => item.code !== 0).err, /another queue mutation is in progress|Queue is locked/);
-const raceOwner = JSON.parse(reclaimRace.find((item) => item.code === 0).out).owner_token;
-runOk(['release', '--owner-token', raceOwner]);
-assert.equal(fs.existsSync(guardFile), false, 'the race must not leave a guard file behind');
-assert.equal(fs.existsSync(`${guardFile}.reclaim`), false, 'the race must not leave a reclaim file behind');
-ok('concurrent stale-guard reclamation admits exactly one process and leaves no lock behind');
-
 const concurrent = await Promise.all([
   runAsync(['claim', 'reisi007/demo', '1']),
   runAsync(['claim', 'reisi007/demo', '2']),
@@ -525,14 +486,48 @@ assert.equal(concurrent.filter((item) => item.code === 0).length, 1, 'exactly on
 assert.equal(concurrent.filter((item) => item.code !== 0).length, 1, 'the losing concurrent claim must refuse');
 const concurrentOwner = JSON.parse(concurrent.find((item) => item.code === 0).out).owner_token;
 runOk(['release', '--owner-token', concurrentOwner]);
-ok('cross-process claims serialize and exactly one issue obtains ownership');
+ok('cross-process transactional claims serialize and exactly one issue obtains ownership');
 
-write(lockPath(), '{ not json');
-runRefused(['release']);
-ok('release refuses a corrupt lock without --force');
+const staleOwner = json(runOk(['claim', 'reisi007/demo', '1']));
+const forcedClaim = json(runOk(['claim', 'reisi007/demo', '1', '--force', '--confirm-stale']));
+assert.notEqual(forcedClaim.owner_token, staleOwner.owner_token);
+runRefused(['checkpoint', 'triaged', '--owner-token', staleOwner.owner_token]);
 runOk(['release', '--force', '--confirm-stale']);
-assert.equal(fs.existsSync(lockPath()), false);
-ok('release --force clears a corrupt lock');
+ok('confirmed stale recovery rotates ownership and force release clears the SQLite claim');
+
+const retryHome = path.join(TMP, 'cli-retry-home');
+const retryEnv = { ISSUE_ORCHESTRATOR_HOME: retryHome };
+let retryClaim = json(runOk(['claim', 'reisi007/demo', '1'], { env: retryEnv }));
+const retryStore = new SQLiteStore(path.join(retryHome, 'orchestrator.sqlite3'));
+const retryJob = retryStore.rows('SELECT id, work_item_id FROM jobs WHERE owner_token=?', retryClaim.owner_token)[0];
+assert.ok(retryJob, 'the CLI claim should have a persisted job');
+retryStore.db.prepare('UPDATE jobs SET max_attempts=3 WHERE id=?').run(retryJob.id);
+const retriesBeforeExhaustion = Number(retryStore.rows('SELECT COUNT(*) AS count FROM jobs WHERE work_item_id=?', retryJob.work_item_id)[0].count);
+for (let attempt = 2; attempt <= 3; attempt += 1) {
+  retryStore.db.prepare('UPDATE jobs SET lease_expires_at=? WHERE id=?').run(new Date(0).toISOString(), retryJob.id);
+  retryClaim = json(runOk(
+    ['claim', 'reisi007/demo', '1', '--force', '--confirm-stale'],
+    { env: retryEnv },
+  ));
+}
+retryStore.db.prepare('UPDATE jobs SET lease_expires_at=? WHERE id=?').run(new Date(0).toISOString(), retryJob.id);
+const exhaustedCliClaim = runRefused(
+  ['claim', 'reisi007/demo', '1', '--force', '--confirm-stale'],
+  { env: retryEnv },
+);
+assert.match(exhaustedCliClaim.err, /exhausted max_attempts/);
+const exhaustedCliJob = retryStore.rows('SELECT state, attempts, max_attempts FROM jobs WHERE id=?', retryJob.id)[0];
+assert.equal(exhaustedCliJob.state, 'FAILED');
+assert.equal(exhaustedCliJob.attempts, 3);
+assert.equal(exhaustedCliJob.max_attempts, 3);
+assert.equal(
+  Number(retryStore.rows('SELECT COUNT(*) AS count FROM jobs WHERE work_item_id=?', retryJob.work_item_id)[0].count),
+  retriesBeforeExhaustion,
+  'a fourth CLI claim must not create another job for an exhausted work item',
+);
+assert.equal(retryStore.readLock(), null);
+retryStore.close();
+ok('CLI claims cannot reset the retry budget after three expired leases');
 
 // --- CLI: merge gate --------------------------------------------------------
 
@@ -736,16 +731,89 @@ ok('evidence refuses mismatched remotes, credential-like content and hidden cred
 
 // --- config isolation -------------------------------------------------------
 
-assert.ok(fs.existsSync(path.join(TMP, 'state.json')));
+assert.ok(fs.existsSync(lockPath()));
 const homeConfigDir = path.join(os.homedir(), '.config', 'issue-orchestrator');
-const homeLock = path.join(homeConfigDir, 'lock.json');
-const homeExisted = fs.existsSync(homeLock);
+const homeDatabase = path.join(homeConfigDir, 'orchestrator.sqlite3');
+const homeExisted = fs.existsSync(homeDatabase);
 runOk(['claim', 'reisi007/demo', '1']);
 assert.ok(fs.existsSync(lockPath()));
-assert.equal(fs.existsSync(homeLock), homeExisted);
+assert.equal(fs.existsSync(homeDatabase), homeExisted);
 const finalToken = readLock().owner_token;
 runOk(['release', '--result', 'none', '--owner-token', finalToken]);
-ok('--config keeps runtime state in its config directory and never touches the live home dir');
+assert.equal(fs.existsSync(path.join(TMP, 'state.json')), false);
+assert.equal(fs.existsSync(path.join(TMP, 'lock.json')), false);
+ok('--config uses the isolated SQLite runtime home without creating JSON lock/state files');
+
+const corruptLegacyHome = path.join(TMP, 'corrupt-legacy-home');
+const corruptLegacyConfig = path.join(corruptLegacyHome, 'config.jsonc');
+fs.mkdirSync(corruptLegacyHome, { recursive: true });
+write(corruptLegacyConfig, fs.readFileSync(CONFIG, 'utf8'));
+write(path.join(corruptLegacyHome, 'lock.json'), '{ malformed lock');
+write(path.join(corruptLegacyHome, 'state.json'), {
+  active: { repo: 'reisi007/demo', issue: 1, owner_token: 'old-owner' },
+  last_run: '2026-01-01T00:00:00.000Z',
+});
+const corruptLegacyEnv = {
+  ISSUE_ORCHESTRATOR_HOME: corruptLegacyHome,
+  ISSUE_ORCHESTRATOR_CONFIG: corruptLegacyConfig,
+};
+const unconfirmedRecovery = run(['release', '--force'], { env: corruptLegacyEnv });
+assert.notEqual(unconfirmedRecovery.code, 0);
+assert.match(unconfirmedRecovery.err, /--confirm-stale/);
+assert.ok(fs.existsSync(path.join(corruptLegacyHome, 'lock.json')), 'unconfirmed recovery must preserve the malformed file');
+const recoveredLegacy = json(runOk(['release', '--force', '--confirm-stale'], { env: corruptLegacyEnv }));
+assert.equal(recoveredLegacy.reason, 'corrupt legacy lock quarantined');
+assert.ok(fs.existsSync(recoveredLegacy.quarantine));
+assert.ok(fs.existsSync(recoveredLegacy.state_backup));
+assert.equal(fs.existsSync(path.join(corruptLegacyHome, 'lock.json')), false);
+assert.equal(json(runOk(['status'], { env: corruptLegacyEnv })).lock, null);
+ok('confirmed force release quarantines malformed legacy ownership and its matching state backup');
+
+const unrelatedLegacyHome = path.join(TMP, 'unrelated-corrupt-legacy-home');
+const unrelatedLegacyConfig = path.join(unrelatedLegacyHome, 'config.jsonc');
+fs.mkdirSync(unrelatedLegacyHome, { recursive: true });
+write(unrelatedLegacyConfig, fs.readFileSync(CONFIG, 'utf8'));
+const unrelatedOwnerToken = 'unrelated-sqlite-owner';
+const unrelatedDbPath = path.join(unrelatedLegacyHome, 'orchestrator.sqlite3');
+const unrelatedStore = new SQLiteStore(unrelatedDbPath);
+const unrelatedNow = new Date().toISOString();
+unrelatedStore.acquireLock({
+  provider: 'github', repo: 'reisi007/demo', issue: 2, branch: null, account: 'reisi007',
+  config_file: unrelatedLegacyConfig, owner_token: unrelatedOwnerToken, stage: 'claimed',
+  claimed_at: unrelatedNow, updated_at: unrelatedNow, local_only: true,
+});
+const unrelatedPointerBefore = unrelatedStore.rows(
+  'SELECT active_job_id FROM runtime_state WHERE config_file=?', path.resolve(unrelatedLegacyConfig),
+)[0].active_job_id;
+unrelatedStore.close();
+write(path.join(unrelatedLegacyHome, 'lock.json'), '{ malformed lock');
+write(path.join(unrelatedLegacyHome, 'state.json'), {
+  active: {
+    repo: 'reisi007/demo', issue: 999, owner_token: 'different-legacy-owner',
+    config_file: unrelatedLegacyConfig,
+  },
+  last_run: '2026-01-01T00:00:00.000Z',
+});
+const unrelatedLegacyEnv = {
+  ISSUE_ORCHESTRATOR_HOME: unrelatedLegacyHome,
+  ISSUE_ORCHESTRATOR_CONFIG: unrelatedLegacyConfig,
+};
+const unrelatedRecovery = json(runOk(
+  ['release', '--force', '--confirm-stale'],
+  { env: unrelatedLegacyEnv },
+));
+assert.equal(unrelatedRecovery.reason, 'corrupt legacy lock quarantined');
+assert.ok(fs.existsSync(unrelatedRecovery.quarantine));
+const preservedStore = new SQLiteStore(unrelatedDbPath);
+assert.equal(preservedStore.readLock().owner_token, unrelatedOwnerToken);
+assert.equal(preservedStore.readState(unrelatedLegacyConfig).active.owner_token, unrelatedOwnerToken);
+assert.equal(
+  preservedStore.rows('SELECT active_job_id FROM runtime_state WHERE config_file=?', path.resolve(unrelatedLegacyConfig))[0].active_job_id,
+  unrelatedPointerBefore,
+  'quarantining mismatched legacy ownership must preserve the SQLite runtime-state pointer',
+);
+preservedStore.close();
+ok('corrupt legacy quarantine preserves an unrelated active SQLite job and its runtime pointer');
 
 fs.rmSync(TMP, { recursive: true, force: true });
 console.log(`\n${passed} checks passed`);
