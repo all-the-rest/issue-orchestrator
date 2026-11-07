@@ -25,3 +25,12 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm test
+      - name: Validate gates
+        uses: all-the-rest/ratchet-cli@4cace52ac7731985130292ead6ae81d44b4d72d6 # v0.6.3
+        with:
+          version: v0.6.3
+          tier: fast
+      - name: Render the report
+        if: always()
+        shell: bash
+        run: ratchet report --format md >> "$GITHUB_STEP_SUMMARY"
