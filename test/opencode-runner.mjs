@@ -1,0 +1,1243 @@
+#!/usr/bin/env node
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { spawn, spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { SQLiteStore } from '../dist/core/persistence.js';
+import { git as hostGit } from '../dist/git/index.js';
+import { AgentResultContractError, AgentRunnerError, OpenCodeAgentRunner } from '../dist/providers/opencode-runner.js';
+
+const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'issue-orchestrator-agent-runner-'));
+const FAKE_OPENCODE = path.join(TMP, 'fake-opencode');
+const FAKE_OCI = path.join(TMP, 'fake-docker');
+const TIMEOUT_CHILD = path.join(TMP, 'timeout-child.mjs');
+const OCI_TRACE = path.join(TMP, 'oci-trace.ndjson');
+const OCI_ACTIVE = path.join(TMP, 'oci-active');
+const OCI_FAIL_IMAGE = path.join(TMP, 'oci-fail-image');
+const OCI_FAIL_CLEANUP = path.join(TMP, 'oci-fail-cleanup');
+const OCI_LEAVE_ACTIVE = path.join(TMP, 'oci-leave-active');
+const OCI_HANG = path.join(TMP, 'oci-hang');
+const OCI_ROOTLESS = path.join(TMP, 'oci-rootless');
+const FAKE_ORPHAN_PID = path.join(TMP, 'fake-orphan.pid');
+const EXTERNAL_TEMPS = [];
+process.env.ISSUE_ORCHESTRATOR_HOME = path.join(TMP, 'orchestrator-runtime');
+let passed = 0;
+
+function ok(name) {
+  passed += 1;
+  console.log(`PASS ${name}`);
+}
+
+function git(args, cwd) {
+  const result = spawnSync('git', args, { cwd, encoding: 'utf8' });
+  assert.equal(result.status, 0, `git ${args.join(' ')} failed: ${result.stderr}`);
+  return result.stdout.trim();
+}
+
+function createWorktree(name, base = TMP) {
+  const repo = path.join(base, `${name}-repo`);
+  const worktree = path.join(base, `${name}-worktree`);
+  fs.mkdirSync(repo, { recursive: true });
+  git(['init', '--initial-branch=main'], repo);
+  git(['config', 'user.name', 'Issue Orchestrator Test'], repo);
+  git(['config', 'user.email', 'test@example.invalid'], repo);
+  fs.writeFileSync(path.join(repo, 'README.md'), 'fixture\n');
+  git(['add', 'README.md'], repo);
+  git(['commit', '-m', 'fixture'], repo);
+  git(['worktree', 'add', '-b', `test/${name}`, worktree, 'HEAD'], repo);
+  return worktree;
+}
+
+function createBuilderWorktree(name) {
+  const storeResult = spawnSync('pnpm', ['store', 'path', '--silent'], {
+    cwd: process.cwd(), encoding: 'utf8',
+  });
+  assert.equal(storeResult.status, 0, `pnpm store lookup failed: ${storeResult.stderr}`);
+  const store = fs.realpathSync(storeResult.stdout.trim());
+  const fixtureParent = path.dirname(path.dirname(store));
+  const base = fs.mkdtempSync(path.join(fixtureParent, 'issue-orchestrator-builder-test-'));
+  EXTERNAL_TEMPS.push(base);
+  return createWorktree(name, base);
+}
+
+function makeJob(store, issue) {
+  const job = store.claimWorkItem('example/project', issue, { workerId: 'opencode-runner-test' });
+  assert.ok(job, 'test job should be claimed');
+  return Number(job.id);
+}
+
+function writeFakeOpenCode() {
+  fs.writeFileSync(TIMEOUT_CHILD, `import fs from 'node:fs';
+process.on('SIGTERM', () => {});
+setInterval(() => fs.appendFileSync(process.env.FAKE_HEARTBEAT, 'd'), 10);
+`);
+  fs.writeFileSync(FAKE_OCI, `#!/usr/bin/env node
+import fs from 'node:fs';
+const args = process.argv.slice(2);
+const active = ${JSON.stringify(OCI_ACTIVE)};
+const trace = ${JSON.stringify(OCI_TRACE)};
+const failImage = ${JSON.stringify(OCI_FAIL_IMAGE)};
+const failCleanup = ${JSON.stringify(OCI_FAIL_CLEANUP)};
+const leaveActive = ${JSON.stringify(OCI_LEAVE_ACTIVE)};
+const hang = ${JSON.stringify(OCI_HANG)};
+const containerID = 'f'.repeat(64);
+fs.appendFileSync(trace, JSON.stringify({ args, env: process.env }) + String.fromCharCode(10));
+if (args[0] === 'info') {
+  if (args.some((arg) => arg.includes('SecurityOptions'))) {
+    process.stdout.write(fs.existsSync(${JSON.stringify(OCI_ROOTLESS)}) ? '["name=rootless"]\\n' : '[]\\n');
+  } else {
+    process.stdout.write(fs.existsSync(${JSON.stringify(OCI_ROOTLESS)}) ? 'true\\n' : 'false\\n');
+  }
+} else if (args[0] === 'image' && args[1] === 'inspect') {
+  if (fs.existsSync(failImage)) process.exit(1);
+  process.stdout.write('sha256:' + 'a'.repeat(64) + String.fromCharCode(10));
+} else if (args[0] === 'container' && args[1] === 'ls') {
+  if (fs.existsSync(active)) process.stdout.write(containerID + String.fromCharCode(10));
+} else if (args[0] === 'container' && args[1] === 'rm') {
+  if (fs.existsSync(failCleanup)) process.exit(1);
+  try { fs.unlinkSync(active); } catch {}
+} else if (args[0] === 'run') {
+  fs.writeFileSync(active, 'active');
+  if (fs.existsSync(hang)) {
+    process.on('SIGTERM', () => {});
+    setInterval(() => {}, 1000);
+  } else if (!fs.existsSync(leaveActive)) fs.unlinkSync(active);
+}
+`);
+  fs.chmodSync(FAKE_OCI, 0o755);
+  const source = `#!/usr/bin/env node
+import fs from 'node:fs';
+import path from 'node:path';
+import { spawn, spawnSync } from 'node:child_process';
+const args = process.argv.slice(2);
+const mode = process.env.FAKE_OPENCODE_MODE || 'success';
+if (process.env.FAKE_OPENCODE_SPAWN_LOG) {
+  fs.appendFileSync(process.env.FAKE_OPENCODE_SPAWN_LOG, String(process.pid) + String.fromCharCode(10));
+}
+const configFile = process.env.OPENCODE_CONFIG;
+const prompt = args.at(-1) || '';
+const resultMatch = /absolute path ("[^"]+") with required fields/.exec(prompt);
+const resultFile = resultMatch ? JSON.parse(resultMatch[1]) : path.join(process.cwd(), '.issue-orchestrator', 'result.json');
+const nodeEval = (code, args = []) => 'node -e ' + String.fromCharCode(34) + code + String.fromCharCode(34) +
+  args.map((arg) => ' ' + arg).join('');
+const report = {
+  args,
+  path: process.env.PATH,
+  cwd: process.cwd(),
+  config: configFile && fs.existsSync(configFile) ? JSON.parse(fs.readFileSync(configFile, 'utf8')) : null,
+  home: process.env.HOME,
+  xdgConfigHome: process.env.XDG_CONFIG_HOME,
+  xdgDataHome: process.env.XDG_DATA_HOME ?? null,
+  hostAuthReadable: process.env.XDG_DATA_HOME
+    ? fs.readFileSync(path.join(process.env.XDG_DATA_HOME, 'opencode', 'auth.json'), 'utf8') === 'test saved OpenCode auth'
+    : false,
+  gitConfigGlobal: process.env.GIT_CONFIG_GLOBAL ?? null,
+  sshAuthSock: process.env.SSH_AUTH_SOCK ?? null,
+  awsProfile: process.env.AWS_PROFILE ?? null,
+  httpsProxy: process.env.HTTPS_PROXY ?? null,
+  githubToken: process.env.GITHUB_TOKEN ?? null,
+  ghToken: process.env.GH_TOKEN ?? null,
+  openaiApiKey: process.env.OPENAI_API_KEY ?? null,
+  ownerToken: process.env.ISSUE_ORCHESTRATOR_OWNER_TOKEN ?? null,
+};
+if (process.env.FAKE_OPENCODE_REPORT) fs.writeFileSync(process.env.FAKE_OPENCODE_REPORT, JSON.stringify(report));
+if (mode === 'question') {
+  process.stdout.write(JSON.stringify({ type: 'tool_use', part: { tool: 'question' } }) + String.fromCharCode(10));
+  setInterval(() => {}, 1000);
+} else if (mode === 'timeout') {
+  const child = spawn(process.execPath, [${JSON.stringify(TIMEOUT_CHILD)}], { stdio: 'ignore' });
+  fs.writeFileSync(process.env.FAKE_DESCENDANT_PID, String(child.pid));
+  // The parent exits on TERM; its stdio-independent descendant must still be KILLed.
+  process.on('SIGTERM', () => process.exit(0));
+  setInterval(() => fs.appendFileSync(process.env.FAKE_HEARTBEAT, 'x'), 10);
+} else if (mode === 'orphan') {
+  fs.writeFileSync(process.env.FAKE_ORPHAN_PID, String(process.pid));
+  setInterval(() => fs.appendFileSync(process.env.FAKE_HEARTBEAT, 'o'), 10);
+} else {
+  if (mode.startsWith('builder')) {
+    const command = mode === 'builder-hang'
+      ? 'sleep 300'
+      : mode === 'builder-real-commit'
+        ? (() => {
+          const sentinel = Buffer.from(process.env.FAKE_OPENCODE_HOST_SENTINEL ?? '').toString('base64');
+          const noCredentials = nodeEval("const re=/(TOKEN|SECRET|PASSWORD|CREDENTIAL|API_KEY|SSH_AUTH_SOCK|DOCKER_HOST)/i;if(Object.keys(process.env).some((key)=>re.test(key))||process.env.XDG_DATA_HOME)process.exit(1)");
+          const hostFiles = [sentinel, process.env.FAKE_OPENCODE_HOST_AUTH_FILE, process.env.FAKE_OPENCODE_HOST_CREDENTIAL_FILE]
+            .filter(Boolean).map((file) => Buffer.from(file).toString('base64'));
+          const noHostFiles = nodeEval("const fs=require('node:fs');const files=process.argv.slice(1).map((value)=>Buffer.from(value,'base64').toString());if(files.some((file)=>fs.existsSync(file))||['/tmp/home/.aws/credentials','/tmp/home/.ssh','/tmp/home/.config/gh/hosts.yml','/tmp/home/.local/share/opencode/auth.json'].some((file)=>fs.existsSync(file)))process.exit(1)", hostFiles);
+          const readonlyRoot = nodeEval("const fs=require('node:fs');const line=fs.readFileSync('/proc/mounts','utf8').split(String.fromCharCode(10)).find((entry)=>entry.split(' ')[1]==='/');if(!line||!line.split(' ')[3].split(',').includes('ro'))process.exit(1)");
+          const noSockets = nodeEval("const fs=require('node:fs');const paths=['/var/run/docker.sock','/run/docker.sock','/run/podman/podman.sock'];try{for(const user of fs.readdirSync('/run/user'))paths.push('/run/user/'+user+'/docker.sock','/run/user/'+user+'/podman/podman.sock','/run/user/'+user+'/podman/podman/podman.sock')}catch{}if(paths.some((file)=>fs.existsSync(file)))process.exit(1)");
+          const attemptOutsideWrite = nodeEval("const fs=require('node:fs');const p=Buffer.from(process.argv[1],'base64').toString();try{fs.writeFileSync(p,'tampered');process.exit(41)}catch(error){if(!['ENOENT','EROFS','EACCES','EPERM'].includes(error.code))process.exit(42)}", [sentinel]);
+          const pushBlocked = nodeEval("const cp=require('node:child_process');const result=cp.spawnSync('git',['push','--dry-run','https://example.invalid/issue-orchestrator/smoke.git','HEAD:refs/heads/smoke'],{env:{...process.env,GIT_TERMINAL_PROMPT:'0'},timeout:5000,stdio:'ignore'});if(result.status===0)process.exit(1)");
+          const protectGitMetadata = nodeEval("const fs=require('node:fs');const path=require('node:path');const cp=require('node:child_process');const common=cp.execFileSync('git',['rev-parse','--git-common-dir'],{encoding:'utf8'}).trim();const worktreeGit=cp.execFileSync('git',['rev-parse','--git-dir'],{encoding:'utf8'}).trim();const protectedPaths=['/workspace/.git',path.join(common,'config'),path.join(worktreeGit,'config.worktree'),path.join(worktreeGit,'commondir'),path.join(worktreeGit,'gitdir')];for(const file of protectedPaths){try{fs.appendFileSync(file,'attacker');process.exit(41)}catch(error){if(!['EROFS','EACCES','EPERM'].includes(error.code))process.exit(42)}}try{fs.mkdirSync(path.join(common,'worktrees','attacker-fake'));process.exit(43)}catch(error){if(!['EROFS','EACCES','EPERM'].includes(error.code))process.exit(44)}const hooks=path.join(common,'agent-planted-hooks');fs.mkdirSync(hooks,{recursive:true});fs.writeFileSync(path.join(hooks,'pre-push'),['#!/bin/sh','printf ran > /workspace/.issue-orchestrator/pre-push-ran','exit 1',''].join(String.fromCharCode(10)),{mode:0o755})");
+          return [
+            "node -e 'process.exit(process.versions.node.startsWith(String.fromCharCode(50,52,46)) ? 0 : 1)'",
+            'COREPACK_ENABLE_NETWORK=0 pnpm --version | grep -Fx 11.23.0 >/dev/null',
+            'COREPACK_ENABLE_NETWORK=0 pnpm store path --silent | grep -Fx /pnpm-store/v11 >/dev/null',
+            'test -r /pnpm-store/v11 && test ! -w /pnpm-store/v11',
+            noCredentials,
+            noHostFiles,
+            readonlyRoot,
+            noSockets,
+            '! command -v gh >/dev/null 2>&1 && ! command -v glab >/dev/null 2>&1',
+            attemptOutsideWrite,
+            pushBlocked,
+            protectGitMetadata,
+            "printf 'container commit\\n' >> README.md && git add README.md && git commit -m oci-sandbox-smoke",
+          ].join(' && ');
+        })()
+        : 'git status --short';
+    const shell = spawnSync(report.config.shell, ['-l', '-c', command], {
+      cwd: process.cwd(), env: process.env, encoding: 'utf8', stdio: 'inherit',
+    });
+    if (shell.error || shell.status !== 0) process.exit(shell.status || 1);
+    if (mode === 'builder-hang') setInterval(() => {}, 1000);
+  }
+  if (mode === 'invalid-json') fs.writeFileSync(resultFile, '{');
+  else if (mode === 'invalid-schema') fs.writeFileSync(resultFile, JSON.stringify({ status: 'DONE' }));
+  else if (mode !== 'missing') {
+    const status = mode === 'blocked' ? 'BLOCKED' : mode === 'changes-required' ? 'CHANGES_REQUIRED' : 'DONE';
+    fs.writeFileSync(resultFile, JSON.stringify({
+      status,
+      summary: status === 'BLOCKED' ? 'Waiting for input' : 'Finished fixture task',
+      changed_files: ['README.md'], commands: ['pnpm test'], acceptance: ['fixture acceptance passed'],
+      blocked_reason: status === 'BLOCKED' ? 'Which acceptance target should be used?' : null,
+      evidence_dir: null, verdict: status === 'DONE' ? 'PASS' : status,
+    }));
+  }
+  process.stdout.write(JSON.stringify({ type: 'step_finish', part: {
+    cost: 0.004, tokens: { input: 11, output: 7, reasoning: 2, cache: { read: 3, write: 4 } },
+  } }) + String.fromCharCode(10));
+}
+`;
+  fs.writeFileSync(FAKE_OPENCODE, source);
+  fs.chmodSync(FAKE_OPENCODE, 0o755);
+}
+
+function runnerFor(store, options = {}) {
+  return new OpenCodeAgentRunner({
+    store,
+    executable: options.executable ?? FAKE_OPENCODE,
+    timeoutMs: options.timeoutMs ?? 5_000,
+    terminationGraceMs: options.terminationGraceMs ?? 50,
+    containerRuntime: options.containerRuntime,
+    environment: { ...process.env, FAKE_OPENCODE_MODE: 'success', ...options.environment },
+  });
+}
+
+function readReport(file) {
+  return JSON.parse(fs.readFileSync(file, 'utf8'));
+}
+
+function readOciTrace() {
+  if (!fs.existsSync(OCI_TRACE)) return [];
+  return fs.readFileSync(OCI_TRACE, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+}
+
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function isRunning(pid) {
+  try {
+    process.kill(pid, 0);
+    if (process.platform === 'linux') {
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+      return stat.slice(stat.lastIndexOf(')') + 2).split(' ')[0] !== 'Z';
+    }
+    if (process.platform === 'darwin') {
+      const status = spawnSync('/bin/ps', ['-p', String(pid), '-o', 'state='], { encoding: 'utf8' });
+      if (status.error) throw status.error;
+      if (status.status !== 0) return false;
+      const state = status.stdout.trim();
+      return !!state && state[0].toUpperCase() !== 'Z' && state[0].toUpperCase() !== 'X';
+    }
+    return true;
+  } catch (error) {
+    if (error.code === 'ESRCH') return false;
+    throw error;
+  }
+}
+
+try {
+  writeFakeOpenCode();
+
+  // Valid result, NDJSON capture, accounting and environment scrubbing.
+  {
+    const worktree = createWorktree('result');
+    const store = new SQLiteStore(path.join(TMP, 'result.sqlite3'));
+    const jobId = makeJob(store, 501);
+    const reportFile = path.join(TMP, 'success-report.json');
+    const providerBin = path.join(TMP, 'provider-bin');
+    const trustedData = path.join(TMP, 'trusted-opencode-data');
+    fs.mkdirSync(providerBin);
+    fs.mkdirSync(path.join(trustedData, 'opencode'), { recursive: true });
+    fs.writeFileSync(path.join(trustedData, 'opencode', 'auth.json'), 'test saved OpenCode auth');
+    fs.writeFileSync(path.join(providerBin, 'gh'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    const runner = runnerFor(store, { environment: {
+      FAKE_OPENCODE_REPORT: reportFile,
+      GITHUB_TOKEN: 'must-not-pass', GH_TOKEN: 'must-not-pass',
+      ISSUE_ORCHESTRATOR_OWNER_TOKEN: 'must-not-pass',
+      HOME: os.homedir(), XDG_CONFIG_HOME: path.join(os.homedir(), '.config'),
+      XDG_DATA_HOME: trustedData,
+      GIT_CONFIG_GLOBAL: path.join(os.homedir(), '.gitconfig'), SSH_AUTH_SOCK: '/tmp/host-agent.sock',
+      AWS_PROFILE: 'host-profile', HTTPS_PROXY: 'http://host-user:host-password@proxy.example.invalid:8080',
+      PATH: `${providerBin}${path.delimiter}${process.env.PATH}`,
+    } });
+    const session = await runner.createSession({ jobId, role: 'verifier', model: 'test/model', worktree });
+    const result = await runner.run({ sessionId: session.externalSessionId, prompt: 'Verify this fixture.' });
+    assert.equal(result.status, 'DONE');
+    assert.deepEqual(await runner.getResult({ sessionId: session.externalSessionId }), result);
+    const record = store.getAgentSession(session.externalSessionId);
+    assert.equal(record.status, 'DONE');
+    assert.equal(record.externalSessionId, session.externalSessionId);
+    assert.equal(record.role, 'verifier');
+    assert.equal(record.model, 'test/model');
+    assert.equal(record.worktree, fs.realpathSync(worktree));
+    assert.ok(record.startedAt && record.endedAt);
+    assert.deepEqual([
+      record.inputTokens, record.outputTokens, record.reasoningTokens,
+      record.cacheReadTokens, record.cacheWriteTokens, record.costUsd,
+    ], [11, 7, 2, 3, 4, 0.004]);
+    assert.match(fs.readFileSync(record.ndjsonPath, 'utf8'), /step_finish/);
+    const report = readReport(reportFile);
+    const profile = Object.values(report.config.agents)[0];
+    assert.equal(report.githubToken, null);
+    assert.equal(report.ghToken, null);
+    assert.equal(report.ownerToken, null);
+    assert.equal(report.home, os.homedir(), 'trusted OpenCode control plane must retain its host HOME');
+    assert.notEqual(report.xdgConfigHome, path.join(os.homedir(), '.config'));
+    assert.equal(report.xdgDataHome, trustedData, 'saved OpenCode auth data must remain available to the control plane');
+    assert.equal(report.hostAuthReadable, true, 'subprocess must be able to read saved host-side OpenCode auth');
+    assert.equal(report.gitConfigGlobal, null);
+    assert.equal(report.sshAuthSock, null);
+    assert.equal(report.awsProfile, null);
+    assert.equal(report.httpsProxy, null, 'proxy credentials must not be inherited');
+    assert.equal(report.openaiApiKey, null, 'provider API keys are not inherited as environment variables');
+    assert.ok(report.args.includes('--standalone') && report.args.includes('--auto'));
+    assert.ok(report.args.includes('--format') && report.args.includes('json'));
+    assert.ok(report.args.includes(session.externalSessionId));
+    assert.ok(report.args.some((arg) => arg.startsWith('issue-orchestrator-verifier-')));
+    assert.ok(!report.path.split(path.delimiter).includes(providerBin), 'the original provider CLI directory must be absent');
+    assert.equal(fs.existsSync(path.join(report.path, 'gh')), false, 'gh must not be available on agent PATH');
+    assert.ok(profile.permissions.some((rule) => (
+      rule.action === 'question' && rule.resource === '*' && rule.effect === 'deny'
+    )));
+    assert.ok(profile.permissions.some((rule) => (
+      rule.action === 'shell' && rule.resource === '*' && rule.effect === 'deny'
+    )), 'verifier shell requests, including pnpm test/build, must be rejected');
+    assert.ok(!profile.permissions.some((rule) => rule.action === 'shell' && rule.effect === 'allow'));
+    assert.ok(!record.ndjsonPath.startsWith(`${worktree}${path.sep}`), 'captured logs must live outside the agent-controlled worktree');
+    assert.equal(fs.statSync(path.dirname(record.ndjsonPath)).mode & 0o777, 0o700);
+    assert.equal(fs.statSync(record.ndjsonPath).mode & 0o777, 0o600);
+    store.close();
+    ok('OpenCode captures NDJSON privately, rejects verifier shell requests, and scrubs host credentials');
+  }
+
+  // A worktree-controlled sessions symlink cannot redirect captured output.
+  {
+    const worktree = createWorktree('worktree-log-symlink');
+    const worktreeRuntime = path.join(worktree, '.issue-orchestrator');
+    const redirect = path.join(TMP, 'worktree-log-redirect');
+    fs.mkdirSync(worktreeRuntime);
+    fs.mkdirSync(redirect);
+    fs.symlinkSync(redirect, path.join(worktreeRuntime, 'sessions'), 'dir');
+    const store = new SQLiteStore(path.join(TMP, 'worktree-log-symlink.sqlite3'));
+    const runner = runnerFor(store);
+    const session = await runner.createSession({
+      jobId: makeJob(store, 512), role: 'verifier', model: 'test/model', worktree,
+    });
+    const result = await runner.run({ sessionId: session.externalSessionId, prompt: 'Ignore the worktree log link.' });
+    assert.equal(result.status, 'DONE');
+    assert.ok(!store.getAgentSession(session.externalSessionId).ndjsonPath.startsWith(`${worktreeRuntime}${path.sep}`));
+    assert.deepEqual(fs.readdirSync(redirect), [], 'worktree symlink target must receive no captured logs');
+    store.close();
+    ok('worktree-controlled sessions symlink cannot redirect runtime logs');
+  }
+
+  // Neither persisted output path may be a symlink, even if it targets a writable host file.
+  for (const [field, issue] of [['ndjsonPath', 513], ['stderrPath', 514]]) {
+    const worktree = createWorktree(`persisted-${field}-symlink`);
+    const store = new SQLiteStore(path.join(TMP, `persisted-${field}-symlink.sqlite3`));
+    const runner = runnerFor(store);
+    const session = await runner.createSession({
+      jobId: makeJob(store, issue), role: 'verifier', model: 'test/model', worktree,
+    });
+    const record = store.getAgentSession(session.externalSessionId);
+    const target = path.join(TMP, `${field}-target`);
+    fs.writeFileSync(target, 'must remain unchanged');
+    fs.symlinkSync(target, record[field]);
+    await assert.rejects(
+      runner.run({ sessionId: session.externalSessionId, prompt: 'Attempt to redirect output.' }),
+      AgentRunnerError,
+    );
+    assert.equal(fs.readFileSync(target, 'utf8'), 'must remain unchanged');
+    store.close();
+  }
+  ok('persisted NDJSON and stderr symlinks are rejected without modifying their targets');
+
+  // The configured runtime directory itself must also be a real directory.
+  {
+    const previousHome = process.env.ISSUE_ORCHESTRATOR_HOME;
+    const runtimeHome = path.join(TMP, 'directory-symlink-runtime');
+    const redirect = path.join(TMP, 'directory-symlink-target');
+    process.env.ISSUE_ORCHESTRATOR_HOME = runtimeHome;
+    fs.mkdirSync(runtimeHome, { recursive: true });
+    fs.mkdirSync(redirect);
+    fs.symlinkSync(redirect, path.join(runtimeHome, 'agent-sessions'), 'dir');
+    const worktree = createWorktree('runtime-directory-symlink');
+    const store = new SQLiteStore(path.join(TMP, 'runtime-directory-symlink.sqlite3'));
+    const runner = runnerFor(store);
+    try {
+      await assert.rejects(
+        runner.createSession({ jobId: makeJob(store, 516), role: 'verifier', model: 'test/model', worktree }),
+        (error) => error instanceof AgentRunnerError && error.code === 'INVALID_AGENT_SESSION',
+      );
+      assert.deepEqual(fs.readdirSync(redirect), []);
+      assert.equal(Number(store.rows('SELECT COUNT(*) AS count FROM agent_sessions')[0].count), 0);
+    } finally {
+      process.env.ISSUE_ORCHESTRATOR_HOME = previousHome;
+      store.close();
+    }
+    ok('symlinked runtime log directory is rejected before persistence');
+  }
+
+  // Required private-directory chmod errors fail closed before session persistence.
+  {
+    const previousHome = process.env.ISSUE_ORCHESTRATOR_HOME;
+    const runtimeHome = path.join(TMP, 'chmod-failure-runtime');
+    process.env.ISSUE_ORCHESTRATOR_HOME = runtimeHome;
+    fs.mkdirSync(path.join(runtimeHome, 'agent-sessions'), { recursive: true, mode: 0o700 });
+    const worktree = createWorktree('chmod-failure');
+    const store = new SQLiteStore(path.join(TMP, 'chmod-failure.sqlite3'));
+    const runner = runnerFor(store);
+    const originalChmod = fs.chmodSync;
+    fs.chmodSync = (file, mode) => {
+      if (path.resolve(String(file)) === path.join(runtimeHome, 'agent-sessions')) {
+        const error = new Error('injected chmod failure');
+        error.code = 'EPERM';
+        throw error;
+      }
+      return originalChmod(file, mode);
+    };
+    try {
+      await assert.rejects(
+        runner.createSession({ jobId: makeJob(store, 515), role: 'verifier', model: 'test/model', worktree }),
+        (error) => error instanceof AgentRunnerError && error.code === 'INVALID_AGENT_SESSION',
+      );
+      assert.equal(Number(store.rows('SELECT COUNT(*) AS count FROM agent_sessions')[0].count), 0);
+    } finally {
+      fs.chmodSync = originalChmod;
+      process.env.ISSUE_ORCHESTRATOR_HOME = previousHome;
+      store.close();
+    }
+    ok('private agent-storage chmod failures fail closed before persistence');
+  }
+
+  // A question attempt is killed even if a CLI regression emits the tool event.
+  {
+    const worktree = createWorktree('question');
+    const store = new SQLiteStore(path.join(TMP, 'question.sqlite3'));
+    const runner = runnerFor(store, { environment: { FAKE_OPENCODE_MODE: 'question' } });
+    const session = await runner.createSession({
+      jobId: makeJob(store, 502), role: 'triage', model: 'test/model', worktree,
+    });
+    await assert.rejects(
+      runner.run({ sessionId: session.externalSessionId, prompt: 'Try to ask a question.' }),
+      (error) => error instanceof AgentRunnerError && error.code === 'AGENT_QUESTION_DENIED',
+    );
+    assert.equal(store.getAgentSession(session.externalSessionId).status, 'FAILED');
+    assert.equal(store.getAgentSession(session.externalSessionId).errorClass, 'AGENT_QUESTION_DENIED');
+    store.close();
+    ok('question-tool attempts terminate instead of blocking and persist FAILED');
+  }
+
+  // Timeout must TERM and then KILL the entire detached process group.
+  {
+    const worktree = createWorktree('timeout');
+    const store = new SQLiteStore(path.join(TMP, 'timeout.sqlite3'));
+    const pidFile = path.join(TMP, 'descendant.pid');
+    const heartbeat = path.join(TMP, 'timeout-heartbeat');
+    const runner = runnerFor(store, { environment: {
+      FAKE_OPENCODE_MODE: 'timeout', FAKE_DESCENDANT_PID: pidFile, FAKE_HEARTBEAT: heartbeat,
+    } });
+    const session = await runner.createSession({
+      jobId: makeJob(store, 503), role: 'verifier', model: 'test/model', worktree,
+    });
+    const started = Date.now();
+    await assert.rejects(
+      runner.run({ sessionId: session.externalSessionId, prompt: 'Timeout this process group.', timeoutMs: 150 }),
+      (error) => error instanceof AgentRunnerError && error.code === 'AGENT_TIMEOUT',
+    );
+    assert.ok(Date.now() - started >= 150);
+    const descendantPid = Number(fs.readFileSync(pidFile, 'utf8'));
+    await wait(100);
+    const heartbeatLength = fs.readFileSync(heartbeat, 'utf8').length;
+    await wait(100);
+    assert.equal(fs.readFileSync(heartbeat, 'utf8').length, heartbeatLength);
+    assert.equal(await isRunning(descendantPid), false, 'descendant must be dead after SIGKILL escalation');
+    const record = store.getAgentSession(session.externalSessionId);
+    assert.equal(record.status, 'FAILED');
+    assert.equal(record.errorClass, 'AGENT_TIMEOUT');
+    store.close();
+    ok('timeout records FAILED and kills a SIGTERM-resistant process-group descendant');
+  }
+
+  {
+    const worktree = createWorktree('abort');
+    const store = new SQLiteStore(path.join(TMP, 'abort.sqlite3'));
+    const pidFile = path.join(TMP, 'abort-descendant.pid');
+    const runner = runnerFor(store, { environment: {
+      FAKE_OPENCODE_MODE: 'timeout',
+      FAKE_DESCENDANT_PID: pidFile,
+      FAKE_HEARTBEAT: path.join(TMP, 'abort-heartbeat'),
+    } });
+    const session = await runner.createSession({
+      jobId: makeJob(store, 510), role: 'verifier', model: 'test/model', worktree,
+    });
+    const running = runner.run({ sessionId: session.externalSessionId, prompt: 'Abort this process group.' });
+    const deadline = Date.now() + 2_000;
+    while (!fs.existsSync(pidFile) && Date.now() < deadline) await wait(10);
+    assert.ok(fs.existsSync(pidFile), 'fake OpenCode should have started before abort');
+    assert.equal(await runner.abort({ sessionId: session.externalSessionId }), true);
+    await assert.rejects(running, (error) => error.code === 'AGENT_ABORTED');
+    assert.equal(store.getAgentSession(session.externalSessionId).status, 'ABORTED');
+    assert.equal(await isRunning(Number(fs.readFileSync(pidFile, 'utf8'))), false);
+    store.close();
+    ok('abort terminates the process group and persists ABORTED');
+  }
+
+  // Invalid and absent files are failures regardless of a zero process exit.
+  for (const [mode, issue] of [['missing', 504], ['invalid-json', 505], ['invalid-schema', 506]]) {
+    const worktree = createWorktree(`contract-${mode}`);
+    const store = new SQLiteStore(path.join(TMP, `contract-${mode}.sqlite3`));
+    const runner = runnerFor(store, { environment: { FAKE_OPENCODE_MODE: mode } });
+    const session = await runner.createSession({
+      jobId: makeJob(store, issue), role: 'reviewer', model: 'test/model', worktree,
+    });
+    await assert.rejects(
+      runner.run({ sessionId: session.externalSessionId, prompt: 'Return a bad result.' }),
+      (error) => error instanceof AgentResultContractError && error.code === 'INVALID_AGENT_RESULT',
+    );
+    assert.equal(store.getAgentSession(session.externalSessionId).status, 'FAILED');
+    await assert.rejects(runner.getResult({ sessionId: session.externalSessionId }), AgentRunnerError);
+    store.close();
+  }
+  ok('missing, malformed, and invalid-schema result.json are rejected, never successful');
+
+  {
+    const worktree = createWorktree('blocked');
+    const store = new SQLiteStore(path.join(TMP, 'blocked.sqlite3'));
+    const runner = runnerFor(store, { environment: { FAKE_OPENCODE_MODE: 'blocked' } });
+    const session = await runner.createSession({
+      jobId: makeJob(store, 507), role: 'triage', model: 'test/model', worktree,
+    });
+    const result = await runner.run({ sessionId: session.externalSessionId, prompt: 'Report missing information.' });
+    assert.equal(result.status, 'BLOCKED');
+    assert.match(result.blocked_reason, /Which acceptance target/);
+    assert.equal(store.getAgentSession(session.externalSessionId).status, 'BLOCKED');
+    store.close();
+    ok('BLOCKED plus a recorded question is valid without calling the question tool');
+  }
+
+  {
+    const worktree = createWorktree('changes-required');
+    const store = new SQLiteStore(path.join(TMP, 'changes-required.sqlite3'));
+    const runner = runnerFor(store, { environment: { FAKE_OPENCODE_MODE: 'changes-required' } });
+    const session = await runner.createSession({
+      jobId: makeJob(store, 511), role: 'reviewer', model: 'test/model', worktree,
+    });
+    const result = await runner.run({ sessionId: session.externalSessionId, prompt: 'Review and request changes.' });
+    assert.equal(result.status, 'CHANGES_REQUIRED');
+    assert.equal(store.getAgentSession(session.externalSessionId).status, 'CHANGES_REQUIRED');
+    store.close();
+    ok('CHANGES_REQUIRED is valid but remains a non-success terminal result');
+  }
+
+  // Persist the external ID before run, reopen SQLite, and resume that session.
+  {
+    const worktree = createWorktree('resume');
+    const database = path.join(TMP, 'resume.sqlite3');
+    let store = new SQLiteStore(database);
+    const session = await runnerFor(store).createSession({
+      jobId: makeJob(store, 508), role: 'verifier', model: 'test/model', worktree,
+    });
+    store.close();
+
+    store = new SQLiteStore(database);
+    const reportFile = path.join(TMP, 'resume-report.json');
+    const runner = runnerFor(store, { environment: { FAKE_OPENCODE_REPORT: reportFile } });
+    const result = await runner.resume({ sessionId: session.externalSessionId, prompt: 'Resume after restart.' });
+    assert.equal(result.status, 'DONE');
+    const report = readReport(reportFile);
+    assert.equal(report.args.filter((arg) => arg === session.externalSessionId).length, 1);
+    assert.ok(report.args.includes('--session'));
+    assert.equal(store.getAgentSession(session.externalSessionId).status, 'DONE');
+    store.close();
+    ok('external session ID, role, model and worktree persist and resume after SQLite restart');
+  }
+
+  // Execution claims are shared by independent runner instances, not just a local map.
+  {
+    const worktree = createWorktree('execution-race');
+    const database = path.join(TMP, 'execution-race.sqlite3');
+    const spawnLog = path.join(TMP, 'execution-race-spawns');
+    const storeA = new SQLiteStore(database);
+    const session = await runnerFor(storeA).createSession({
+      jobId: makeJob(storeA, 525), role: 'verifier', model: 'test/model', worktree,
+    });
+    const storeB = new SQLiteStore(database);
+    const runnerA = runnerFor(storeA, { environment: { FAKE_OPENCODE_SPAWN_LOG: spawnLog } });
+    const runnerB = runnerFor(storeB, { environment: { FAKE_OPENCODE_SPAWN_LOG: spawnLog } });
+    const first = runnerA.run({ sessionId: session.externalSessionId, prompt: 'Win the execution claim.' });
+    await assert.rejects(
+      runnerB.run({ sessionId: session.externalSessionId, prompt: 'Must not start a second process.' }),
+      (error) => error instanceof AgentRunnerError && error.code === 'AGENT_SESSION_BUSY',
+    );
+    assert.equal((await first).status, 'DONE');
+    assert.equal(fs.readFileSync(spawnLog, 'utf8').trim().split('\n').length, 1);
+    assert.equal(storeA.getAgentSession(session.externalSessionId).status, 'DONE');
+    storeB.close();
+    storeA.close();
+    ok('two runner instances racing a session produce one spawn and one typed busy result');
+  }
+
+  // Kill the runner parent while its child remains active, then let a new
+  // instance verify and reap that persisted process group before resuming.
+  {
+    const worktree = createWorktree('orphan-recovery');
+    const database = path.join(TMP, 'orphan-recovery.sqlite3');
+    const spawnLog = path.join(TMP, 'orphan-recovery-spawns');
+    const heartbeat = path.join(TMP, 'orphan-recovery-heartbeat');
+    const readyFile = path.join(TMP, 'orphan-recovery-ready');
+    let store = new SQLiteStore(database);
+    const session = await runnerFor(store).createSession({
+      jobId: makeJob(store, 526), role: 'verifier', model: 'test/model', worktree,
+    });
+    store.close();
+
+    const persistenceUrl = new URL('../dist/core/persistence.js', import.meta.url).href;
+    const runnerUrl = new URL('../dist/providers/opencode-runner.js', import.meta.url).href;
+    const helper = path.join(TMP, 'orphan-runner-parent.mjs');
+    fs.writeFileSync(helper, `import fs from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { SQLiteStore } from ${JSON.stringify(persistenceUrl)};
+import { OpenCodeAgentRunner } from ${JSON.stringify(runnerUrl)};
+const store = new SQLiteStore(${JSON.stringify(database)});
+const runner = new OpenCodeAgentRunner({
+  store,
+  executable: ${JSON.stringify(FAKE_OPENCODE)},
+  timeoutMs: 30000,
+  terminationGraceMs: 50,
+  environment: { ...process.env, FAKE_OPENCODE_MODE: 'orphan',
+    FAKE_OPENCODE_SPAWN_LOG: ${JSON.stringify(spawnLog)},
+    FAKE_ORPHAN_PID: ${JSON.stringify(FAKE_ORPHAN_PID)},
+    FAKE_HEARTBEAT: ${JSON.stringify(heartbeat)} },
+});
+runner.run({ sessionId: ${JSON.stringify(session.externalSessionId)}, prompt: 'Remain active for recovery.' }).catch(() => {});
+const deadline = Date.now() + 5000;
+while (Date.now() < deadline) {
+  const record = store.getAgentSession(${JSON.stringify(session.externalSessionId)});
+  if (record?.executionPid && fs.existsSync(${JSON.stringify(FAKE_ORPHAN_PID)}) &&
+      fs.existsSync(${JSON.stringify(heartbeat)})) {
+    const macIdentity = process.platform === 'darwin' ? spawnSync('/bin/ps', [
+      '-p', String(record.executionPid), '-o', 'pid=,pgid=,lstart=,state=',
+    ], { encoding: 'utf8', env: { ...process.env, LC_ALL: 'C' } }) : null;
+    const macEnvironment = process.platform === 'darwin' ? spawnSync('/bin/ps', [
+      '-E', '-ww', '-p', String(record.executionPid), '-o', 'command=',
+    ], { encoding: 'utf8', env: { ...process.env, LC_ALL: 'C' } }) : null;
+    fs.writeFileSync(${JSON.stringify(readyFile)}, JSON.stringify({
+      supervisorPid: record.executionPid,
+      agentPid: Number(fs.readFileSync(${JSON.stringify(FAKE_ORPHAN_PID)}, 'utf8')),
+      macIdentityStatus: macIdentity?.status,
+      macIdentityOutput: macIdentity?.stdout,
+      macEnvironmentStatus: macEnvironment?.status,
+      macEnvironmentOutput: macEnvironment?.stdout,
+    }));
+    store.db.prepare('UPDATE agent_sessions SET execution_lease_until=? WHERE external_session_id=?')
+      .run('2000-01-01T00:00:00.000Z', ${JSON.stringify(session.externalSessionId)});
+    store.close();
+    process.exit(0);
+  }
+  await new Promise((resolve) => setTimeout(resolve, 10));
+}
+store.close();
+process.exit(2);
+`);
+    const parent = spawnSync(process.execPath, [helper], { encoding: 'utf8', timeout: 10_000 });
+    assert.equal(parent.status, 0, `runner parent did not persist the child identity: ${parent.stderr}`);
+    const {
+      supervisorPid, agentPid, macIdentityStatus, macIdentityOutput,
+      macEnvironmentStatus, macEnvironmentOutput,
+    } = JSON.parse(fs.readFileSync(readyFile, 'utf8'));
+    const stopDeadline = Date.now() + 5_000;
+    while ((await isRunning(supervisorPid) || await isRunning(agentPid)) && Date.now() < stopDeadline) await wait(25);
+    assert.equal(await isRunning(supervisorPid), false, 'the supervisor should stop its process group when its parent exits');
+    assert.equal(await isRunning(agentPid), false, 'OpenCode must not outlive its runner parent');
+    await wait(500);
+
+    store = new SQLiteStore(database);
+    const orphanRecord = store.getAgentSession(session.externalSessionId);
+    assert.equal(orphanRecord.executionPid, supervisorPid);
+    assert.equal(orphanRecord.executionPgid, supervisorPid);
+    if (process.platform === 'darwin') {
+      assert.equal(macIdentityStatus, 0, 'macOS ps must inspect the live supervisor identity');
+      const identityFields = macIdentityOutput.trim().split(/\s+/);
+      assert.equal(Number(identityFields[0]), supervisorPid);
+      assert.equal(Number(identityFields[1]), supervisorPid);
+      assert.equal(identityFields.length, 8, 'macOS ps identity row must include PID, PGID, lstart and state');
+      assert.equal(macEnvironmentStatus, 0, 'macOS ps must inspect the live supervisor environment');
+      assert.ok(macEnvironmentOutput.split(/\s+/).includes(
+        `ISSUE_ORCHESTRATOR_EXECUTION_ID=${orphanRecord.executionToken}`,
+      ), 'macOS ps must expose the exact per-execution environment token');
+    }
+    const recovery = runnerFor(store, {
+      environment: {
+        FAKE_OPENCODE_MODE: 'success', FAKE_OPENCODE_SPAWN_LOG: spawnLog,
+      },
+    });
+    const result = await recovery.resume({ sessionId: session.externalSessionId, prompt: 'Recover the orphan safely.' });
+    assert.equal(result.status, 'DONE');
+    assert.equal(await isRunning(supervisorPid), false, 'recovery must leave the old process group stopped');
+    assert.equal(await isRunning(agentPid), false, 'recovery must leave the previous agent stopped');
+    const heartbeatLength = fs.readFileSync(heartbeat, 'utf8').length;
+    await wait(100);
+    assert.equal(fs.readFileSync(heartbeat, 'utf8').length, heartbeatLength,
+      'the orphan must no longer mutate shared files after recovery');
+    assert.equal(fs.readFileSync(spawnLog, 'utf8').trim().split('\n').length, 2,
+      'exactly the original and resumed process should have spawned');
+    const recovered = store.getAgentSession(session.externalSessionId);
+    assert.equal(recovered.status, 'DONE');
+    assert.equal(recovered.executionOwner, null);
+    assert.equal(recovered.executionPid, null);
+    store.close();
+    ok('restart recovery verifies and reaps the persisted process group before a replacement spawn');
+  }
+
+  // Crash the runner after the detached guardian starts but before its process
+  // identity can be persisted. The guardian must still be gated from OpenCode.
+  {
+    fs.rmSync(OCI_TRACE, { force: true });
+    const worktree = createBuilderWorktree('crash-before-launch-handoff');
+    const database = path.join(TMP, 'crash-before-launch-handoff.sqlite3');
+    const spawnLog = path.join(TMP, 'crash-before-launch-handoff-spawns');
+    const readyFile = path.join(TMP, 'crash-before-launch-handoff-ready');
+    let store = new SQLiteStore(database);
+    const session = await runnerFor(store, { containerRuntime: FAKE_OCI }).createSession({
+      jobId: makeJob(store, 529), role: 'builder', model: 'test/model', worktree,
+    });
+    store.close();
+
+    const persistenceUrl = new URL('../dist/core/persistence.js', import.meta.url).href;
+    const runnerUrl = new URL('../dist/providers/opencode-runner.js', import.meta.url).href;
+    const helper = path.join(TMP, 'crash-before-launch-handoff-parent.mjs');
+    fs.writeFileSync(helper, `import fs from 'node:fs';
+import { SQLiteStore } from ${JSON.stringify(persistenceUrl)};
+import { OpenCodeAgentRunner } from ${JSON.stringify(runnerUrl)};
+const store = new SQLiteStore(${JSON.stringify(database)});
+const recordProcess = store.recordAgentSessionProcess.bind(store);
+store.recordAgentSessionProcess = (input) => {
+  fs.writeFileSync(${JSON.stringify(readyFile)}, JSON.stringify(input));
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 60000);
+  return recordProcess(input);
+};
+const runner = new OpenCodeAgentRunner({
+  store,
+  executable: ${JSON.stringify(FAKE_OPENCODE)},
+  containerRuntime: ${JSON.stringify(FAKE_OCI)},
+  timeoutMs: 30000,
+  terminationGraceMs: 50,
+  environment: { ...process.env, FAKE_OPENCODE_MODE: 'builder',
+    FAKE_OPENCODE_SPAWN_LOG: ${JSON.stringify(spawnLog)} },
+});
+runner.run({ sessionId: ${JSON.stringify(session.externalSessionId)}, prompt: 'Wait for durable launch handoff.' }).catch(() => {});
+setInterval(() => {}, 1000);
+`);
+    const parent = spawn(process.execPath, [helper], { stdio: ['ignore', 'ignore', 'pipe'] });
+    let parentStderr = '';
+    parent.stderr?.on('data', (chunk) => { parentStderr += chunk.toString(); });
+    const readyDeadline = Date.now() + 10_000;
+    while (!fs.existsSync(readyFile) && parent.exitCode === null && Date.now() < readyDeadline) await wait(10);
+    assert.ok(fs.existsSync(readyFile), `runner never reached the pre-persistence handoff: ${parentStderr}`);
+    const launch = JSON.parse(fs.readFileSync(readyFile, 'utf8'));
+    const supervisorPid = Number(launch.pid);
+    assert.ok(await isRunning(supervisorPid), 'guardian must be alive and waiting before the identity write');
+    const parentClosed = new Promise((resolve) => parent.once('close', resolve));
+    parent.kill('SIGKILL');
+    await parentClosed;
+
+    const guardianDeadline = Date.now() + 5_000;
+    while (await isRunning(supervisorPid) && Date.now() < guardianDeadline) await wait(25);
+    assert.equal(await isRunning(supervisorPid), false, 'guardian must exit when the runner control pipe closes');
+    assert.equal(fs.existsSync(spawnLog), false, 'OpenCode must not start before durable process identity handoff');
+    const ociBeforeRecovery = readOciTrace();
+    assert.equal(ociBeforeRecovery.some((entry) => entry.args[0] === 'run'), false,
+      'no builder container may run before the durable handoff');
+
+    store = new SQLiteStore(database);
+    const pending = store.getAgentSession(session.externalSessionId);
+    assert.equal(pending.status, 'RUNNING');
+    assert.equal(pending.executionPid, null);
+    assert.equal(pending.executionPgid, null);
+    assert.equal(pending.executionStartTicks, null);
+    assert.equal(pending.executionToken, launch.token, 'the startup token must persist before spawn');
+    store.db.prepare('UPDATE agent_sessions SET execution_lease_until=? WHERE external_session_id=?')
+      .run('2000-01-01T00:00:00.000Z', session.externalSessionId);
+
+    const recovery = runnerFor(store, {
+      containerRuntime: FAKE_OCI,
+      environment: { ...process.env, FAKE_OPENCODE_MODE: 'builder', FAKE_OPENCODE_SPAWN_LOG: spawnLog },
+    });
+    const result = await recovery.resume({
+      sessionId: session.externalSessionId,
+      prompt: 'Recover the gated launch and complete safely.',
+    });
+    assert.equal(result.status, 'DONE');
+    assert.equal(fs.readFileSync(spawnLog, 'utf8').trim().split('\n').length, 1,
+      'only the recovered execution may start OpenCode');
+    assert.equal(readOciTrace().filter((entry) => entry.args[0] === 'run').length, 1,
+      'only the recovered execution may start a builder container');
+    const recovered = store.getAgentSession(session.externalSessionId);
+    assert.equal(recovered.status, 'DONE');
+    assert.equal(recovered.executionToken, null);
+    store.close();
+    ok('runner crash before identity persistence leaves a gated, recoverable launch intent');
+  }
+
+  // Old RUNNING rows without an attributable child remain non-terminal and
+  // cannot be resumed by starting an untracked replacement process.
+  {
+    const worktree = createWorktree('unsafe-stale-session');
+    const database = path.join(TMP, 'unsafe-stale-session.sqlite3');
+    const spawnLog = path.join(TMP, 'unsafe-stale-session-spawns');
+    const store = new SQLiteStore(database);
+    const session = await runnerFor(store).createSession({
+      jobId: makeJob(store, 527), role: 'verifier', model: 'test/model', worktree,
+    });
+    const stale = store.claimAgentSession({
+      externalSessionId: session.externalSessionId,
+      owner: 'legacy-owner-with-no-child',
+      leaseUntil: '2000-01-01T00:00:00.000Z',
+      resume: false,
+    });
+    assert.equal(stale.acquired, true);
+    const recovery = runnerFor(store, {
+      environment: { FAKE_OPENCODE_SPAWN_LOG: spawnLog },
+    });
+    await assert.rejects(
+      recovery.resume({ sessionId: session.externalSessionId, prompt: 'Do not guess a stale PID.' }),
+      (error) => error instanceof AgentRunnerError && error.code === 'AGENT_RECOVERY_UNSAFE' && /no persisted child identity/.test(error.message),
+    );
+    assert.equal(store.getAgentSession(session.externalSessionId).status, 'RUNNING');
+    assert.equal(store.getAgentSession(session.externalSessionId).executionPid, null);
+    assert.equal(fs.existsSync(spawnLog), false, 'unsafe stale recovery must not spawn');
+    store.close();
+    ok('stale RUNNING sessions with no safe process identity fail closed without a replacement');
+  }
+
+  // If a process-group descendant cannot prove its execution token, stop the
+  // supervisor group and refuse a concurrent resume while identity is unresolved.
+  {
+    const worktree = createWorktree('unverified-startup');
+    const database = path.join(TMP, 'unverified-startup.sqlite3');
+    const spawnLog = path.join(TMP, 'unverified-startup-spawns');
+    const heartbeat = path.join(TMP, 'unverified-startup-heartbeat');
+    const pidFile = path.join(TMP, 'unverified-startup.pid');
+    const executable = path.join(TMP, 'fake-opencode-without-token');
+    fs.writeFileSync(executable,
+      `#!/bin/sh\nexec /usr/bin/env -i PATH="$PATH" FAKE_OPENCODE_MODE=orphan ` +
+        `FAKE_OPENCODE_SPAWN_LOG="${spawnLog}" FAKE_ORPHAN_PID="${pidFile}" ` +
+        `FAKE_HEARTBEAT="${heartbeat}" "${process.execPath}" "${FAKE_OPENCODE}" "$@"\n`,
+      { mode: 0o700 });
+    const store = new SQLiteStore(database);
+    const runner = runnerFor(store, {
+      executable,
+      timeoutMs: 5_000,
+      environment: {
+        FAKE_OPENCODE_MODE: 'orphan', FAKE_OPENCODE_SPAWN_LOG: spawnLog,
+        FAKE_ORPHAN_PID: pidFile, FAKE_HEARTBEAT: heartbeat,
+      },
+    });
+    const session = await runner.createSession({
+      jobId: makeJob(store, 528), role: 'verifier', model: 'test/model', worktree,
+    });
+    const first = runner.run({ sessionId: session.externalSessionId, prompt: 'Fail closed without identity.' });
+    const deadline = Date.now() + 2_000;
+    while (!fs.existsSync(pidFile) && Date.now() < deadline) await wait(10);
+    assert.ok(fs.existsSync(pidFile), 'fake child should start before its token is rejected');
+    await assert.rejects(
+      runner.resume({ sessionId: session.externalSessionId, prompt: 'Do not start a duplicate.' }),
+      (error) => error instanceof AgentRunnerError && error.code === 'AGENT_SESSION_BUSY',
+    );
+    await assert.rejects(
+      first,
+      (error) => error instanceof AgentRunnerError && error.code === 'AGENT_RECOVERY_UNSAFE',
+    );
+    const pid = Number(fs.readFileSync(pidFile, 'utf8'));
+    assert.equal(await isRunning(pid), false, 'the direct child must be stopped after identity failure');
+    assert.equal(fs.readFileSync(spawnLog, 'utf8').trim().split('\n').length, 1,
+      'identity failure must not launch a concurrent replacement');
+    const record = store.getAgentSession(session.externalSessionId);
+    assert.ok(['FAILED', 'RUNNING'].includes(record.status), `unexpected session status ${record.status}`);
+    if (record.status === 'FAILED') assert.equal(record.errorClass, 'AGENT_RECOVERY_UNSAFE');
+    else {
+      assert.ok(Number.isSafeInteger(record.executionPid), 'the durable guardian identity must remain persisted');
+      assert.notEqual(record.executionPid, pid, 'the persisted process is the guardian, not the fake OpenCode child');
+      await assert.rejects(
+        runner.resume({ sessionId: session.externalSessionId, prompt: 'Do not bypass the unresolved lease.' }),
+        (error) => error instanceof AgentRunnerError && error.code === 'AGENT_SESSION_BUSY',
+      );
+    }
+    store.close();
+    ok('unverified startup kills its direct child and refuses a concurrent resume');
+  }
+
+  // Builder OpenCode stays in the private runtime area; only its custom shell
+  // wrapper starts a hardened, per-command OCI container.
+  {
+    fs.rmSync(OCI_TRACE, { force: true });
+    const worktree = createBuilderWorktree('builder');
+    const expectedStore = fs.realpathSync(spawnSync('pnpm', ['store', 'path', '--silent'], {
+      cwd: process.cwd(), encoding: 'utf8',
+    }).stdout.trim());
+    const untrustedStore = path.join(TMP, 'untrusted-project-store', 'v11');
+    fs.mkdirSync(untrustedStore, { recursive: true });
+    fs.writeFileSync(path.join(worktree, '.npmrc'), `store-dir=${untrustedStore}\n`);
+    const store = new SQLiteStore(path.join(TMP, 'builder.sqlite3'));
+    const reportFile = path.join(TMP, 'builder-report.json');
+    const runner = runnerFor(store, { containerRuntime: FAKE_OCI, environment: {
+      FAKE_OPENCODE_MODE: 'builder', FAKE_OPENCODE_REPORT: reportFile,
+      GITHUB_TOKEN: 'must-not-reach-runtime', AWS_SECRET_ACCESS_KEY: 'must-not-reach-runtime',
+      SSH_AUTH_SOCK: '/host/ssh-agent',
+    } });
+    const session = await runner.createSession({
+      jobId: makeJob(store, 509), role: 'builder', model: 'test/model', worktree,
+    });
+    const result = await runner.run({ sessionId: session.externalSessionId, prompt: 'Run a sandboxed git status.' });
+    assert.equal(result.status, 'DONE');
+
+    // Model a builder planting executable Git config and a hook in shared
+    // metadata. Host-side Git must not execute either builder-controlled path.
+    const bareRemote = path.join(TMP, 'builder-hook-remote.git');
+    fs.mkdirSync(bareRemote);
+    git(['init', '--bare'], bareRemote);
+    git(['remote', 'add', 'origin', bareRemote], worktree);
+    const commonGit = fs.realpathSync(path.resolve(worktree, git(['rev-parse', '--git-common-dir'], worktree)));
+    const worktreeGit = fs.realpathSync(path.resolve(worktree, git(['rev-parse', '--git-dir'], worktree)));
+    const fsmonitorMarker = path.join(TMP, 'builder-fsmonitor-ran');
+    const fsmonitor = path.join(TMP, 'builder-fsmonitor');
+    fs.writeFileSync(fsmonitor, `#!/bin/sh\nprintf executed > '${fsmonitorMarker}'\nprintf 'token\\n'\n`, { mode: 0o755 });
+    git(['config', 'core.fsmonitor', fsmonitor], worktree);
+    assert.doesNotThrow(() => hostGit(['status', '--short'], { cwd: worktree }));
+    assert.equal(fs.existsSync(fsmonitorMarker), false,
+      'host git must ignore builder-controlled core.fsmonitor commands');
+    const maliciousHooks = path.join(commonGit, 'hooks');
+    const hookMarker = path.join(TMP, 'builder-pre-push-hook-ran');
+    fs.mkdirSync(maliciousHooks, { recursive: true });
+    fs.writeFileSync(path.join(maliciousHooks, 'pre-push'),
+      `#!/bin/sh\nprintf executed > '${hookMarker}'\nexit 1\n`, { mode: 0o755 });
+    git(['config', 'core.hooksPath', maliciousHooks], worktree);
+    assert.doesNotThrow(() => hostGit(
+      ['push', 'origin', 'HEAD:refs/heads/hook-defense'], {
+        cwd: worktree,
+        env: {
+          GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.hooksPath',
+          GIT_CONFIG_VALUE_0: maliciousHooks,
+        },
+      },
+    ));
+    assert.equal(fs.existsSync(hookMarker), false, 'host git must ignore builder-controlled hooks and core.hooksPath');
+    assert.throws(
+      () => hostGit(['-c', `core.hooksPath=${maliciousHooks}`, 'push', 'origin', 'HEAD']),
+      /does not permit caller-supplied command-scope configuration/,
+    );
+
+    const report = readReport(reportFile);
+    const profile = Object.values(report.config.agents)[0];
+    const resultFile = path.join(worktree, '.issue-orchestrator', 'result.json');
+    assert.notEqual(report.cwd, worktree);
+    assert.ok(report.cwd.startsWith(path.dirname(store.getAgentSession(session.externalSessionId).ndjsonPath)));
+    assert.equal(report.config.shell.endsWith('.mjs'), true);
+    assert.deepEqual(report.config.plugins, []);
+    assert.deepEqual(report.config.mcp, {});
+    assert.ok(profile.permissions.some((rule) => rule.action === 'shell' && rule.resource === '*' && rule.effect === 'allow'));
+    assert.ok(profile.permissions.some((rule) => rule.action === 'shell' && rule.resource === '*git push*' && rule.effect === 'deny'));
+    assert.ok(profile.permissions.some((rule) => rule.action === 'shell' && rule.resource === '*gh*' && rule.effect === 'deny'));
+    assert.ok(profile.permissions.some((rule) => rule.action === 'shell' && rule.resource === '*glab*' && rule.effect === 'deny'));
+    assert.ok(profile.permissions.some((rule) => rule.action === 'external_directory' && rule.resource === '*' && rule.effect === 'deny'));
+    assert.ok(profile.permissions.some((rule) => rule.action === 'external_directory' && rule.resource === worktree && rule.effect === 'allow'));
+    assert.ok(profile.permissions.some((rule) => rule.action === 'external_directory' && rule.resource === `${worktree}/**` && rule.effect === 'allow'));
+    assert.ok(profile.permissions.some((rule) => rule.action === 'read' && rule.resource === `${worktree}/**` && rule.effect === 'allow'));
+    assert.ok(profile.permissions.some((rule) => rule.action === 'edit' && rule.resource === `${worktree}/**` && rule.effect === 'allow'));
+    assert.ok(profile.permissions.filter((rule) => rule.action === 'read' && rule.effect === 'allow')
+      .every((rule) => [
+        `${worktree}/**`, `${worktree}/*.env.example`, `${worktree}/**/*.env.example`,
+      ].includes(rule.resource)));
+    assert.ok(profile.permissions.filter((rule) => rule.action === 'edit' && rule.effect === 'allow')
+      .every((rule) => rule.resource === `${worktree}/**` || rule.resource === resultFile));
+    const trace = readOciTrace();
+    const run = trace.find((entry) => entry.args[0] === 'run');
+    assert.ok(run, 'builder shell must invoke the fake OCI runtime');
+    for (const required of [
+      '--rm', '--pull=never', '--network=none', '--read-only', '--cap-drop=ALL',
+      '--security-opt=no-new-privileges:true', '--pids-limit=256', '--memory=4g', '--cpus=2',
+    ]) assert.ok(run.args.includes(required), `missing OCI hardening option ${required}`);
+    const mounts = run.args.filter((arg) => arg.startsWith('--mount='));
+    assert.equal(mounts.length, 11,
+      'only worktree, protected Git metadata/config, writable worktree Git state, hooks, and pnpm store are mounted');
+    assert.ok(mounts.some((mount) => mount.includes(`source=${worktree},target=/workspace`)));
+    assert.ok(mounts.includes(`--mount=type=bind,source=${expectedStore},target=/pnpm-store/v11,readonly`));
+    assert.ok(mounts.some((mount) => mount.includes(`target=${commonGit}/hooks,readonly`)));
+    assert.ok(mounts.includes(`--mount=type=bind,source=${commonGit}/config,target=${commonGit}/config,readonly`));
+    assert.ok(mounts.includes(`--mount=type=bind,source=${worktreeGit}/config.worktree,target=${worktreeGit}/config.worktree,readonly`));
+    assert.ok(mounts.includes(`--mount=type=bind,source=${path.join(worktree, '.git')},target=/workspace/.git,readonly`));
+    assert.ok(mounts.includes(`--mount=type=bind,source=${commonGit}/worktrees,target=${commonGit}/worktrees,readonly`));
+    assert.ok(mounts.includes(`--mount=type=bind,source=${worktreeGit},target=${worktreeGit}`),
+      'only the selected worktree metadata directory is reopened for Git writes');
+    assert.ok(mounts.includes(`--mount=type=bind,source=${worktreeGit}/commondir,target=${worktreeGit}/commondir,readonly`));
+    assert.ok(mounts.includes(`--mount=type=bind,source=${worktreeGit}/gitdir,target=${worktreeGit}/gitdir,readonly`));
+    assert.ok(!mounts.some((mount) => mount.includes(untrustedStore)));
+    assert.ok(mounts.some((mount) => mount.includes('/.git,target=') && !mount.endsWith(',readonly')));
+    assert.ok(!run.args.some((arg) => /docker\.sock|\.ssh|\.config\/issue-orchestrator|\.local\/share\/opencode/i.test(arg)));
+    assert.ok(run.args.includes('--env=HOME=/tmp/home'));
+    assert.ok(run.args.includes(`--user=${process.getuid()}:${process.getgid()}`), 'bind mounts use the exact host UID/GID');
+    assert.ok(!mounts.some((mount) => mount.includes(os.homedir()) || mount.includes(path.join(TMP, 'trusted-opencode-data'))));
+    assert.ok(!run.args.some((arg) => /(?:GITHUB_TOKEN|AWS_SECRET|SSH_AUTH_SOCK|DOCKER_HOST|OPENCODE_CONFIG)=/i.test(arg)));
+    assert.deepEqual(run.args.filter((arg) => arg.startsWith('--env=')), [
+      '--env=HOME=/tmp/home', '--env=TMPDIR=/tmp',
+      '--env=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+      '--env=XDG_CONFIG_HOME=/tmp/home/.config', '--env=XDG_CACHE_HOME=/tmp/home/.cache',
+      '--env=COREPACK_HOME=/opt/corepack', '--env=COREPACK_ENABLE_NETWORK=0',
+      '--env=PNPM_HOME=/tmp/pnpm-home', '--env=PNPM_CONFIG_STORE_DIR=/pnpm-store/v11',
+      '--env=GIT_CONFIG_COUNT=1', '--env=GIT_CONFIG_KEY_0=core.hooksPath', '--env=GIT_CONFIG_VALUE_0=/dev/null',
+      '--env=GIT_CONFIG_NOSYSTEM=1', '--env=GIT_CONFIG_GLOBAL=/dev/null', '--env=GIT_TERMINAL_PROMPT=0',
+      '--env=GIT_AUTHOR_NAME=Issue Orchestrator Builder', '--env=GIT_AUTHOR_EMAIL=issue-orchestrator@localhost',
+      '--env=GIT_COMMITTER_NAME=Issue Orchestrator Builder', '--env=GIT_COMMITTER_EMAIL=issue-orchestrator@localhost',
+    ]);
+    assert.equal(run.args.at(-1), 'git status --short');
+    assert.ok(!Object.hasOwn(run.env, 'GITHUB_TOKEN'));
+    assert.ok(!Object.hasOwn(run.env, 'AWS_SECRET_ACCESS_KEY'));
+    assert.ok(!Object.hasOwn(run.env, 'SSH_AUTH_SOCK'));
+    assert.ok(!Object.keys(run.env).some((key) => /TOKEN|SECRET|PASSWORD|CREDENTIAL|SSH|GITHUB|AWS_PROFILE/i.test(key)));
+    assert.equal(store.getAgentSession(session.externalSessionId).status, 'DONE');
+    store.close();
+    ok('builder runs through a fixed hardened OCI wrapper with workspace-only direct access');
+  }
+
+  // Rootless runtimes map namespace root to the unprivileged daemon owner;
+  // using the host UID inside that namespace would make bind mounts unwritable.
+  {
+    fs.rmSync(OCI_TRACE, { force: true });
+    fs.writeFileSync(OCI_ROOTLESS, 'rootless');
+    const worktree = createBuilderWorktree('builder-rootless-runtime');
+    const store = new SQLiteStore(path.join(TMP, 'builder-rootless-runtime.sqlite3'));
+    const runner = runnerFor(store, { containerRuntime: FAKE_OCI, environment: { FAKE_OPENCODE_MODE: 'builder' } });
+    try {
+      const session = await runner.createSession({
+        jobId: makeJob(store, 524), role: 'builder', model: 'test/model', worktree,
+      });
+      assert.equal((await runner.run({ sessionId: session.externalSessionId, prompt: 'Check rootless mapping.' })).status, 'DONE');
+      const run = readOciTrace().find((entry) => entry.args[0] === 'run');
+      assert.ok(run.args.includes('--user=0:0'));
+    } finally {
+      fs.rmSync(OCI_ROOTLESS, { force: true });
+      store.close();
+    }
+    ok('rootless OCI sandbox maps namespace root to the unprivileged host owner');
+  }
+
+  // Builder preflight inspects an existing image only and rejects unavailable runtimes/images.
+  {
+    fs.rmSync(OCI_TRACE, { force: true });
+    const worktree = createBuilderWorktree('builder-preflight');
+    const store = new SQLiteStore(path.join(TMP, 'builder-preflight.sqlite3'));
+    const runner = runnerFor(store, { containerRuntime: FAKE_OCI });
+    fs.writeFileSync(OCI_FAIL_IMAGE, 'fail');
+    try {
+      await assert.rejects(
+        runner.createSession({ jobId: makeJob(store, 517), role: 'builder', model: 'test/model', worktree }),
+        (error) => error instanceof AgentRunnerError && error.code === 'BUILDER_SECURITY_UNAVAILABLE',
+      );
+      assert.equal(Number(store.rows('SELECT COUNT(*) AS count FROM agent_sessions')[0].count), 0);
+      assert.ok(readOciTrace().every((entry) => entry.args[0] === 'info' ||
+        (entry.args[0] === 'image' && entry.args[1] === 'inspect')));
+      assert.ok(!readOciTrace().some((entry) => entry.args[0] === 'pull' || entry.args.includes('pull')));
+    } finally {
+      fs.rmSync(OCI_FAIL_IMAGE, { force: true });
+      store.close();
+    }
+    const missingRuntimeStore = new SQLiteStore(path.join(TMP, 'builder-missing-runtime.sqlite3'));
+    const missingRunner = runnerFor(missingRuntimeStore, { containerRuntime: path.join(TMP, 'missing-runtime') });
+    await assert.rejects(
+      missingRunner.createSession({
+        jobId: makeJob(missingRuntimeStore, 518), role: 'builder', model: 'test/model', worktree,
+      }),
+      (error) => error instanceof AgentRunnerError && error.code === 'BUILDER_SECURITY_UNAVAILABLE',
+    );
+    assert.equal(Number(missingRuntimeStore.rows('SELECT COUNT(*) AS count FROM agent_sessions')[0].count), 0);
+    missingRuntimeStore.close();
+
+    const forgedWorktree = createBuilderWorktree('builder-forged-gitdir');
+    const peerWorktree = createBuilderWorktree('builder-gitdir-peer');
+    const peerMarker = fs.readFileSync(path.join(peerWorktree, '.git'), 'utf8');
+    fs.writeFileSync(path.join(forgedWorktree, '.git'), peerMarker);
+    const forgedStore = new SQLiteStore(path.join(TMP, 'builder-forged-gitdir.sqlite3'));
+    const forgedRunner = runnerFor(forgedStore, { containerRuntime: FAKE_OCI });
+    await assert.rejects(
+      forgedRunner.createSession({
+        jobId: makeJob(forgedStore, 522), role: 'builder', model: 'test/model', worktree: forgedWorktree,
+      }),
+      (error) => error instanceof AgentRunnerError && error.code === 'BUILDER_SECURITY_UNAVAILABLE',
+    );
+    assert.equal(Number(forgedStore.rows('SELECT COUNT(*) AS count FROM agent_sessions')[0].count), 0);
+    forgedStore.close();
+
+    const credentialWorktree = createBuilderWorktree('builder-credential-url');
+    const credentialRepo = path.join(path.dirname(credentialWorktree), 'builder-credential-url-repo');
+    git(['remote', 'add', 'origin', 'https://user:secret@example.invalid/repo.git'], credentialRepo);
+    const credentialStore = new SQLiteStore(path.join(TMP, 'builder-credential-url.sqlite3'));
+    const credentialRunner = runnerFor(credentialStore, { containerRuntime: FAKE_OCI });
+    await assert.rejects(
+      credentialRunner.createSession({
+        jobId: makeJob(credentialStore, 523), role: 'builder', model: 'test/model', worktree: credentialWorktree,
+      }),
+      (error) => error instanceof AgentRunnerError && error.code === 'BUILDER_SECURITY_UNAVAILABLE',
+    );
+    assert.equal(Number(credentialStore.rows('SELECT COUNT(*) AS count FROM agent_sessions')[0].count), 0);
+    credentialStore.close();
+    ok('builder rejects forged Git metadata and credential-bearing common Git config');
+    ok('builder fails closed for missing image/runtime without pulling or persisting');
+  }
+
+  // A timeout kills the OpenCode process group and removes any labeled OCI container.
+  {
+    fs.rmSync(OCI_TRACE, { force: true });
+    const worktree = createBuilderWorktree('builder-timeout');
+    const store = new SQLiteStore(path.join(TMP, 'builder-timeout.sqlite3'));
+    const runner = runnerFor(store, {
+      containerRuntime: FAKE_OCI,
+      timeoutMs: 1_000,
+      environment: { FAKE_OPENCODE_MODE: 'builder-hang' },
+    });
+    fs.writeFileSync(OCI_HANG, 'hang');
+    const session = await runner.createSession({
+      jobId: makeJob(store, 519), role: 'builder', model: 'test/model', worktree,
+    });
+    try {
+      await assert.rejects(
+        runner.run({ sessionId: session.externalSessionId, prompt: 'Wait for timeout.' }),
+        (error) => error instanceof AgentRunnerError && error.code === 'AGENT_TIMEOUT',
+      );
+      assert.equal(fs.existsSync(OCI_ACTIVE), false, 'timeout cleanup must remove the labeled container');
+      assert.equal(store.getAgentSession(session.externalSessionId).status, 'FAILED');
+      const trace = readOciTrace();
+      assert.ok(trace.some((entry) => entry.args[0] === 'container' && entry.args[1] === 'rm'));
+      assert.ok(trace.some((entry) => entry.args.some((arg) => arg === `--filter=label=issue-orchestrator.session=${session.externalSessionId}`)));
+    } finally {
+      fs.rmSync(OCI_HANG, { force: true });
+      store.close();
+    }
+    ok('builder timeout removes OCI containers by persisted session label');
+  }
+
+  // A failed OCI cleanup leaves the session RUNNING rather than falsely marking it stopped.
+  {
+    const worktree = createBuilderWorktree('builder-cleanup-failure');
+    const store = new SQLiteStore(path.join(TMP, 'builder-cleanup-failure.sqlite3'));
+    const runner = runnerFor(store, { containerRuntime: FAKE_OCI, environment: { FAKE_OPENCODE_MODE: 'builder' } });
+    fs.writeFileSync(OCI_LEAVE_ACTIVE, 'leave');
+    fs.writeFileSync(OCI_FAIL_CLEANUP, 'fail');
+    const session = await runner.createSession({
+      jobId: makeJob(store, 520), role: 'builder', model: 'test/model', worktree,
+    });
+    try {
+      await assert.rejects(
+        runner.run({ sessionId: session.externalSessionId, prompt: 'Finish with a simulated orphan.' }),
+        (error) => error instanceof AgentRunnerError && error.code === 'AGENT_CLEANUP_FAILED',
+      );
+      assert.equal(store.getAgentSession(session.externalSessionId).status, 'RUNNING');
+      assert.equal(fs.existsSync(OCI_ACTIVE), true);
+    } finally {
+      fs.rmSync(OCI_ACTIVE, { force: true });
+      fs.rmSync(OCI_LEAVE_ACTIVE, { force: true });
+      fs.rmSync(OCI_FAIL_CLEANUP, { force: true });
+      store.close();
+    }
+    ok('builder cleanup failure leaves the persisted session non-terminal');
+  }
+
+  // Opt-in only: requires a preloaded image and a daemon able to mount /projects.
+  if (process.env.ISSUE_ORCHESTRATOR_REAL_CONTAINER === '1') {
+    const worktree = createBuilderWorktree('builder-real-commit');
+    const fixtureParent = path.dirname(worktree);
+    const hostCredentialFile = path.join(fixtureParent, 'host-credentials', 'credentials.json');
+    const hostAuthFile = path.join(fixtureParent, 'host-opencode-data', 'opencode', 'auth.json');
+    fs.mkdirSync(path.dirname(hostCredentialFile), { recursive: true });
+    fs.mkdirSync(path.dirname(hostAuthFile), { recursive: true });
+    fs.writeFileSync(hostCredentialFile, 'host-only credential sentinel');
+    fs.writeFileSync(hostAuthFile, 'test saved OpenCode auth');
+    const store = new SQLiteStore(path.join(TMP, 'builder-real-container.sqlite3'));
+    const runner = runnerFor(store, { environment: {
+      FAKE_OPENCODE_MODE: 'builder-real-commit',
+      FAKE_OPENCODE_HOST_SENTINEL: hostCredentialFile,
+      FAKE_OPENCODE_HOST_AUTH_FILE: hostAuthFile,
+      FAKE_OPENCODE_HOST_CREDENTIAL_FILE: hostCredentialFile,
+      XDG_DATA_HOME: path.join(fixtureParent, 'host-opencode-data'),
+      GITHUB_TOKEN: 'must-not-reach-container',
+      AWS_ACCESS_KEY_ID: 'must-not-reach-container',
+      AWS_SECRET_ACCESS_KEY: 'must-not-reach-container',
+      AWS_SHARED_CREDENTIALS_FILE: hostCredentialFile,
+      OPENAI_API_KEY: 'must-not-reach-container',
+      SSH_AUTH_SOCK: '/host/ssh-agent',
+    } });
+    const session = await runner.createSession({
+      jobId: makeJob(store, 521), role: 'builder', model: 'test/model', worktree,
+    });
+    const commonGit = fs.realpathSync(path.resolve(worktree, git(['rev-parse', '--git-common-dir'], worktree)));
+    const worktreeGit = fs.realpathSync(path.resolve(worktree, git(['rev-parse', '--git-dir'], worktree)));
+    const commonConfigBefore = fs.readFileSync(path.join(commonGit, 'config'), 'utf8');
+    const worktreeConfigBefore = fs.readFileSync(path.join(worktreeGit, 'config.worktree'), 'utf8');
+    let realContainerResult;
+    try {
+      realContainerResult = await runner.run({ sessionId: session.externalSessionId, prompt: 'Commit in the container.' });
+    } catch (error) {
+      const persisted = store.getAgentSession(session.externalSessionId);
+      process.stderr.write(fs.readFileSync(persisted.stderrPath, 'utf8'));
+      throw error;
+    }
+    assert.equal(realContainerResult.status, 'DONE');
+    assert.equal(fs.readFileSync(hostCredentialFile, 'utf8'), 'host-only credential sentinel',
+      'an attempted write outside the mounted worktree must not change the host sentinel');
+    assert.equal(fs.readFileSync(hostAuthFile, 'utf8'), 'test saved OpenCode auth',
+      'host-side model auth must remain outside the builder container');
+    assert.equal(fs.readFileSync(path.join(commonGit, 'config'), 'utf8'), commonConfigBefore,
+      'the builder must not modify shared executable Git config');
+    assert.equal(fs.readFileSync(path.join(worktreeGit, 'config.worktree'), 'utf8'), worktreeConfigBefore,
+      'the builder must not modify per-worktree executable Git config');
+    const bareRemote = path.join(TMP, 'builder-real-hook-remote.git');
+    fs.mkdirSync(bareRemote);
+    git(['init', '--bare'], bareRemote);
+    git(['remote', 'add', 'origin', bareRemote], worktree);
+    const plantedHooks = path.join(commonGit, 'agent-planted-hooks');
+    assert.ok(fs.existsSync(path.join(plantedHooks, 'pre-push')),
+      'the real builder must plant a hook in shared Git metadata');
+    git(['config', 'core.hooksPath', plantedHooks], worktree);
+    const hookMarker = path.join(worktree, '.issue-orchestrator', 'pre-push-ran');
+    assert.doesNotThrow(() => hostGit(
+      ['push', 'origin', 'HEAD:refs/heads/hook-defense'], { cwd: worktree },
+    ));
+    assert.equal(fs.existsSync(hookMarker), false,
+      'a hook planted in the real shared Git common directory must not run in the host');
+    const output = spawnSync('git', ['-C', worktree, 'log', '-1', '--format=%s'], { encoding: 'utf8' });
+    assert.equal(output.status, 0, output.stderr);
+    assert.equal(output.stdout.trim(), 'oci-sandbox-smoke');
+    store.close();
+    ok('opt-in real OCI image verifies the isolated commit and host-push hooks remain inert');
+  }
+
+  console.log(`\n${passed} OpenCode runner checks passed`);
+} finally {
+  for (const directory of EXTERNAL_TEMPS) fs.rmSync(directory, { recursive: true, force: true });
+  fs.rmSync(TMP, { recursive: true, force: true });
+}

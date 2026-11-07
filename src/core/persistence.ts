@@ -170,6 +170,88 @@ interface SideEffectRow extends SqlRow {
   result_json: string | null;
 }
 
+interface AgentSessionRow extends SqlRow {
+  id: number | bigint;
+  job_id: number | bigint;
+  session_id: string;
+  external_session_id: string | null;
+  role: string | null;
+  model: string | null;
+  worktree: string | null;
+  status: string;
+  started_at: string | null;
+  ended_at: string | null;
+  input_tokens: number | bigint;
+  output_tokens: number | bigint;
+  reasoning_tokens: number | bigint;
+  cache_read_tokens: number | bigint;
+  cache_write_tokens: number | bigint;
+  cost_usd: number;
+  result_json: string | null;
+  ndjson_path: string | null;
+  stderr_path: string | null;
+  error_class: string | null;
+  execution_owner: string | null;
+  execution_lease_until: string | null;
+  execution_pid: number | bigint | null;
+  execution_pgid: number | bigint | null;
+  execution_start_ticks: string | null;
+  execution_token: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AgentUsage {
+  inputTokens: number;
+  outputTokens: number;
+  reasoningTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  costUsd: number;
+}
+
+export interface PersistedAgentProcess {
+  pid: number | null;
+  pgid: number | null;
+  startTicks: string | null;
+  token: string | null;
+}
+
+export type AgentSessionClaim =
+  | { acquired: true; recovering: boolean; previousProcess: PersistedAgentProcess | null }
+  | { acquired: false; reason: 'BUSY' | 'INVALID_STATE' | 'INVALID_LEASE'; status: string };
+
+export interface PersistedAgentSession {
+  id: number;
+  jobId: number;
+  sessionId: string;
+  externalSessionId: string;
+  role: string;
+  model: string;
+  worktree: string;
+  status: string;
+  startedAt: string;
+  endedAt: string | null;
+  inputTokens: number;
+  outputTokens: number;
+  reasoningTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  costUsd: number;
+  resultJson: string | null;
+  ndjsonPath: string;
+  stderrPath: string;
+  errorClass: string | null;
+  executionOwner: string | null;
+  executionLeaseUntil: string | null;
+  executionPid: number | null;
+  executionPgid: number | null;
+  executionStartTicks: string | null;
+  executionToken: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
 interface RuntimeStateInput {
   active?: Lock | null;
   last_run?: string | null;
@@ -502,6 +584,37 @@ const MIGRATIONS = [
       updated_at TEXT NOT NULL
     );
     CREATE INDEX side_effect_journal_job ON side_effect_journal(job_id, created_at);
+  `,
+  `
+    ALTER TABLE agent_sessions ADD COLUMN external_session_id TEXT;
+    ALTER TABLE agent_sessions ADD COLUMN role TEXT;
+    ALTER TABLE agent_sessions ADD COLUMN model TEXT;
+    ALTER TABLE agent_sessions ADD COLUMN worktree TEXT;
+    ALTER TABLE agent_sessions ADD COLUMN status TEXT NOT NULL DEFAULT 'FAILED';
+    ALTER TABLE agent_sessions ADD COLUMN started_at TEXT;
+    ALTER TABLE agent_sessions ADD COLUMN ended_at TEXT;
+    ALTER TABLE agent_sessions ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE agent_sessions ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE agent_sessions ADD COLUMN reasoning_tokens INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE agent_sessions ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE agent_sessions ADD COLUMN cache_write_tokens INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE agent_sessions ADD COLUMN cost_usd REAL NOT NULL DEFAULT 0;
+    ALTER TABLE agent_sessions ADD COLUMN result_json TEXT;
+    ALTER TABLE agent_sessions ADD COLUMN ndjson_path TEXT;
+    ALTER TABLE agent_sessions ADD COLUMN stderr_path TEXT;
+    UPDATE agent_sessions SET external_session_id=session_id, started_at=created_at
+      WHERE external_session_id IS NULL;
+    CREATE INDEX agent_sessions_external_id ON agent_sessions(external_session_id);
+    CREATE INDEX agent_sessions_job_role ON agent_sessions(job_id, role, created_at);
+  `,
+  `
+    ALTER TABLE agent_sessions ADD COLUMN execution_owner TEXT;
+    ALTER TABLE agent_sessions ADD COLUMN execution_lease_until TEXT;
+    ALTER TABLE agent_sessions ADD COLUMN execution_pid INTEGER;
+    ALTER TABLE agent_sessions ADD COLUMN execution_pgid INTEGER;
+    ALTER TABLE agent_sessions ADD COLUMN execution_start_ticks TEXT;
+    ALTER TABLE agent_sessions ADD COLUMN execution_token TEXT;
+    CREATE INDEX agent_sessions_execution_owner ON agent_sessions(execution_owner, execution_lease_until);
   `,
 ];
 
@@ -1130,6 +1243,231 @@ export class SQLiteStore {
       AND (j.workflow_state <> 'DONE' OR COALESCE(j.stage, '') <> 'merged' OR j.state IN ('READY', 'FAILED'))
     `)).all() as SqlRow[];
     return this.sideEffectContext(rows);
+  }
+
+  createAgentSession(input: {
+    jobId: number;
+    externalSessionId: string;
+    role: string;
+    model: string;
+    worktree: string;
+    ndjsonPath: string;
+    stderrPath: string;
+  }): PersistedAgentSession {
+    if (!Number.isSafeInteger(input.jobId) || input.jobId <= 0 || !input.externalSessionId || !input.role ||
+        !input.model || !input.worktree) {
+      throw new Error('agent session requires a job, external ID, role, model and worktree');
+    }
+    const stamp = nowIso();
+    this.transaction(() => {
+      this.db.prepare(`
+        INSERT INTO agent_sessions(job_id, session_id, external_session_id, role, model, worktree,
+          status, started_at, ndjson_path, stderr_path, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'CREATED', ?, ?, ?, ?, ?)
+      `).run(input.jobId, input.externalSessionId, input.externalSessionId, input.role, input.model,
+        input.worktree, stamp, input.ndjsonPath, input.stderrPath, stamp, stamp);
+    });
+    const created = this.getAgentSession(input.externalSessionId);
+    if (!created) throw new Error(`Could not read newly created agent session ${input.externalSessionId}`);
+    return created;
+  }
+
+  getAgentSession(externalSessionId: string): PersistedAgentSession | null {
+    const rows = asSqlRows<AgentSessionRow>(this.db.prepare(
+      'SELECT * FROM agent_sessions WHERE external_session_id=? ORDER BY id',
+    ).all(externalSessionId));
+    if (rows.length > 1) throw new Error(`External agent session ID is ambiguous: ${externalSessionId}`);
+    const row = rows[0];
+    if (!row || typeof row.external_session_id !== 'string' || typeof row.role !== 'string' ||
+        typeof row.model !== 'string' || typeof row.worktree !== 'string' ||
+        typeof row.started_at !== 'string' || typeof row.ndjson_path !== 'string' ||
+        typeof row.stderr_path !== 'string') return null;
+    return {
+      id: Number(row.id),
+      jobId: Number(row.job_id),
+      sessionId: row.session_id,
+      externalSessionId: row.external_session_id,
+      role: row.role,
+      model: row.model,
+      worktree: row.worktree,
+      status: row.status,
+      startedAt: row.started_at,
+      endedAt: row.ended_at,
+      inputTokens: Number(row.input_tokens),
+      outputTokens: Number(row.output_tokens),
+      reasoningTokens: Number(row.reasoning_tokens),
+      cacheReadTokens: Number(row.cache_read_tokens),
+      cacheWriteTokens: Number(row.cache_write_tokens),
+      costUsd: Number(row.cost_usd),
+      resultJson: row.result_json,
+      ndjsonPath: row.ndjson_path,
+      stderrPath: row.stderr_path,
+      errorClass: row.error_class,
+      executionOwner: row.execution_owner,
+      executionLeaseUntil: row.execution_lease_until,
+      executionPid: row.execution_pid == null ? null : Number(row.execution_pid),
+      executionPgid: row.execution_pgid == null ? null : Number(row.execution_pgid),
+      executionStartTicks: row.execution_start_ticks,
+      executionToken: row.execution_token,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    };
+  }
+
+  claimAgentSession(input: {
+    externalSessionId: string;
+    owner: string;
+    leaseUntil: string;
+    resume: boolean;
+  }): AgentSessionClaim {
+    const stamp = nowIso();
+    return this.transaction(() => {
+      const row = asSqlRow<AgentSessionRow>(this.db.prepare(
+        'SELECT * FROM agent_sessions WHERE external_session_id=?',
+      ).get(input.externalSessionId));
+      if (!row) return { acquired: false, reason: 'INVALID_STATE', status: 'MISSING' };
+
+      if (row.status === 'RUNNING') {
+        if (!input.resume) return { acquired: false, reason: 'BUSY', status: row.status };
+        const leaseExpiry = typeof row.execution_lease_until === 'string'
+          ? Date.parse(row.execution_lease_until)
+          : Number.NaN;
+        if (!Number.isFinite(leaseExpiry)) {
+          return { acquired: false, reason: 'INVALID_LEASE', status: row.status };
+        }
+        if (leaseExpiry > Date.now()) return { acquired: false, reason: 'BUSY', status: row.status };
+
+        const previousProcess = row.execution_pid == null && row.execution_pgid == null &&
+          row.execution_start_ticks == null && row.execution_token == null
+          ? null
+          : {
+            pid: row.execution_pid == null ? null : Number(row.execution_pid),
+            pgid: row.execution_pgid == null ? null : Number(row.execution_pgid),
+            startTicks: row.execution_start_ticks,
+            token: row.execution_token,
+          };
+        this.db.prepare(`
+          UPDATE agent_sessions SET execution_owner=?, execution_lease_until=?, updated_at=?
+          WHERE external_session_id=? AND status='RUNNING'
+        `).run(input.owner, input.leaseUntil, stamp, input.externalSessionId);
+        return { acquired: true, recovering: true, previousProcess };
+      }
+
+      if ((!input.resume && row.status !== 'CREATED') || (input.resume && row.status === 'DONE')) {
+        return { acquired: false, reason: 'INVALID_STATE', status: row.status };
+      }
+      this.db.prepare(`
+        UPDATE agent_sessions SET status='RUNNING', started_at=?, ended_at=NULL,
+          result_json=NULL, error_class=NULL, execution_owner=?, execution_lease_until=?,
+          execution_pid=NULL, execution_pgid=NULL, execution_start_ticks=NULL, execution_token=NULL,
+          updated_at=? WHERE external_session_id=?
+      `).run(stamp, input.owner, input.leaseUntil, stamp, input.externalSessionId);
+      return { acquired: true, recovering: false, previousProcess: null };
+    });
+  }
+
+  renewAgentSessionLease(externalSessionId: string, owner: string, leaseUntil: string) {
+    const result = this.db.prepare(`
+      UPDATE agent_sessions SET execution_lease_until=?, updated_at=?
+      WHERE external_session_id=? AND status='RUNNING' AND execution_owner=?
+    `).run(leaseUntil, nowIso(), externalSessionId, owner);
+    return Number(result.changes) === 1;
+  }
+
+  recordAgentSessionLaunchIntent(input: {
+    externalSessionId: string;
+    owner: string;
+    token: string;
+  }) {
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(input.token)) {
+      throw new Error('agent launch intent requires a valid execution token');
+    }
+    const result = this.db.prepare(`
+      UPDATE agent_sessions SET execution_token=?, updated_at=?
+      WHERE external_session_id=? AND status='RUNNING' AND execution_owner=?
+        AND execution_pid IS NULL AND execution_pgid IS NULL
+        AND execution_start_ticks IS NULL AND execution_token IS NULL
+    `).run(input.token, nowIso(), input.externalSessionId, input.owner);
+    return Number(result.changes) === 1;
+  }
+
+  recordAgentSessionProcess(input: {
+    externalSessionId: string;
+    owner: string;
+    pid: number;
+    pgid: number;
+    startTicks: string;
+    token: string;
+  }) {
+    const result = this.db.prepare(`
+      UPDATE agent_sessions SET execution_pid=?, execution_pgid=?, execution_start_ticks=?, updated_at=?
+      WHERE external_session_id=? AND status='RUNNING' AND execution_owner=?
+        AND execution_pid IS NULL AND execution_pgid IS NULL AND execution_start_ticks IS NULL
+        AND execution_token=?
+    `).run(input.pid, input.pgid, input.startTicks, nowIso(), input.externalSessionId, input.owner, input.token);
+    return Number(result.changes) === 1;
+  }
+
+  clearAgentSessionProcess(externalSessionId: string, owner: string) {
+    const result = this.db.prepare(`
+      UPDATE agent_sessions SET execution_pid=NULL, execution_pgid=NULL, execution_start_ticks=NULL,
+        execution_token=NULL, updated_at=?
+      WHERE external_session_id=? AND status='RUNNING' AND execution_owner=?
+    `).run(nowIso(), externalSessionId, owner);
+    return Number(result.changes) === 1;
+  }
+
+  completeAgentSession(input: {
+    externalSessionId: string;
+    owner: string;
+    status: 'DONE' | 'BLOCKED' | 'CHANGES_REQUIRED';
+    result: unknown;
+    usage: AgentUsage;
+  }) {
+    const resultJson = JSON.stringify(input.result);
+    if (resultJson === undefined) throw new Error('agent result must be JSON serializable');
+    this.assertAgentUsage(input.usage);
+    const stamp = nowIso();
+    const updated = this.db.prepare(`
+      UPDATE agent_sessions SET status=?, ended_at=?, result_json=?, error_class=NULL,
+        input_tokens=input_tokens+?, output_tokens=output_tokens+?, reasoning_tokens=reasoning_tokens+?,
+        cache_read_tokens=cache_read_tokens+?, cache_write_tokens=cache_write_tokens+?, cost_usd=cost_usd+?,
+        execution_owner=NULL, execution_lease_until=NULL, execution_pid=NULL, execution_pgid=NULL,
+        execution_start_ticks=NULL, execution_token=NULL, updated_at=?
+      WHERE external_session_id=? AND status='RUNNING' AND execution_owner=?
+    `).run(input.status, stamp, resultJson, input.usage.inputTokens, input.usage.outputTokens,
+      input.usage.reasoningTokens, input.usage.cacheReadTokens, input.usage.cacheWriteTokens,
+      input.usage.costUsd, stamp, input.externalSessionId, input.owner);
+    if (Number(updated.changes) !== 1) throw new Error(`Agent session execution ownership was lost: ${input.externalSessionId}`);
+  }
+
+  failAgentSession(input: {
+    externalSessionId: string;
+    owner: string;
+    status: 'FAILED' | 'ABORTED';
+    errorClass: string;
+    usage: AgentUsage;
+  }) {
+    if (!input.errorClass) throw new Error('failed agent session requires an error class');
+    this.assertAgentUsage(input.usage);
+    const stamp = nowIso();
+    const updated = this.db.prepare(`
+      UPDATE agent_sessions SET status=?, ended_at=?, result_json=NULL, error_class=?,
+        input_tokens=input_tokens+?, output_tokens=output_tokens+?, reasoning_tokens=reasoning_tokens+?,
+        cache_read_tokens=cache_read_tokens+?, cache_write_tokens=cache_write_tokens+?, cost_usd=cost_usd+?,
+        execution_owner=NULL, execution_lease_until=NULL, execution_pid=NULL, execution_pgid=NULL,
+        execution_start_ticks=NULL, execution_token=NULL, updated_at=?
+      WHERE external_session_id=? AND status='RUNNING' AND execution_owner=?
+    `).run(input.status, stamp, input.errorClass, input.usage.inputTokens, input.usage.outputTokens,
+      input.usage.reasoningTokens, input.usage.cacheReadTokens, input.usage.cacheWriteTokens,
+      input.usage.costUsd, stamp, input.externalSessionId, input.owner);
+    if (Number(updated.changes) !== 1) throw new Error(`Agent session execution ownership was lost: ${input.externalSessionId}`);
+  }
+
+  private assertAgentUsage(usage: AgentUsage) {
+    for (const [name, value] of Object.entries(usage)) {
+      if (!Number.isFinite(value) || value < 0) throw new Error(`agent usage ${name} must be a finite non-negative number`);
+    }
   }
 
   private sideEffectContextQuery(where: string) {

@@ -183,23 +183,28 @@ fs.chmodSync(path.join(BIN, 'gh'), 0o755);
 
 const REAL_GIT = spawnSync('which', ['git'], { encoding: 'utf8' }).stdout.trim();
 write(path.join(BIN, 'git'), `#!/usr/bin/env bash
+HOOK_ARGS=()
+while [ "$1" = "-c" ] && [ "$#" -ge 2 ]; do
+  HOOK_ARGS+=("$1" "$2")
+  shift 2
+done
 if [ "$1" = "ls-remote" ] && [ "$2" = "--heads" ] && [ "$3" = "origin" ]; then
   shift 3
-  exec "${REAL_GIT}" ls-remote --heads "${ORIGIN}" "$@"
+  exec "${REAL_GIT}" "\${HOOK_ARGS[@]}" ls-remote --heads "${ORIGIN}" "$@"
 fi
 if [ "$1" = "ls-remote" ] && [ "$2" = "--heads" ] && [ "$3" = "https://github.com/reisi007/demo.git" ]; then
   shift 3
-  exec "${REAL_GIT}" ls-remote --heads "${ORIGIN}" "$@"
+  exec "${REAL_GIT}" "\${HOOK_ARGS[@]}" ls-remote --heads "${ORIGIN}" "$@"
 fi
 if [ "$1" = "fetch" ] && [ "$2" = "--no-tags" ] && [ "$3" = "https://github.com/reisi007/demo.git" ]; then
   shift 3
-  exec "${REAL_GIT}" fetch --no-tags "${ORIGIN}" "$@"
+  exec "${REAL_GIT}" "\${HOOK_ARGS[@]}" fetch --no-tags "${ORIGIN}" "$@"
 fi
 if [ "$1" = "push" ] && [ "$2" = "https://github.com/reisi007/demo.git" ]; then
   shift 2
-  exec "${REAL_GIT}" push "${ORIGIN}" "$@"
+  exec "${REAL_GIT}" "\${HOOK_ARGS[@]}" push "${ORIGIN}" "$@"
 fi
-exec "${REAL_GIT}" "$@"
+exec "${REAL_GIT}" "\${HOOK_ARGS[@]}" "$@"
 `);
 fs.chmodSync(path.join(BIN, 'git'), 0o755);
 
@@ -440,12 +445,13 @@ for (const [adapter, port, operation] of [
   [getTracker('gitlab'), 'Tracker', 'listWorkItems'],
   [getCodeHost('jira'), 'CodeHost', 'createChange'],
   [getCodeHost('gitlab'), 'CodeHost', 'getChecks'],
-  [getAgentRunner('opencode'), 'AgentRunner', 'run'],
 ]) {
   assert.throws(() => adapter[operation]({}), (error) => (
     error instanceof UnsupportedCapabilityError && error.port === port && error.capability === operation
   ));
 }
+assert.equal(getAgentRunner('opencode').capabilities.capabilities.run, true);
+assert.deepEqual(getAgentRunner('opencode').capabilities.capabilities.roles, ['triage', 'builder', 'verifier', 'reviewer']);
 assert.throws(() => getTracker('github').updateWorkItem({
   project: 'reisi007/demo', number: 1, fields: { unsupported: true },
 }), (error) => error instanceof UnsupportedCapabilityError);

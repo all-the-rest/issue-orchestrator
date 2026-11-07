@@ -120,14 +120,55 @@ export interface CodeHost {
   publishComment(args: { project: string; number: number; body: string }): unknown;
 }
 
+export type AgentRole = 'triage' | 'builder' | 'verifier' | 'reviewer';
+
+export type AgentResultStatus = 'DONE' | 'BLOCKED' | 'CHANGES_REQUIRED';
+
+export interface AgentResult {
+  status: AgentResultStatus;
+  summary: string;
+  changed_files: string[];
+  commands: string[];
+  acceptance: string[];
+  blocked_reason: string | null;
+  evidence_dir: string | null;
+  verdict: string;
+}
+
+export type AgentSessionStatus = AgentResultStatus | 'CREATED' | 'RUNNING' | 'FAILED' | 'ABORTED';
+
+export interface AgentSession {
+  externalSessionId: string;
+  jobId: number;
+  role: AgentRole;
+  model: string;
+  worktree: string;
+  status: AgentSessionStatus;
+  startedAt: string;
+  endedAt: string | null;
+}
+
+export interface CreateAgentSessionArgs {
+  jobId: number;
+  role: AgentRole;
+  model: string;
+  worktree: string;
+}
+
+export interface RunAgentSessionArgs {
+  sessionId: string;
+  prompt: string;
+  timeoutMs?: number;
+}
+
 export interface AgentRunner {
   readonly name: string;
   readonly capabilities: CapabilityDescriptor;
-  createSession(args: Record<string, unknown>): unknown;
-  run(args: Record<string, unknown>): unknown;
-  resume(args: Record<string, unknown>): unknown;
-  abort(args: Record<string, unknown>): unknown;
-  getResult(args: Record<string, unknown>): unknown;
+  createSession(args: CreateAgentSessionArgs): Promise<AgentSession>;
+  run(args: RunAgentSessionArgs): Promise<AgentResult>;
+  resume(args: RunAgentSessionArgs): Promise<AgentResult>;
+  abort(args: { sessionId: string }): Promise<boolean>;
+  getResult(args: { sessionId: string }): Promise<AgentResult | null>;
 }
 
 export class UnsupportedCapabilityError extends Error {
