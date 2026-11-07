@@ -136,8 +136,9 @@ function validateConfig(cfg, file) {
   for (const field of ['enabled', 'local_only', 'auto_merge']) {
     if (field in defaults) requireType(defaults[field], 'boolean', `defaults.${field}`, file);
   }
-  for (const provider of [cfg.provider, defaults.provider].filter((value) => value !== undefined)) {
-    if (!['github', 'gitlab'].includes(provider)) throw new Error(`${file}: unsupported provider "${provider}"`);
+  for (const provider of [cfg.provider, defaults.provider, cfg.tracker, cfg.code_host,
+    defaults.tracker, defaults.code_host].filter((value) => value !== undefined)) {
+    if (!['github', 'gitlab', 'jira'].includes(provider)) throw new Error(`${file}: unsupported provider "${provider}"`);
   }
   for (const [field, labels] of [['defaults.labels', defaults.labels], ['labels', cfg.labels]]) {
     if (labels === undefined) continue;
@@ -176,9 +177,18 @@ function validateConfig(cfg, file) {
     if (account && !accounts.includes(account)) {
       throw new Error(`${file}: account "${account}" for "${project}" is not listed in accounts`);
     }
-    const provider = repo.provider ?? defaults.provider ?? cfg.provider ?? 'github';
-    if (!['github', 'gitlab'].includes(provider)) {
-      throw new Error(`${file}: unsupported provider "${provider}" for "${project}"`);
+    for (const provider of [repo.provider, repo.tracker, repo.code_host].filter((value) => value !== undefined)) {
+      if (!['github', 'gitlab', 'jira'].includes(provider)) {
+        throw new Error(`${file}: unsupported provider "${provider}" for "${project}"`);
+      }
+    }
+    for (const accountField of ['account', 'tracker_account', 'code_host_account']) {
+      if (repo[accountField] !== undefined && (typeof repo[accountField] !== 'string' || !repo[accountField])) {
+        throw new Error(`${file}: repos.${project}.${accountField} must be a non-empty account name`);
+      }
+      if (repo[accountField] && !accounts.includes(repo[accountField])) {
+        throw new Error(`${file}: account "${repo[accountField]}" for "${project}" is not listed in accounts`);
+      }
     }
     if (repo.trusted_authors !== undefined &&
         (!Array.isArray(repo.trusted_authors) || repo.trusted_authors.some((author) => typeof author !== 'string' || !author))) {
@@ -220,10 +230,21 @@ export function repoConfig(cfg, project) {
   const defaults = cfg.defaults ?? {};
   const labels = { ...(defaults.labels ?? {}), ...(own.labels ?? {}) };
   const enabled = own.enabled ?? defaults.enabled ?? true;
+  const tracker = own.tracker ?? own.provider ?? defaults.tracker ?? cfg.tracker ??
+    defaults.provider ?? cfg.provider ?? 'github';
+  const codeHost = own.code_host ?? own.provider ?? defaults.code_host ?? cfg.code_host ??
+    defaults.provider ?? cfg.provider ?? 'github';
+  const account = own.account ?? cfg.accounts?.[0] ?? null;
   return {
     project,
-    provider: own.provider ?? defaults.provider ?? cfg.provider ?? 'github',
-    account: own.account ?? cfg.accounts?.[0] ?? null,
+    // Keep a stable persisted adapter identity so recovery refuses a changed
+    // tracker/code-host pair without requiring a database migration.
+    provider: tracker === codeHost ? tracker : `${tracker}+${codeHost}`,
+    tracker,
+    code_host: codeHost,
+    account,
+    tracker_account: own.tracker_account ?? account,
+    code_host_account: own.code_host_account ?? account,
     enabled,
     local_only: own.local_only ?? defaults.local_only ?? false,
     auto_merge: enabled && (own.auto_merge ?? defaults.auto_merge ?? true),

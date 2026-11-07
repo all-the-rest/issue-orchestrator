@@ -1029,6 +1029,16 @@ export class SQLiteStore {
     return Number(row.id);
   }
 
+  providerForOwner(ownerToken: string) {
+    const row = asSqlRow<SqlRow>(
+      this.db.prepare('SELECT provider FROM jobs WHERE owner_token=?').get(ownerToken),
+    );
+    if (!row || typeof row.provider !== 'string') {
+      throw new Error('Queue lock ownership changed; no persisted provider for active job');
+    }
+    return row.provider;
+  }
+
   beginSideEffect(input: {
     idempotencyKey: string;
     kind: string;
