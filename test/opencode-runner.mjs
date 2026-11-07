@@ -55,7 +55,12 @@ function createBuilderWorktree(name) {
     cwd: process.cwd(), encoding: 'utf8',
   });
   assert.equal(storeResult.status, 0, `pnpm store lookup failed: ${storeResult.stderr}`);
-  const store = fs.realpathSync(storeResult.stdout.trim());
+  const storePath = path.resolve(storeResult.stdout.trim());
+  // `pnpm store path` reports the configured location even when a cacheless
+  // CI runner has not created the store directory yet. The sandbox requires
+  // that trusted host path to exist before it can mount it read-only.
+  fs.mkdirSync(storePath, { recursive: true });
+  const store = fs.realpathSync(storePath);
   const fixtureParent = path.dirname(path.dirname(store));
   const base = fs.mkdtempSync(path.join(fixtureParent, 'issue-orchestrator-builder-test-'));
   EXTERNAL_TEMPS.push(base);
