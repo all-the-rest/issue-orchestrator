@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "rules": {
+    "explicit-any": {
+      "value": 4
+    },
+    "skill-dir-imports": {
+      "value": 0
+    },
+    "todo-markers": {
+      "value": 0
+    }
+  }
+}

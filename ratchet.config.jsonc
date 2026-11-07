@@ -1,0 +1,60 @@
+// The gates of this repository: the deterministic core must stay clean and
+// must not grow back into the skill it was extracted from.
+//
+// Every rule is a ceiling: the count may only shrink. A deliberate growth is a
+// `ratchet baseline raise --rule <id> --value <n> --reason "<why>"` commit.
+[
+  {
+    "name": "issue-orchestrator",
+    "tiers": {
+      "fast": { "floor": 3 }
+    },
+    "rules": {
+      "todo-markers": {
+        "class": "unfinished work",
+        "incident": "prevention: the extraction ports a working skill; a TODO in src/ would be a dropped behaviour that the e2e suite does not see",
+        "unit": "markers",
+        "direction": "ceiling",
+        "tier": "fast",
+        "description": "the counted scope is every tracked file under src/; the count is the number of TODO/FIXME markers",
+        "count": {
+          "command": [
+            "sh",
+            "-c",
+            "git grep -I -o -E 'TODO|FIXME' -- src | wc -l | tr -d '[:space:]'"
+          ]
+        }
+      },
+      "explicit-any": {
+        "class": "type-system weakening",
+        "incident": "the extracted JavaScript was annotated with `any` at the boundaries; the ceiling records that debt so new code cannot add more of it",
+        "unit": "lines",
+        "direction": "ceiling",
+        "tier": "fast",
+        "description": "the counted scope is every tracked file under src/; the count is the number of lines that use `: any` or `as any`",
+        "count": {
+          "command": [
+            "sh",
+            "-c",
+            "git grep -n -E ': any|as any' -- src | wc -l | tr -d '[:space:]'"
+          ]
+        }
+      },
+      "skill-dir-imports": {
+        "class": "dependency on the extracted skill",
+        "incident": "issue #1 requires the package to run without the git-issue-agent skill; a reintroduced import or SKILL_DIR reference would silently undo the extraction",
+        "unit": "matches",
+        "direction": "ceiling",
+        "tier": "fast",
+        "description": "the counted scope is every tracked file under src/ and test/; the count is the number of lines that mention SKILL_DIR or .agents/skills",
+        "count": {
+          "command": [
+            "sh",
+            "-c",
+            "git grep -n -E 'SKILL_DIR|agents/skills' -- src test | wc -l | tr -d '[:space:]'"
+          ]
+        }
+      }
+    }
+  }
+]
