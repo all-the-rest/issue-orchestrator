@@ -51,8 +51,19 @@ function createWorktree(name, base = TMP) {
 }
 
 function createBuilderWorktree(name) {
+  const pnpmEnv = {
+    PATH: process.env.PATH ?? process.env.Path ?? '',
+    HOME: process.env.HOME ?? os.homedir(),
+    npm_config_userconfig: '/dev/null',
+    npm_config_globalconfig: '/dev/null',
+    NPM_CONFIG_USERCONFIG: '/dev/null',
+    NPM_CONFIG_GLOBALCONFIG: '/dev/null',
+  };
+  for (const key of ['XDG_CONFIG_HOME', 'COREPACK_HOME']) {
+    if (process.env[key] !== undefined) pnpmEnv[key] = process.env[key];
+  }
   const storeResult = spawnSync('pnpm', ['store', 'path', '--silent'], {
-    cwd: process.cwd(), encoding: 'utf8',
+    cwd: process.cwd(), env: pnpmEnv, encoding: 'utf8',
   });
   assert.equal(storeResult.status, 0, `pnpm store lookup failed: ${storeResult.stderr}`);
   const storePath = path.resolve(storeResult.stdout.trim());
