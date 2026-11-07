@@ -3,6 +3,13 @@ import os from 'node:os';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { DatabaseSync, type SQLInputValue, type SQLOutputValue } from 'node:sqlite';
+import {
+  assertWorkflowTransition,
+  isTerminalWorkflowState,
+  isWorkflowState,
+  type WorkflowActor,
+  type WorkflowState,
+} from './state-machine.js';
 
 const BUSY_TIMEOUT_MS = 5000;
 const DEFAULT_LEASE_MS = 15 * 60 * 1000;
@@ -18,6 +25,7 @@ interface Lock {
   branch?: string | null;
   account?: string | null;
   stage?: string;
+  workflow_state?: WorkflowState;
   claimed_at?: string;
   updated_at?: string;
   local_only?: boolean;
@@ -152,6 +160,16 @@ interface JobStateRow extends IdRow {
   state: string;
 }
 
+interface SideEffectRow extends SqlRow {
+  idempotency_key: string;
+  job_id: number | bigint | null;
+  kind: string;
+  intent_hash: string;
+  intent_json: string;
+  status: string;
+  result_json: string | null;
+}
+
 interface RuntimeStateInput {
   active?: Lock | null;
   last_run?: string | null;
@@ -227,6 +245,27 @@ function isValidLegacyLock(value: unknown): value is LegacyLock {
   return true;
 }
 
+function legacyWorkflowState(stage?: string, result?: string): WorkflowState {
+  const states: Record<string, WorkflowState> = {
+    claimed: 'CLAIMED',
+    triaged: 'CLAIMED',
+    isolated: 'ISOLATED',
+    'before-evidence': 'BEFORE_CAPTURED',
+    implemented: 'IMPLEMENTED',
+    'change-pending': 'IMPLEMENTED',
+    'change-created': 'CHANGE_OPEN',
+    'evidence-publishing': 'CHANGE_OPEN',
+    'evidence-published': 'EVIDENCE_PUBLISHED',
+    reviewed: 'REVIEWING',
+    'checks-green': 'CHECKS_GREEN',
+    'merge-pending': 'MERGING',
+    merged: 'DONE',
+    'release-pending': result === 'done' ? 'DONE' : result === 'blocked' ? 'BLOCKED' :
+      result === 'review' ? 'REVIEW' : result === 'needs-info' ? 'NEEDS_INFO' : 'CLAIMED',
+  };
+  return states[stage ?? ''] ?? 'CLAIMED';
+}
+
 function fromRow(row: LockRow | undefined): Lock | null {
   if (!row) return null;
   if (typeof row.owner_token !== 'string') return null;
@@ -239,6 +278,9 @@ function fromRow(row: LockRow | undefined): Lock | null {
     config_file: typeof row.config_file === 'string' ? row.config_file : '',
     owner_token: row.owner_token,
     stage: typeof row.stage === 'string' ? row.stage : undefined,
+    workflow_state: typeof row.workflow_state === 'string' && isWorkflowState(row.workflow_state)
+      ? row.workflow_state
+      : undefined,
     claimed_at: typeof row.claimed_at === 'string' ? row.claimed_at : undefined,
     updated_at: typeof row.updated_at === 'string' ? row.updated_at : undefined,
     local_only: !!row.local_only,
@@ -399,6 +441,67 @@ const MIGRATIONS = [
       pid INTEGER NOT NULL,
       acquired_at TEXT NOT NULL
     );
+  `,
+  `
+    ALTER TABLE jobs ADD COLUMN workflow_state TEXT NOT NULL DEFAULT 'NEW'
+      CHECK (workflow_state IN (
+        'NEW', 'TRIAGED', 'READY', 'CLAIMED', 'ISOLATED', 'BEFORE_CAPTURED',
+        'IMPLEMENTING', 'IMPLEMENTED', 'CHANGE_OPEN', 'EVIDENCE_PUBLISHED',
+        'REVIEWING', 'REVIEW_APPROVED', 'CHECKS_GREEN', 'MERGING', 'DONE',
+        'NEEDS_INFO', 'BLOCKED', 'REVIEW', 'FAILED', 'CANCELLED', 'STALE'
+      ));
+    UPDATE jobs SET workflow_state = CASE
+      WHEN stage = 'triaged' AND state IN ('CLAIMED', 'RUNNING') THEN 'CLAIMED'
+      WHEN stage IN ('triaged') THEN 'TRIAGED'
+      WHEN stage IN ('isolated') THEN 'ISOLATED'
+      WHEN stage IN ('before-evidence') THEN 'BEFORE_CAPTURED'
+      WHEN stage IN ('implemented', 'change-pending') THEN 'IMPLEMENTED'
+      WHEN stage IN ('change-created', 'evidence-publishing') THEN 'CHANGE_OPEN'
+      WHEN stage IN ('evidence-published') THEN 'EVIDENCE_PUBLISHED'
+      WHEN stage IN ('reviewed') THEN 'REVIEWING'
+      WHEN stage IN ('checks-green') THEN 'CHECKS_GREEN'
+      WHEN stage IN ('merge-pending') THEN 'MERGING'
+      WHEN stage IN ('merged') THEN 'DONE'
+      WHEN stage IN ('release-pending') AND release_result = 'done' THEN 'DONE'
+      WHEN stage IN ('release-pending') AND release_result = 'blocked' THEN 'BLOCKED'
+      WHEN stage IN ('release-pending') AND release_result = 'review' THEN 'REVIEW'
+      WHEN stage IN ('release-pending') AND release_result = 'needs-info' THEN 'NEEDS_INFO'
+      WHEN state = 'FAILED' THEN 'FAILED'
+      WHEN state = 'DONE' THEN 'DONE'
+      WHEN state = 'BLOCKED' THEN 'BLOCKED'
+      WHEN state = 'REVIEW' THEN 'REVIEW'
+      WHEN state = 'NEEDS_INFO' THEN 'NEEDS_INFO'
+      WHEN state = 'CANCELLED' THEN 'CANCELLED'
+      WHEN state = 'STALE' THEN 'STALE'
+      WHEN state IN ('CLAIMED', 'RUNNING') THEN 'CLAIMED'
+      WHEN state = 'READY' THEN 'READY'
+      WHEN state = 'ABANDONED' THEN 'STALE'
+      ELSE 'NEW'
+    END;
+
+    CREATE TABLE workflow_transitions (
+      id INTEGER PRIMARY KEY,
+      job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+      from_state TEXT NOT NULL,
+      to_state TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      actor TEXT NOT NULL CHECK (actor IN ('cli', 'agent', 'human')),
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX workflow_transitions_job ON workflow_transitions(job_id, created_at);
+
+    CREATE TABLE side_effect_journal (
+      idempotency_key TEXT PRIMARY KEY,
+      job_id INTEGER REFERENCES jobs(id) ON DELETE CASCADE,
+      kind TEXT NOT NULL,
+      intent_hash TEXT NOT NULL,
+      intent_json TEXT NOT NULL,
+      status TEXT NOT NULL CHECK (status IN ('INTENT', 'COMPLETED', 'UNCERTAIN')),
+      result_json TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX side_effect_journal_job ON side_effect_journal(job_id, created_at);
   `,
 ];
 
@@ -621,14 +724,14 @@ export class SQLiteStore {
     if (!item) throw new Error(`Could not migrate legacy work item ${lock.repo}#${lock.issue}`);
     this.db.prepare("UPDATE work_items SET state='CLAIMED' WHERE id=? AND state='READY' RETURNING id").get(item.id);
     const job = asSqlRow<IdRow>(this.db.prepare(`
-      INSERT INTO jobs(project_id, work_item_id, owner_token, config_file, provider, state, stage, branch,
+      INSERT INTO jobs(project_id, work_item_id, owner_token, config_file, provider, state, workflow_state, stage, branch,
         account, local_only, claimed_by, claimed_at, heartbeat_at, lease_expires_at, attempts,
         change_number, head_sha, evidence_commit, release_result, resumed_at, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, 'CLAIMED', ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, 'CLAIMED', ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
       RETURNING id
     `).get(
       lock.repo, item.id, lock.owner_token, lock.config_file ?? null, lock.provider ?? 'github',
-      lock.stage ?? 'claimed', lock.branch ?? null, lock.account ?? null, lock.local_only ? 1 : 0,
+      legacyWorkflowState(lock.stage, lock.release_result), lock.stage ?? 'claimed', lock.branch ?? null, lock.account ?? null, lock.local_only ? 1 : 0,
       String(process.pid), stamp, lock.updated_at ?? stamp,
       new Date(Date.parse(lock.updated_at ?? stamp) + DEFAULT_LEASE_MS).toISOString(),
       lock.change_number ?? null, lock.head_sha ?? null, lock.evidence_commit ?? null,
@@ -732,8 +835,8 @@ export class SQLiteStore {
       );
       if (!queued) {
         queued = asSqlRow<IdRow>(this.db.prepare(`
-          INSERT INTO jobs(project_id, work_item_id, provider, state, attempts, created_at, updated_at)
-          VALUES (?, ?, ?, 'READY', 0, ?, ?) RETURNING id
+          INSERT INTO jobs(project_id, work_item_id, provider, state, workflow_state, attempts, created_at, updated_at)
+          VALUES (?, ?, ?, 'READY', 'READY', 0, ?, ?) RETURNING id
         `).get(lock.repo, item.id, lock.provider, lock.claimed_at, lock.updated_at));
         if (!queued) throw new Error(`Could not queue work item ${lock.repo}#${lock.issue}`);
         this.recordTransition(Number(queued.id), null, 'READY', 'work item queued for CLI claim', lock.owner_token, lock.claimed_at);
@@ -752,6 +855,10 @@ export class SQLiteStore {
       ));
       if (!updated) throw new Error(`Job for ${lock.repo}#${lock.issue} is not ready to claim`);
       this.recordTransition(Number(updated.id), 'READY', 'CLAIMED', 'claimed from CLI', lock.owner_token, lock.claimed_at);
+      const workflow = asSqlRow<SqlRow>(this.db.prepare('SELECT workflow_state FROM jobs WHERE id=?').get(updated.id));
+      if (workflow?.workflow_state === 'READY') {
+        this.transitionWorkflowInTransaction(Number(updated.id), 'CLAIMED', 'cli', 'trusted issue claimed');
+      }
       this.db.prepare(`
         INSERT INTO runtime_state(config_file, active_job_id, last_run) VALUES (?, ?, ?)
         ON CONFLICT(config_file) DO UPDATE SET active_job_id=excluded.active_job_id, last_run=excluded.last_run
@@ -796,6 +903,439 @@ export class SQLiteStore {
     });
   }
 
+  transitionWorkflow(ownerToken: string, to: WorkflowState, actor: WorkflowActor, reason: string) {
+    return this.transaction(() => {
+      const active = asSqlRow<IdRow>(this.db.prepare(
+        "SELECT id FROM jobs WHERE owner_token=? AND state IN ('CLAIMED', 'RUNNING')",
+      ).get(ownerToken));
+      if (!active) throw new Error('Queue lock ownership changed; refusing workflow transition');
+      return this.transitionWorkflowInTransaction(Number(active.id), to, actor, reason);
+    });
+  }
+
+  workflowStateForOwner(ownerToken: string) {
+    const row = asSqlRow<SqlRow>(this.db.prepare(
+      'SELECT workflow_state FROM jobs WHERE owner_token=?',
+    ).get(ownerToken));
+    if (!row || typeof row.workflow_state !== 'string' || !isWorkflowState(row.workflow_state)) {
+      throw new Error('Queue lock ownership changed; no valid workflow state for this owner');
+    }
+    return row.workflow_state;
+  }
+
+  private transitionWorkflowInTransaction(jobId: number, to: WorkflowState, actor: WorkflowActor, reason: string) {
+    const job = asSqlRow<SqlRow>(this.db.prepare(`
+      SELECT workflow_state, change_number, branch, head_sha, evidence_commit
+      FROM jobs WHERE id=?
+    `).get(jobId));
+    if (!job || typeof job.workflow_state !== 'string' || !isWorkflowState(job.workflow_state)) {
+      throw new Error(`Job ${jobId} has an invalid workflow state`);
+    }
+    const from = job.workflow_state;
+    assertWorkflowTransition(from, to, actor);
+
+    const fullHead = typeof job.head_sha === 'string' && /^[a-f0-9]{40}$/i.test(job.head_sha);
+    if (to === 'CHANGE_OPEN' && (!Number.isSafeInteger(Number(job.change_number)) || Number(job.change_number) <= 0 ||
+        typeof job.branch !== 'string' || !job.branch || !fullHead)) {
+      throw new Error('CHANGE_OPEN requires a persisted change number, branch, and full head SHA');
+    }
+    if (to === 'EVIDENCE_PUBLISHED' && (!fullHead || typeof job.evidence_commit !== 'string' ||
+        !/^[a-f0-9]{40}$/i.test(job.evidence_commit))) {
+      throw new Error('EVIDENCE_PUBLISHED requires a persisted evidence commit and full head SHA');
+    }
+    if (to === 'REVIEW_APPROVED' && !this.hasWorkflowCheck(jobId, 'review-approval', 'approved', String(job.head_sha ?? ''))) {
+      throw new Error('REVIEW_APPROVED requires an observed trusted approval for the current head SHA');
+    }
+    if (to === 'CHECKS_GREEN' && !this.hasWorkflowCheck(jobId, 'required-checks', 'green', String(job.head_sha ?? ''))) {
+      throw new Error('CHECKS_GREEN requires observed green required checks for the current head SHA');
+    }
+    if (to === 'DONE' && !this.hasWorkflowCheck(jobId, 'merge', 'merged', String(job.head_sha ?? ''))) {
+      throw new Error('DONE requires observed external merge state for the current head SHA');
+    }
+
+    const stamp = nowIso();
+    this.db.prepare('UPDATE jobs SET workflow_state=?, updated_at=? WHERE id=?').run(to, stamp, jobId);
+    this.db.prepare(`
+      INSERT INTO workflow_transitions(job_id, from_state, to_state, reason, actor, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(jobId, from, to, reason, actor, stamp);
+    return true;
+  }
+
+  recordWorkflowCheck(ownerToken: string, name: string, status: string, headSha: string, details: unknown = {}) {
+    if (!/^[a-f0-9]{40}$/i.test(headSha)) throw new Error('workflow check requires a full head SHA');
+    const detailsJson = JSON.stringify(details);
+    if (detailsJson === undefined) throw new Error('workflow check details must be JSON serializable');
+    return this.transaction(() => {
+      const job = asSqlRow<SqlRow>(this.db.prepare(
+        "SELECT id, head_sha FROM jobs WHERE owner_token=? AND state IN ('CLAIMED', 'RUNNING')",
+      ).get(ownerToken));
+      if (!job) throw new Error('Queue lock ownership changed; refusing to record workflow check');
+      if (String(job.head_sha ?? '').toLowerCase() !== headSha.toLowerCase()) {
+        throw new Error('Workflow check head SHA differs from the persisted job head');
+      }
+      this.db.prepare(`
+        INSERT INTO checks(job_id, name, status, head_sha, details_json, checked_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(job.id, name, status, headSha.toLowerCase(), detailsJson, nowIso());
+      return Number(job.id);
+    });
+  }
+
+  recordMergedOutcome(ownerToken: string, headSha: string, details: unknown = {}, reason = 'external merge verified') {
+    if (!/^[a-f0-9]{40}$/i.test(headSha)) throw new Error('merged outcome requires a full head SHA');
+    const detailsJson = JSON.stringify(details);
+    if (detailsJson === undefined) throw new Error('merged outcome details must be JSON serializable');
+    return this.transaction(() => {
+      const job = asSqlRow<SqlRow>(this.db.prepare(`
+        SELECT id, head_sha, workflow_state, config_file FROM jobs
+        WHERE owner_token=? AND state IN ('CLAIMED', 'RUNNING')
+      `).get(ownerToken));
+      if (!job) throw new Error('Queue lock ownership changed; refusing to record merged outcome');
+      if (String(job.head_sha ?? '').toLowerCase() !== headSha.toLowerCase()) {
+        throw new Error('Merged outcome head SHA differs from the persisted job head');
+      }
+      const jobId = Number(job.id);
+      const workflow = String(job.workflow_state);
+      if (workflow !== 'MERGING' && workflow !== 'DONE') {
+        throw new Error(`Cannot record merged outcome from workflow state ${workflow}`);
+      }
+      if (!this.hasWorkflowCheck(jobId, 'merge', 'merged', headSha)) {
+        this.db.prepare(`
+          INSERT INTO checks(job_id, name, status, head_sha, details_json, checked_at)
+          VALUES (?, 'merge', 'merged', ?, ?, ?)
+        `).run(jobId, headSha.toLowerCase(), detailsJson, nowIso());
+      }
+      if (workflow === 'MERGING') {
+        this.transitionWorkflowInTransaction(jobId, 'DONE', 'cli', reason);
+      }
+      const stamp = nowIso();
+      this.db.prepare("UPDATE jobs SET stage='merged', updated_at=? WHERE id=? AND owner_token=?")
+        .run(stamp, jobId, ownerToken);
+      this.db.prepare('UPDATE runtime_state SET last_run=? WHERE active_job_id=?').run(stamp, jobId);
+      return true;
+    });
+  }
+
+  private hasWorkflowCheck(jobId: number, name: string, status: string, headSha: string) {
+    return !!this.db.prepare(`
+      SELECT 1 FROM checks WHERE job_id=? AND name=? AND status=? AND head_sha=?
+    `).get(jobId, name, status, headSha.toLowerCase());
+  }
+
+  jobIdForOwner(ownerToken: string) {
+    const row = asSqlRow<IdRow>(this.db.prepare('SELECT id FROM jobs WHERE owner_token=?').get(ownerToken));
+    if (!row) throw new Error('Queue lock ownership changed; no matching job for side effect');
+    return Number(row.id);
+  }
+
+  beginSideEffect(input: {
+    idempotencyKey: string;
+    kind: string;
+    intent: unknown;
+    ownerToken?: string;
+  }) {
+    if (!input.idempotencyKey || !input.kind) throw new Error('side effect requires an idempotency key and kind');
+    const intentJson = JSON.stringify(input.intent);
+    if (intentJson === undefined) throw new Error('side-effect intent must be JSON serializable');
+    const intentHash = hashPayload(input.intent);
+    return this.transaction(() => {
+      let jobId: number | null = null;
+      if (input.ownerToken) {
+        const job = asSqlRow<IdRow>(this.db.prepare(
+          "SELECT id FROM jobs WHERE owner_token=? AND state IN ('CLAIMED', 'RUNNING')",
+        ).get(input.ownerToken));
+        if (!job) throw new Error('Queue lock ownership changed; refusing side effect');
+        jobId = Number(job.id);
+      }
+      const existing = asSqlRow<SideEffectRow>(this.db.prepare(
+        'SELECT * FROM side_effect_journal WHERE idempotency_key=?',
+      ).get(input.idempotencyKey));
+      if (existing) {
+        if (Number(existing.job_id ?? 0) !== Number(jobId ?? 0) || existing.kind !== input.kind ||
+            existing.intent_hash !== intentHash) {
+          throw new Error(`Side-effect idempotency key collision: ${input.idempotencyKey}`);
+        }
+        return this.sideEffectValue(existing);
+      }
+      const stamp = nowIso();
+      this.db.prepare(`
+        INSERT INTO side_effect_journal(idempotency_key, job_id, kind, intent_hash, intent_json, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, 'INTENT', ?, ?)
+      `).run(input.idempotencyKey, jobId, input.kind, intentHash, intentJson, stamp, stamp);
+      return {
+        idempotencyKey: input.idempotencyKey,
+        jobId,
+        kind: input.kind,
+        intent: input.intent,
+        status: 'INTENT',
+        result: null,
+      };
+    });
+  }
+
+  completeSideEffect(idempotencyKey: string, result: unknown) {
+    const resultJson = JSON.stringify(result);
+    if (resultJson === undefined) throw new Error('side-effect result must be JSON serializable');
+    const updated = this.db.prepare(`
+      UPDATE side_effect_journal SET status='COMPLETED', result_json=?, updated_at=?
+      WHERE idempotency_key=?
+    `).run(resultJson, nowIso(), idempotencyKey);
+    if (Number(updated.changes) !== 1) throw new Error(`No side-effect intent exists for ${idempotencyKey}`);
+  }
+
+  markSideEffectUncertain(idempotencyKey: string, reason: string) {
+    const resultJson = JSON.stringify({ outcome: 'uncertain', reason });
+    this.db.prepare(`
+      UPDATE side_effect_journal SET status='UNCERTAIN', result_json=?, updated_at=?
+      WHERE idempotency_key=? AND status IN ('INTENT', 'UNCERTAIN')
+    `).run(resultJson, nowIso(), idempotencyKey);
+  }
+
+  markSideEffectPending(idempotencyKey: string) {
+    this.db.prepare(`
+      UPDATE side_effect_journal SET status='INTENT', result_json=NULL, updated_at=?
+      WHERE idempotency_key=? AND status='UNCERTAIN'
+    `).run(nowIso(), idempotencyKey);
+  }
+
+  sideEffectsForJob(jobId: number) {
+    return asSqlRows<SideEffectRow>(this.db.prepare(
+      'SELECT * FROM side_effect_journal WHERE job_id=? ORDER BY created_at, idempotency_key',
+    ).all(jobId)).map((row) => this.sideEffectValue(row));
+  }
+
+  pendingSideEffects() {
+    const rows = this.db.prepare(this.sideEffectContextQuery(`e.status IN ('INTENT', 'UNCERTAIN')`))
+      .all() as SqlRow[];
+    return this.sideEffectContext(rows);
+  }
+
+  completedMergeRecoveries() {
+    // A normal merge records stage=merged and keeps its lock for `release`.
+    // Recovery-stage jobs remain selected until their journaled labels finish.
+    const rows = this.db.prepare(this.sideEffectContextQuery(`
+      e.kind='merge' AND e.status='COMPLETED'
+      AND j.state <> 'RELEASED'
+      AND (j.workflow_state <> 'DONE' OR COALESCE(j.stage, '') <> 'merged' OR j.state IN ('READY', 'FAILED'))
+    `)).all() as SqlRow[];
+    return this.sideEffectContext(rows);
+  }
+
+  private sideEffectContextQuery(where: string) {
+    return `
+      SELECT e.*, j.owner_token, j.project_id AS job_project, j.config_file AS job_config_file,
+        j.provider AS job_provider, j.workflow_state AS job_workflow_state, j.state AS job_state,
+        j.error_class AS job_error_class, j.branch AS job_branch, j.head_sha AS job_head_sha,
+        j.change_number AS job_change_number, w.external_id AS job_issue
+      FROM side_effect_journal e LEFT JOIN jobs j ON j.id=e.job_id
+        LEFT JOIN work_items w ON w.id=j.work_item_id
+      WHERE ${where}
+      ORDER BY e.created_at, e.idempotency_key
+    `;
+  }
+
+  private sideEffectContext(rows: SqlRow[]) {
+    return rows.map((raw) => {
+      const row = raw as unknown as SideEffectRow;
+      const effect = this.sideEffectValue(row);
+      const intent = effect.intent as Record<string, unknown>;
+      const project = typeof intent.project === 'string'
+        ? intent.project
+        : typeof raw.job_project === 'string' ? raw.job_project : null;
+      const projectConfig = project
+        ? asSqlRow<SqlRow>(this.db.prepare('SELECT provider, config_file FROM projects WHERE id=?').get(project))
+        : undefined;
+      return {
+        ...effect,
+        ownerToken: typeof raw.owner_token === 'string' ? raw.owner_token : null,
+        project,
+        provider: typeof raw.job_provider === 'string'
+          ? raw.job_provider
+          : typeof projectConfig?.provider === 'string' ? projectConfig.provider : null,
+        configFile: typeof raw.job_config_file === 'string'
+          ? raw.job_config_file
+          : typeof intent.config_file === 'string' ? intent.config_file
+            : typeof projectConfig?.config_file === 'string' ? projectConfig.config_file : null,
+        issue: typeof raw.job_issue === 'string' ? Number(raw.job_issue) : null,
+        branch: typeof raw.job_branch === 'string' ? raw.job_branch : null,
+        headSha: typeof raw.job_head_sha === 'string' ? raw.job_head_sha : null,
+        changeNumber: raw.job_change_number == null ? null : Number(raw.job_change_number),
+        workflowState: typeof raw.job_workflow_state === 'string' ? raw.job_workflow_state : null,
+        jobState: typeof raw.job_state === 'string' ? raw.job_state : null,
+        errorClass: typeof raw.job_error_class === 'string' ? raw.job_error_class : null,
+      };
+    });
+  }
+
+  prepareMergedSideEffectRecovery(idempotencyKey: string, observed: {
+    project: string;
+    number: number;
+    head_sha: string;
+    issue: number;
+    branch: string;
+    base: string;
+  }) {
+    return this.transaction(() => {
+      const row = asSqlRow<SqlRow>(this.db.prepare(`
+        SELECT e.job_id, e.kind, e.status, e.intent_json,
+          j.state AS job_state, j.owner_token, j.workflow_state, j.error_class, j.work_item_id,
+          j.project_id, j.branch, j.head_sha, j.change_number, j.stage, j.config_file,
+          j.provider, j.account, j.local_only, j.claimed_by, j.claimed_at,
+          w.external_id, w.state AS item_state
+        FROM side_effect_journal e JOIN jobs j ON j.id=e.job_id
+        JOIN work_items w ON w.id=j.work_item_id
+        WHERE e.idempotency_key=?
+      `).get(idempotencyKey));
+      if (!row || row.kind !== 'merge' || !['INTENT', 'UNCERTAIN', 'COMPLETED'].includes(String(row.status))) {
+        throw new Error('merge recovery intent changed; refusing workflow recovery');
+      }
+      const intent = JSON.parse(String(row.intent_json)) as Record<string, unknown>;
+      const jobId = Number(row.job_id);
+      const workItemId = Number(row.work_item_id);
+      const issue = Number(row.external_id);
+      const headSha = String(row.head_sha ?? '').toLowerCase();
+      if (typeof row.config_file !== 'string' || !row.config_file ||
+          observed.project !== row.project_id || intent.project !== row.project_id ||
+          Number(observed.number) !== Number(row.change_number) ||
+          Number(intent.number) !== Number(row.change_number) || observed.head_sha.toLowerCase() !== headSha ||
+          String(intent.head_sha ?? '').toLowerCase() !== headSha || Number(observed.issue) !== issue ||
+          Number(intent.issue) !== issue || typeof row.branch !== 'string' || observed.branch !== row.branch ||
+          intent.branch !== row.branch || typeof intent.base !== 'string' || !intent.base ||
+          observed.base !== intent.base || typeof intent.owner_token !== 'string' || !intent.owner_token) {
+        throw new Error('observed merge does not match the persisted job and merge intent');
+      }
+
+      const jobState = String(row.job_state);
+      const workflow = String(row.workflow_state);
+      const recoveryStage = row.stage === 'merge-recovery';
+      const doneRecovery = workflow === 'DONE' && (recoveryStage || row.stage !== 'merged' ||
+        jobState === 'READY' || jobState === 'FAILED');
+      if (workflow === 'DONE' && !doneRecovery) return null;
+      if (workflow !== 'MERGING' && workflow !== 'DONE' &&
+          !(workflow === 'FAILED' && row.error_class === 'LeaseExpiredMaxAttempts')) return null;
+      if (jobState === 'RELEASED') return null;
+      if (!['CLAIMED', 'RUNNING', 'READY', 'FAILED'].includes(jobState)) return null;
+      if (jobState === 'FAILED' && row.error_class !== 'LeaseExpiredMaxAttempts') return null;
+
+      const otherActiveJob = this.db.prepare(`
+        SELECT 1 FROM jobs WHERE id<>? AND state IN ('CLAIMED', 'RUNNING') LIMIT 1
+      `).get(jobId);
+      if (otherActiveJob) return null;
+
+      let ownerToken: string;
+      if (jobState === 'CLAIMED' || jobState === 'RUNNING') {
+        if (!recoveryStage && row.owner_token !== intent.owner_token) return null;
+        if (typeof row.owner_token !== 'string' || !row.owner_token) return null;
+        ownerToken = row.owner_token;
+      } else {
+        if (row.owner_token != null) return null;
+        ownerToken = randomUUID();
+      }
+
+      const stamp = nowIso();
+      const leaseExpiresAt = new Date(Date.parse(stamp) + DEFAULT_LEASE_MS).toISOString();
+      if (jobState === 'READY' || jobState === 'FAILED') {
+        const claimed = this.db.prepare(`
+          UPDATE jobs SET state='CLAIMED', owner_token=?, stage='merge-recovery', claimed_by=?,
+            claimed_at=?, heartbeat_at=?, lease_expires_at=?, error_class=NULL, updated_at=?
+          WHERE id=? AND state=?
+        `).run(ownerToken, String(process.pid), stamp, stamp, leaseExpiresAt, stamp, jobId, jobState);
+        if (Number(claimed.changes) !== 1) return null;
+        this.db.prepare("UPDATE work_items SET state='CLAIMED', updated_at=? WHERE id=?")
+          .run(stamp, workItemId);
+        this.recordTransition(jobId, jobState, 'CLAIMED', 'verified merge recovery claimed for journaled label finalization', 'merge-reconciler', stamp);
+      } else {
+        const refreshed = this.db.prepare(`
+          UPDATE jobs SET stage='merge-recovery', heartbeat_at=?, lease_expires_at=?, updated_at=?
+          WHERE id=? AND owner_token=? AND state IN ('CLAIMED', 'RUNNING')
+        `).run(stamp, leaseExpiresAt, stamp, jobId, ownerToken);
+        if (Number(refreshed.changes) !== 1) return null;
+      }
+
+      if (!this.hasWorkflowCheck(jobId, 'merge', 'merged', headSha)) {
+        this.db.prepare(`
+          INSERT INTO checks(job_id, name, status, head_sha, details_json, checked_at)
+          VALUES (?, 'merge', 'merged', ?, ?, ?)
+        `).run(jobId, headSha, JSON.stringify({ change: observed.number, issue, branch: observed.branch,
+          base: observed.base, reconciled: true }), stamp);
+      }
+      if (workflow === 'MERGING') {
+        this.transitionWorkflowInTransaction(jobId, 'DONE', 'cli', 'exact merged PR recovered from the durable merge intent');
+      } else if (workflow === 'FAILED') {
+        this.db.prepare("UPDATE jobs SET workflow_state='DONE', updated_at=? WHERE id=?").run(stamp, jobId);
+        this.db.prepare(`
+          INSERT INTO workflow_transitions(job_id, from_state, to_state, reason, actor, created_at)
+          VALUES (?, 'FAILED', 'DONE', ?, 'cli', ?)
+        `).run(jobId, 'exact merged PR recovered after lease exhaustion', stamp);
+      }
+
+      this.db.prepare(`
+        INSERT INTO runtime_state(config_file, active_job_id, last_run) VALUES (?, ?, ?)
+        ON CONFLICT(config_file) DO UPDATE SET active_job_id=excluded.active_job_id, last_run=excluded.last_run
+      `).run(path.resolve(String(row.config_file)), jobId, stamp);
+      this.db.prepare(`
+        UPDATE side_effect_journal SET status='COMPLETED', result_json=?, updated_at=?
+        WHERE idempotency_key=?
+      `).run(JSON.stringify({ outcome: 'startup-merge-reconciled', observed }), stamp, idempotencyKey);
+      return fromRow(asSqlRow<LockRow>(this.db.prepare(`
+        SELECT j.*, w.external_id FROM jobs j JOIN work_items w ON w.id=j.work_item_id WHERE j.id=?
+      `).get(jobId)));
+    });
+  }
+
+  finalizeMergedRecovery(ownerToken: string, mergeKey: string, requiredLabelKeys: string[]) {
+    return this.transaction(() => {
+      const row = asSqlRow<SqlRow>(this.db.prepare(`
+        SELECT j.id, j.state, j.workflow_state, j.stage, j.owner_token, j.work_item_id,
+          j.head_sha, j.config_file
+        FROM jobs j WHERE j.owner_token=? AND j.state IN ('CLAIMED', 'RUNNING')
+      `).get(ownerToken));
+      if (!row || row.workflow_state !== 'DONE' || row.stage !== 'merge-recovery') return false;
+      const jobId = Number(row.id);
+      if (!this.hasWorkflowCheck(jobId, 'merge', 'merged', String(row.head_sha ?? ''))) return false;
+      const merge = asSqlRow<SqlRow>(this.db.prepare(`
+        SELECT job_id, kind, status FROM side_effect_journal WHERE idempotency_key=?
+      `).get(mergeKey));
+      if (!merge || Number(merge.job_id) !== jobId || merge.kind !== 'merge' || merge.status !== 'COMPLETED') return false;
+      for (const key of requiredLabelKeys) {
+        const effect = asSqlRow<SqlRow>(this.db.prepare(`
+          SELECT job_id, kind, status FROM side_effect_journal WHERE idempotency_key=?
+        `).get(key));
+        if (!effect || Number(effect.job_id) !== jobId || effect.status !== 'COMPLETED' ||
+            !['issue-label-add', 'issue-label-remove'].includes(String(effect.kind))) return false;
+      }
+      const otherActiveJob = this.db.prepare(
+        "SELECT 1 FROM jobs WHERE id<>? AND state IN ('CLAIMED', 'RUNNING') LIMIT 1",
+      ).get(jobId);
+      if (otherActiveJob) return false;
+
+      const stamp = nowIso();
+      this.db.prepare(`
+        UPDATE jobs SET state='RELEASED', owner_token=NULL, lease_expires_at=NULL,
+          stage='merged', release_result='done', error_class=NULL, updated_at=? WHERE id=?
+      `).run(stamp, jobId);
+      this.recordTransition(jobId, String(row.state), 'RELEASED',
+        'verified merge recovery completed after journaled labels', 'merge-reconciler', stamp);
+      this.db.prepare("UPDATE work_items SET state='DONE', updated_at=? WHERE id=?")
+        .run(stamp, row.work_item_id);
+      this.db.prepare('UPDATE runtime_state SET active_job_id=NULL, last_run=? WHERE active_job_id=?')
+        .run(stamp, jobId);
+      return true;
+    });
+  }
+
+  private sideEffectValue(row: SideEffectRow) {
+    return {
+      idempotencyKey: row.idempotency_key,
+      jobId: row.job_id == null ? null : Number(row.job_id),
+      kind: row.kind,
+      intent: JSON.parse(row.intent_json),
+      status: row.status,
+      result: row.result_json == null ? null : JSON.parse(row.result_json),
+    };
+  }
+
   resumeLock(previousToken: string, lock: Lock) {
     return this.transaction(() => {
       const before = asSqlRow<IdRow>(
@@ -828,6 +1368,12 @@ export class SQLiteStore {
       }
       const state = result === 'done' ? 'DONE' : result === 'blocked' ? 'BLOCKED' : result === 'review' ? 'REVIEW' :
         result === 'needs-info' ? 'NEEDS_INFO' : 'READY';
+      if (result !== 'none') {
+        const workflow = asSqlRow<SqlRow>(this.db.prepare('SELECT workflow_state FROM jobs WHERE owner_token=?').get(current.owner_token));
+        if (workflow?.workflow_state !== state) {
+          throw new Error(`Cannot release with ${result}: workflow outcome is ${String(workflow?.workflow_state ?? 'unknown')}`);
+        }
+      }
       this.finishActiveJob(current.owner_token, 'RELEASED', `released: ${result}`, state);
       return true;
     });
@@ -900,8 +1446,8 @@ export class SQLiteStore {
       if (!eventRow) throw new Error('Could not read the persisted event');
       if (Number(inserted.changes) > 0 && item.state === 'READY') {
         const queued = asSqlRow<EventIdRow>(this.db.prepare(`
-          INSERT OR IGNORE INTO jobs(project_id, work_item_id, event_id, provider, state, attempts, created_at, updated_at)
-          VALUES (?, ?, ?, ?, 'READY', 0, ?, ?) RETURNING id
+          INSERT OR IGNORE INTO jobs(project_id, work_item_id, event_id, provider, state, workflow_state, attempts, created_at, updated_at)
+          VALUES (?, ?, ?, ?, 'READY', 'READY', 0, ?, ?) RETURNING id
         `).get(event.project, item.id, eventRow.id, event.provider, stamp, stamp));
         if (queued) this.recordTransition(Number(queued.id), null, 'READY', 'event enqueued', event.provider, stamp);
       }
@@ -952,8 +1498,8 @@ export class SQLiteStore {
       );
       if (!job) {
         job = asSqlRow<IdRow>(this.db.prepare(`
-          INSERT INTO jobs(project_id, work_item_id, provider, state, attempts, max_attempts, created_at, updated_at)
-          VALUES (?, ?, ?, 'READY', 0, ?, ?, ?) RETURNING id
+          INSERT INTO jobs(project_id, work_item_id, provider, state, workflow_state, attempts, max_attempts, created_at, updated_at)
+          VALUES (?, ?, ?, 'READY', 'READY', 0, ?, ?, ?) RETURNING id
         `).get(project, item.id, provider, options.maxAttempts ?? 3, stamp, stamp));
         if (!job) throw new Error(`Could not enqueue work item ${project}#${workItemId}`);
         this.recordTransition(Number(job.id), null, 'READY', 'work item queued', options.workerId ?? 'scheduler', stamp);
@@ -975,6 +1521,10 @@ export class SQLiteStore {
         return null;
       }
       this.recordTransition(Number(claimed.id), 'READY', 'CLAIMED', 'worker claim', claimed.claimed_by, stamp);
+      const workflow = asSqlRow<SqlRow>(this.db.prepare('SELECT workflow_state FROM jobs WHERE id=?').get(claimed.id));
+      if (workflow?.workflow_state === 'READY') {
+        this.transitionWorkflowInTransaction(Number(claimed.id), 'CLAIMED', 'cli', 'ready work item claimed');
+      }
       return claimed;
     });
   }
@@ -1003,6 +1553,13 @@ export class SQLiteStore {
       const jobState = exhausted ? 'FAILED' : 'READY';
       const itemState = exhausted ? 'BLOCKED' : 'READY';
       const stamp = new Date(now).toISOString();
+      if (exhausted) {
+        const workflow = asSqlRow<SqlRow>(this.db.prepare('SELECT workflow_state FROM jobs WHERE id=?').get(job.id));
+        if (typeof workflow?.workflow_state === 'string' && isWorkflowState(workflow.workflow_state) &&
+            !isTerminalWorkflowState(workflow.workflow_state)) {
+          this.transitionWorkflowInTransaction(Number(job.id), 'FAILED', 'cli', 'lease expired at max attempts');
+        }
+      }
       this.db.prepare('UPDATE jobs SET state=?, owner_token=NULL, lease_expires_at=NULL, error_class=?, updated_at=? WHERE id=?')
         .run(jobState, exhausted ? 'LeaseExpiredMaxAttempts' : 'LeaseExpired', stamp, job.id);
       this.db.prepare('UPDATE work_items SET state=?, updated_at=? WHERE id=?').run(itemState, stamp, job.work_item_id);
