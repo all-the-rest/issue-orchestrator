@@ -14,6 +14,11 @@ const GUARDED = new Set([
 const [command = 'help', ...rest] = process.argv.slice(2);
 
 function main(): number {
+  const opts = parseArgs(rest);
+  if (opts['no-switch']) {
+    throw new CliError('--no-switch was removed; the configured active CLI account is always verified');
+  }
+
   if (command === 'help' || command === '--help' || command === '-h') {
     console.log(HELP);
     return 0;
@@ -21,11 +26,6 @@ function main(): number {
   if (command === 'version' || command === '--version' || command === '-v') {
     console.log(VERSION);
     return 0;
-  }
-
-  const opts = parseArgs(rest);
-  if (opts['no-switch']) {
-    throw new CliError('--no-switch was removed; the configured active CLI account is always verified');
   }
 
   const handler = COMMANDS[command];
