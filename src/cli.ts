@@ -1,11 +1,8 @@
 #!/usr/bin/env node
 import { COMMANDS, HELP, CliError, parseArgs } from './core/commands.js';
-import { configPath, lockPath } from './core/config.js';
-import { withMutationGuard } from './core/guard.js';
+import { withMutationGuard } from './core/config.js';
 import { VERSION } from './version.js';
 
-// Commands that read-modify-write the queue lock or the tracker. They are
-// serialized across processes; read-only commands run unguarded.
 const GUARDED = new Set([
   'claim', 'resume-lock', 'checkpoint', 'release', 'label', 'comment',
   'change-create', 'merge', 'evidence', 'ensure-labels',
@@ -32,8 +29,7 @@ function main(): number {
   if (!handler) throw new CliError(`Unknown command "${command}"\n\n${HELP}`);
 
   const invoke = () => handler(opts) ?? 0;
-  if (!GUARDED.has(command)) return invoke();
-  return withMutationGuard(lockPath(opts.config ?? configPath()), invoke);
+  return GUARDED.has(command) ? withMutationGuard(invoke) : invoke();
 }
 
 let exitCode = 0;
