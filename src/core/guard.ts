@@ -24,6 +24,65 @@ function holderState(guardFile: string): HolderState {
   }
 }
 
+function createGuard(guardFile: string): void {
+  const fd = fs.openSync(guardFile, 'wx', 0o600);
+  try {
+    fs.writeSync(fd, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/**
+ * Replace a dead holder's guard, serialized by `<guard>.reclaim`.
+ *
+ * Without that second lock two processes can both observe the same dead pid,
+ * and the slower one can unlink the guard the faster one has just created —
+ * both then enter the critical section. Here only the owner of the reclaim
+ * lock may unlink and re-create the guard, and it does both inside the lock.
+ *
+ * The reclaim lock is deliberately never age-reclaimed: it is held for a few
+ * syscalls, and if a process dies there the error names the file so an
+ * operator can remove it after checking that no run is active.
+ *
+ * Returns true when this call replaced the guard (or created it after the
+ * holder vanished) and the caller may enter.
+ */
+function takeOverStale(guardFile: string): boolean {
+  const reclaimFile = `${guardFile}.reclaim`;
+  let reclaimFd: number;
+  try {
+    reclaimFd = fs.openSync(reclaimFile, 'wx', 0o600);
+  } catch {
+    return false; // another process is reclaiming; treat it as busy
+  }
+  try {
+    let age = 0;
+    let exists = true;
+    try {
+      age = Date.now() - fs.statSync(guardFile).mtimeMs;
+    } catch {
+      exists = false;
+    }
+    if (exists) {
+      const state = holderState(guardFile);
+      if (!(state === 'dead' || (state === 'unknown' && age > STALE_MS))) return false;
+      fs.unlinkSync(guardFile);
+    }
+    createGuard(guardFile);
+    return true;
+  } catch {
+    return false;
+  } finally {
+    fs.closeSync(reclaimFd);
+    try {
+      fs.unlinkSync(reclaimFile);
+    } catch {
+      // already gone; nothing to release
+    }
+  }
+}
+
 /**
  * Serialize mutations across processes without `flock`.
  *
@@ -37,41 +96,18 @@ export function withMutationGuard<T>(lockFile: string, fn: () => T): T {
   const guardFile = `${lockFile}.guard`;
   fs.mkdirSync(path.dirname(guardFile), { recursive: true, mode: 0o700 });
 
-  let fd: number;
   for (;;) {
     try {
-      fd = fs.openSync(guardFile, 'wx', 0o600);
+      createGuard(guardFile);
       break;
     } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code !== 'EEXIST') throw error;
-
-      let age = 0;
-      try {
-        age = Date.now() - fs.statSync(guardFile).mtimeMs;
-      } catch {
-        continue; // the holder released it between open and stat
-      }
-
-      const state = holderState(guardFile);
-      if (state === 'dead' || (state === 'unknown' && age > STALE_MS)) {
-        try {
-          fs.unlinkSync(guardFile);
-        } catch {
-          // another process won the cleanup race; loop and try again
-        }
-        continue;
-      }
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      if (takeOverStale(guardFile)) break;
       throw new Error(
-        `another queue mutation is in progress (guard ${guardFile}); retry after it finishes`,
+        `another queue mutation is in progress (${guardFile}); retry when it finishes, ` +
+        `or remove ${guardFile} and ${guardFile}.reclaim if no run is active`,
       );
     }
-  }
-
-  try {
-    fs.writeSync(fd, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
-  } finally {
-    fs.closeSync(fd);
   }
 
   try {

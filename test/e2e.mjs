@@ -345,6 +345,7 @@ write(path.join(FIX, 'manifest-api.json'), {
 runOk(['help']);
 ok('help exits 0');
 runRefused(['status', '--no-switch']);
+runRefused(['help', '--no-switch']);
 ok('removed account-switch bypass option is rejected');
 
 assert.deepEqual(parseJsonc('{ "a": 1, // note\n}'), { a: 1 });
@@ -498,6 +499,23 @@ const aged = json(runOk(['claim', 'reisi007/demo', '1']));
 assert.equal(fs.existsSync(guardFile), false, 'a stale unreadable guard must be removed after the mutation');
 runOk(['release', '--owner-token', aged.owner_token]);
 ok('mutation guard blocks a live holder, reclaims a dead holder immediately, and ages out an unreadable guard');
+
+// Two processes race to reclaim the same dead holder; only one may enter.
+write(guardFile, JSON.stringify({ pid: 2147483647, at: '2000-01-01T00:00:00.000Z' }));
+const reclaimRace = await Promise.all([
+  runAsync(['claim', 'reisi007/demo', '1'], {
+    env: { FAKE_ISSUE_VIEW_STARTED: path.join(TMP, 'race-started'), FAKE_ISSUE_VIEW_DELAY: '0.4' },
+  }),
+  runAsync(['claim', 'reisi007/demo', '2']),
+]);
+assert.equal(reclaimRace.filter((item) => item.code === 0).length, 1, 'exactly one stale-guard reclaimer may enter');
+assert.equal(reclaimRace.filter((item) => item.code !== 0).length, 1, 'the losing reclaimer must refuse');
+assert.match(reclaimRace.find((item) => item.code !== 0).err, /another queue mutation is in progress|Queue is locked/);
+const raceOwner = JSON.parse(reclaimRace.find((item) => item.code === 0).out).owner_token;
+runOk(['release', '--owner-token', raceOwner]);
+assert.equal(fs.existsSync(guardFile), false, 'the race must not leave a guard file behind');
+assert.equal(fs.existsSync(`${guardFile}.reclaim`), false, 'the race must not leave a reclaim file behind');
+ok('concurrent stale-guard reclamation admits exactly one process and leaves no lock behind');
 
 const concurrent = await Promise.all([
   runAsync(['claim', 'reisi007/demo', '1']),
