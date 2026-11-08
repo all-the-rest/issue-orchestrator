@@ -1,4 +1,42 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { databasePath } from '../core/persistence.js';
+
+function trustedEmptyHooksDirectory() {
+  const runtimeDirectory = path.dirname(databasePath());
+  fs.mkdirSync(runtimeDirectory, { recursive: true, mode: 0o700 });
+  let runtimeStat = fs.lstatSync(runtimeDirectory);
+  if (!runtimeStat.isDirectory() || runtimeStat.isSymbolicLink() ||
+      (typeof process.getuid === 'function' && runtimeStat.uid !== process.getuid())) {
+    throw new Error('Git safety directory must be an owned, real runtime directory');
+  }
+  fs.chmodSync(runtimeDirectory, 0o700);
+  runtimeStat = fs.lstatSync(runtimeDirectory);
+  if (!runtimeStat.isDirectory() || runtimeStat.isSymbolicLink() ||
+      (process.platform !== 'win32' && (runtimeStat.mode & 0o077) !== 0)) {
+    throw new Error('Git safety runtime directory is not private');
+  }
+
+  const hooksDirectory = path.join(fs.realpathSync(runtimeDirectory), 'empty-git-hooks');
+  fs.mkdirSync(hooksDirectory, { recursive: true, mode: 0o700 });
+  const hooksStat = fs.lstatSync(hooksDirectory);
+  if (!hooksStat.isDirectory() || hooksStat.isSymbolicLink() ||
+      (typeof process.getuid === 'function' && hooksStat.uid !== process.getuid())) {
+    throw new Error('Git hooks override must be an owned, real directory');
+  }
+  fs.chmodSync(hooksDirectory, 0o700);
+  const privateHooksStat = fs.lstatSync(hooksDirectory);
+  if (!privateHooksStat.isDirectory() || privateHooksStat.isSymbolicLink() ||
+      (typeof process.getuid === 'function' && privateHooksStat.uid !== process.getuid()) ||
+      (process.platform !== 'win32' && (privateHooksStat.mode & 0o077) !== 0)) {
+    throw new Error('Git hooks override directory is not private');
+  }
+  if (fs.readdirSync(hooksDirectory).length !== 0) {
+    throw new Error('Git hooks override directory must remain empty');
+  }
+  return fs.realpathSync(hooksDirectory);
+}
 
 export function git(
   args: string[],
@@ -9,10 +47,23 @@ export function git(
     allowExitCodes?: number[];
   } = {},
 ) {
-  const result = spawnSync('git', args, {
+  if (args.some((argument) => /^-c(?:$|.+)|^--config-env(?:=|$)/.test(argument))) {
+    throw new Error('git helper does not permit caller-supplied command-scope configuration');
+  }
+  const safeEnvironment = env ? { ...process.env, ...env } : { ...process.env };
+  // These environment config channels have command-scope precedence and could
+  // otherwise override the trusted hook and fsmonitor settings below.
+  for (const key of Object.keys(safeEnvironment)) {
+    if (/^GIT_CONFIG_(?:COUNT|PARAMETERS|KEY_\d+|VALUE_\d+)$/i.test(key)) delete safeEnvironment[key];
+  }
+  const result = spawnSync('git', [
+    '-c', `core.hooksPath=${trustedEmptyHooksDirectory()}`,
+    '-c', 'core.fsmonitor=false',
+    ...args,
+  ], {
     cwd,
     input,
-    env: env ? { ...process.env, ...env } : process.env,
+    env: safeEnvironment,
     encoding: 'utf8',
   });
   if (result.error) throw result.error;

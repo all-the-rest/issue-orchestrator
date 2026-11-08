@@ -8,14 +8,17 @@ work: triage, implementation, verification and review.
 OpenCode is the first intended agent backend, not a dependency of the core.
 
 > **Status:** early `v0.1`. The deterministic core has been extracted from the
-> `git-issue-agent` skill. SQLite persistence is in place; the `run` loop and
-> agent runner land in follow-up issues of milestone `v0.1`.
+> `git-issue-agent` skill. SQLite persistence and the replaceable OpenCode
+> `AgentRunner` adapter are in place; the full orchestration `run` loop remains
+> a follow-up. Builder commands run only through the disposable OCI sandbox and
+> fail closed unless the fixed Node 24/pnpm image is already present locally.
 
 ## Requirements
 
 - Node.js 24 or newer
 - pnpm 11 (`packageManager` is pinned in `package.json`)
 - `git`
+- Docker or Podman with `issue-orchestrator-builder:node24-pnpm11.23.0` preloaded for builder sessions
 - the provider CLI you configure: `gh` for GitHub (GitLab and Jira adapters are fail-closed stubs)
 
 ## Development

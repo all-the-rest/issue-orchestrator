@@ -100,7 +100,13 @@ try {
     assert.ok(columns('jobs').has(column), `jobs should store ${column}`);
   }
   assert.ok(columns('jobs').has('workflow_state'), 'jobs should store guarded workflow progress');
-  for (const column of ['session_id', 'branch', 'base_sha', 'head_sha', 'change_number', 'evidence_commit', 'error_class']) {
+  for (const column of [
+    'session_id', 'external_session_id', 'role', 'model', 'worktree', 'status', 'started_at', 'ended_at',
+     'input_tokens', 'output_tokens', 'reasoning_tokens', 'cache_read_tokens', 'cache_write_tokens',
+     'cost_usd', 'result_json', 'ndjson_path', 'stderr_path', 'branch', 'base_sha', 'head_sha',
+    'change_number', 'evidence_commit', 'error_class', 'execution_owner', 'execution_lease_until',
+    'execution_pid', 'execution_pgid', 'execution_start_ticks', 'execution_token',
+  ]) {
     assert.ok(columns('agent_sessions').has(column), `agent_sessions should store ${column}`);
   }
   for (const column of ['from_state', 'to_state', 'reason', 'actor', 'created_at']) {
@@ -109,10 +115,10 @@ try {
   assert.equal(Number(store.rows('PRAGMA foreign_keys')[0].foreign_keys), 1);
   assert.equal(store.rows('PRAGMA journal_mode')[0].journal_mode, 'wal');
   assert.equal(Number(store.rows('PRAGMA busy_timeout')[0].timeout), 5000);
-  assert.equal(store.rows('SELECT version FROM schema_migrations').length, 2);
+  assert.equal(store.rows('SELECT version FROM schema_migrations').length, 4);
   store.close();
   store = new SQLiteStore(migrationFile);
-  assert.equal(store.rows('SELECT version FROM schema_migrations').length, 2, 'reopening must not reapply migrations');
+  assert.equal(store.rows('SELECT version FROM schema_migrations').length, 4, 'reopening must not reapply migrations');
   store.close();
   ok('empty database receives all schema migrations with WAL/foreign keys, and restart is idempotent');
 
@@ -120,11 +126,41 @@ try {
   store = new SQLiteStore(upgradeFile);
   const upgradeJob = store.claimWorkItem('example/project', 299, { workerId: 'v1-upgrade' });
   store.db.prepare("UPDATE jobs SET stage='evidence-published' WHERE id=?").run(upgradeJob.id);
-  store.db.exec('DROP TABLE side_effect_journal; DROP TABLE workflow_transitions; ALTER TABLE jobs DROP COLUMN workflow_state; DELETE FROM schema_migrations WHERE version=2');
+  store.db.exec(`
+    DROP TABLE side_effect_journal;
+    DROP TABLE workflow_transitions;
+    ALTER TABLE jobs DROP COLUMN workflow_state;
+    DROP INDEX agent_sessions_external_id;
+    DROP INDEX agent_sessions_job_role;
+    ALTER TABLE agent_sessions DROP COLUMN external_session_id;
+    ALTER TABLE agent_sessions DROP COLUMN role;
+    ALTER TABLE agent_sessions DROP COLUMN model;
+    ALTER TABLE agent_sessions DROP COLUMN worktree;
+    ALTER TABLE agent_sessions DROP COLUMN status;
+    ALTER TABLE agent_sessions DROP COLUMN started_at;
+    ALTER TABLE agent_sessions DROP COLUMN ended_at;
+    ALTER TABLE agent_sessions DROP COLUMN input_tokens;
+    ALTER TABLE agent_sessions DROP COLUMN output_tokens;
+    ALTER TABLE agent_sessions DROP COLUMN reasoning_tokens;
+    ALTER TABLE agent_sessions DROP COLUMN cache_read_tokens;
+    ALTER TABLE agent_sessions DROP COLUMN cache_write_tokens;
+    ALTER TABLE agent_sessions DROP COLUMN cost_usd;
+    ALTER TABLE agent_sessions DROP COLUMN result_json;
+    ALTER TABLE agent_sessions DROP COLUMN ndjson_path;
+    ALTER TABLE agent_sessions DROP COLUMN stderr_path;
+    DROP INDEX agent_sessions_execution_owner;
+    ALTER TABLE agent_sessions DROP COLUMN execution_owner;
+    ALTER TABLE agent_sessions DROP COLUMN execution_lease_until;
+    ALTER TABLE agent_sessions DROP COLUMN execution_pid;
+    ALTER TABLE agent_sessions DROP COLUMN execution_pgid;
+    ALTER TABLE agent_sessions DROP COLUMN execution_start_ticks;
+    ALTER TABLE agent_sessions DROP COLUMN execution_token;
+    DELETE FROM schema_migrations WHERE version IN (2, 3, 4);
+  `);
   store.close();
   store = new SQLiteStore(upgradeFile);
   assert.equal(store.rows('SELECT workflow_state FROM jobs WHERE id=?', upgradeJob.id)[0].workflow_state, 'EVIDENCE_PUBLISHED');
-  assert.equal(store.rows('SELECT MAX(version) AS version FROM schema_migrations')[0].version, 2);
+  assert.equal(store.rows('SELECT MAX(version) AS version FROM schema_migrations')[0].version, 4);
   store.close();
   ok('v1 jobs retain their workflow meaning when the additive migration is applied');
 
@@ -132,11 +168,11 @@ try {
   fs.mkdirSync(path.dirname(futureSchema), { recursive: true });
   const futureDb = new DatabaseSync(futureSchema);
   futureDb.exec('CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)');
-  futureDb.prepare('INSERT INTO schema_migrations(version, applied_at) VALUES (3, ?)').run(new Date().toISOString());
+  futureDb.prepare('INSERT INTO schema_migrations(version, applied_at) VALUES (5, ?)').run(new Date().toISOString());
   futureDb.close();
   assert.throws(() => new SQLiteStore(futureSchema), /newer than supported version/);
   const stillFutureDb = new DatabaseSync(futureSchema);
-  assert.equal(Number(stillFutureDb.prepare('SELECT MAX(version) AS version FROM schema_migrations').get().version), 3);
+  assert.equal(Number(stillFutureDb.prepare('SELECT MAX(version) AS version FROM schema_migrations').get().version), 5);
   stillFutureDb.close();
   ok('a database with a newer schema version is rejected without being downgraded');
 

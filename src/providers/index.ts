@@ -1,6 +1,8 @@
 import { githubTracker } from './github-tracker.js';
 import { githubCodeHost } from './github-codehost.js';
-import { agentRunnerStub, codeHostStub, trackerStub } from './stubs.js';
+import { OpenCodeAgentRunner } from './opencode-runner.js';
+import { getRuntimeStore } from '../core/persistence.js';
+import { codeHostStub, trackerStub } from './stubs.js';
 import type { AgentRunner, CodeHost, Tracker } from './ports.js';
 
 const trackers: Record<string, Tracker> = {
@@ -14,7 +16,7 @@ const codeHosts: Record<string, CodeHost> = {
   jira: codeHostStub('jira'),
 };
 const agentRunners: Record<string, AgentRunner> = {
-  opencode: agentRunnerStub('opencode'),
+  opencode: new OpenCodeAgentRunner({ storeProvider: getRuntimeStore }),
 };
 
 export const providerCapabilities = Object.freeze({
@@ -44,4 +46,17 @@ export function getAgentRunner(name = 'opencode') {
 }
 
 export { UnsupportedCapabilityError } from './ports.js';
-export type { AgentRunner, CapabilityDescriptor, CodeHost, Tracker } from './ports.js';
+export { AgentResultContractError, AgentRunnerError, OpenCodeAgentRunner, validateAgentResult } from './opencode-runner.js';
+export type {
+  AgentResult,
+  AgentResultStatus,
+  AgentRole,
+  AgentRunner,
+  AgentSession,
+  AgentSessionStatus,
+  CapabilityDescriptor,
+  CodeHost,
+  CreateAgentSessionArgs,
+  RunAgentSessionArgs,
+  Tracker,
+} from './ports.js';
