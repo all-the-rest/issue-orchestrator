@@ -32,6 +32,7 @@ async function main(): Promise<number> {
   // run --dry-run is deliberately outside the guard and does not reconcile or
   // open SQLite. The dod command stays guarded for its complete execution.
   if (command === 'run' && opts['dry-run']) return await handler(opts) ?? 0;
+  if (command === 'doctor' || command === 'jobs') return await handler(opts) ?? 0;
   if (GUARDED.has(command)) {
     return await withMutationGuard(async () => {
       opts.reconciliation = reconcilePendingSideEffects(opts);
