@@ -120,7 +120,7 @@ export interface CodeHost {
   };
   merge(args: { project: string; number: number; method?: MergeMethod; headSha: string }): { method: MergeMethod };
   evidenceUrl(args: { project: string; ref: string; path: string }): string;
-  verifyEvidence(args: { project: string; commit: string; issue: number; change: number; head: string; evidenceClass: string }): {
+  verifyEvidence(args: { project: string; codeHostProject?: string; commit: string; issue: number; change: number; head: string; evidenceClass: string }): {
     commit: string;
     manifest: Record<string, unknown>;
     files: number;

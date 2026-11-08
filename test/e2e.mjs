@@ -16,7 +16,7 @@ import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { SQLiteStore } from '../dist/core/persistence.js';
-import { parseJsonc } from '../dist/core/config.js';
+import { parseJsonc, repoConfig } from '../dist/core/config.js';
 import { getAgentRunner, getCodeHost, getTracker, UnsupportedCapabilityError } from '../dist/providers/index.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -293,6 +293,8 @@ case "$1 $2" in
     ;;
   "api repos/reisi007/demo/git/trees/"*) cat "$FAKE_DIR/tree.json" ;;
   "api repos/reisi007/demo/contents/manifest.json?ref="*) cat "$FAKE_DIR/manifest-api.json" ;;
+  "api repos/reisi007/demo/contents/issue-1-before-run.log?ref="*) node -e 'process.stdout.write(JSON.stringify({sha:"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",encoding:"base64",content:Buffer.from("before bytes").toString("base64")}))' ;;
+  "api repos/reisi007/demo/contents/issue-1-after-run.log?ref="*) node -e 'process.stdout.write(JSON.stringify({sha:"cccccccccccccccccccccccccccccccccccccccc",encoding:"base64",content:Buffer.from("after bytes").toString("base64")}))' ;;
   "issue list") cat "$FAKE_DIR/issues.json" ;;
   "issue view")
     if [ "\${FAKE_ISSUE_OFFLINE_AFTER_LABEL_FAIL:-0}" = "1" ] && [ -e "$FAKE_DIR/failed-label-once" ]; then
@@ -550,8 +552,8 @@ const manifest = {
   evidence_class: DOD_CONFIG.evidence_class,
   dod_report: dodReport(),
   files: [
-    { source: 'before/run.log', name: 'issue-1-before-run.log', sha: beforeBlobSha, bytes: 12, kind: 'log' },
-    { source: 'after/run.log', name: 'issue-1-after-run.log', sha: afterBlobSha, bytes: 11, kind: 'log' },
+    { source: 'before/run.log', name: 'issue-1-before-run.log', sha: beforeBlobSha, sha256: createHash('sha256').update('before bytes').digest('hex'), bytes: 12, kind: 'log' },
+    { source: 'after/run.log', name: 'issue-1-after-run.log', sha: afterBlobSha, sha256: createHash('sha256').update('after bytes').digest('hex'), bytes: 11, kind: 'log' },
   ],
 };
 write(path.join(FIX, 'tree.json'), {
@@ -642,13 +644,14 @@ assert.throws(() => getTracker('github').updateWorkItem({
 const pairedConfig = path.join(TMP, 'jira-github-config.jsonc');
 write(pairedConfig, fs.readFileSync(CONFIG, 'utf8').replace(
   DEMO_REPO_CONFIG,
-  `"reisi007/demo": { "account": "reisi007", "enabled": true, "local_only": true, "tracker": "jira", "code_host": "github", "dod": ${JSON.stringify(DOD_CONFIG)} }`,
+  `"reisi007/demo": { "account": "reisi007", "enabled": true, "local_only": true, "tracker": "jira", "code_host": "github", "code_host_project": "acme/evidence", "dod": ${JSON.stringify(DOD_CONFIG)} }`,
 ));
 const pairedStatus = json(runOk(['status'], { env: { ISSUE_ORCHESTRATOR_CONFIG: pairedConfig } }));
 const pairedProject = pairedStatus.projects.find((project) => project.project === 'reisi007/demo');
 assert.equal(pairedProject.tracker, 'jira');
 assert.equal(pairedProject.code_host, 'github');
 assert.equal(pairedProject.provider, 'jira+github');
+assert.equal(repoConfig(parseJsonc(fs.readFileSync(pairedConfig, 'utf8')), 'reisi007/demo').code_host_project, 'acme/evidence');
 const globalPairConfig = path.join(TMP, 'global-jira-github-config.jsonc');
 write(globalPairConfig, fs.readFileSync(CONFIG, 'utf8').replace(
   '"provider": "github",', '"tracker": "jira",\n  "code_host": "github",',
@@ -1042,6 +1045,19 @@ const wrongEvidenceClass = runRefused(mergeArgs);
 assert.match(wrongEvidenceClass.err, /evidence manifest does not match/);
 write(reportlessManifestApi, savedManifestApi);
 ok('merge refuses evidence manifests whose evidence class differs from project configuration');
+
+const evidenceTreeFile = path.join(FIX, 'tree.json');
+const savedEvidenceTree = fs.readFileSync(evidenceTreeFile, 'utf8');
+const evidenceTreeWithExtraBlob = JSON.parse(savedEvidenceTree);
+evidenceTreeWithExtraBlob.tree.push({
+  path: 'unlisted-secret.txt', type: 'blob', mode: '100644',
+  sha: 'dddddddddddddddddddddddddddddddddddddddd', size: 20,
+});
+write(evidenceTreeFile, evidenceTreeWithExtraBlob);
+const extraEvidenceBlob = runRefused(mergeArgs);
+assert.match(extraEvidenceBlob.err, /unexpected or unsupported tree entries/);
+write(evidenceTreeFile, JSON.parse(savedEvidenceTree));
+ok('merge refuses unlisted blobs in the immutable evidence commit');
 
 const missingNamedCheck = runRefused(mergeArgs, {
   env: { FAKE_CHECKS_JSON: '[{"bucket":"pass","name":"Other"}]' },
@@ -1807,7 +1823,7 @@ assert.ok(proofBody.includes(published.commit));
 assert.match(proofBody, /\[\#9\]\(https:\/\/example\.test\/pull\/9\)/);
 assert.match(proofBody, /\["node","-e","process.exit\(0\)"\]/);
 assert.match(proofBody, /exit 0/);
-assert.ok(proofBody.includes(`/${published.commit}/issue-7-before-run.log`));
+assert.ok(proofBody.includes('Manual review required'));
 const proofWrites = (fs.readFileSync(GH_LOG, 'utf8').match(/issue comment 7/g) ?? []).length;
 runOk(['evidence', 'reisi007/demo', '7', '--dir', EVIDENCE, '--owner-token', evidenceLock.owner_token], {
   cwd: WORK, env: evidenceEnv,

@@ -57,6 +57,10 @@ legacy `provider` value fills either port that has no repository-level explicit
 selection. The legacy `account` remains the fallback for both `tracker_account` and
 `code_host_account`; those fields may be set independently when needed. Provider
 credentials stay in the provider CLI/credential store, never in config.
+For a Jira tracker project paired with a GitHub code host, set
+`repos.<jira-project>.code_host_project` to the GitHub `owner/repository`; issue
+tracking remains keyed by the Jira project while evidence branches and immutable
+raw links are written to that configured GitHub repository.
 
 Every project must provide `dod.commands.build`, `test`, `lint`, `typecheck`,
 and `security`. Each is either a nonempty argv array or explicit `null` to skip;
@@ -77,7 +81,8 @@ DoD-config digest. Triage acceptance must come from exactly one comment bearing
 contents are data, not agent instructions.
 
 Evidence manifest schema 2 records the configured evidence class and successful
-DoD report in addition to project/issue/change/head and artifact hashes. Older
+DoD report in addition to project/issue/change/head and Git blob SHA plus SHA-256
+artifact hashes; SHA-256 is rechecked against fetched artifact contents. Older
 schema-1 evidence is deliberately rejected for publication recovery and merge;
 an existing schema-1 intent is not silently adopted and needs explicit recovery.
 After publication the issue gets

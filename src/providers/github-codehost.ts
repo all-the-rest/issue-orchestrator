@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { gh, ghJson, verifyGithubAccount } from './gh.js';
 import { verifyOrigin } from '../git/index.js';
 import {
@@ -42,6 +43,7 @@ interface GithubContentsResponse {
 interface EvidenceFile {
   name: string;
   sha: string;
+  sha256: string;
   bytes: number;
   source?: string;
 }
@@ -161,13 +163,13 @@ export const githubCodeHost: CodeHost = {
     gh(['pr', 'comment', String(number), '--repo', project, '--body', body]);
     return { skipped: false };
   },
-  verifyEvidence({ project, commit, issue, change, head, evidenceClass }) {
+  verifyEvidence({ project, codeHostProject = project, commit, issue, change, head, evidenceClass }) {
     if (!/^[a-f0-9]{40}$/i.test(commit ?? '')) throw new Error('evidence commit must be a full SHA');
-    const tree = ghJson<GithubTreeResponse>(['api', `repos/${project}/git/trees/${commit}?recursive=1`]);
+    const tree = ghJson<GithubTreeResponse>(['api', `repos/${codeHostProject}/git/trees/${commit}?recursive=1`]);
     if (tree.truncated || !Array.isArray(tree.tree)) throw new Error('evidence tree is unavailable or truncated');
     const manifestEntry = tree.tree.find((entry) => entry.path === 'manifest.json' && entry.type === 'blob');
     if (!manifestEntry || manifestEntry.mode !== '100644') throw new Error('evidence commit has no regular manifest.json blob');
-    const contents = ghJson<GithubContentsResponse>(['api', `repos/${project}/contents/manifest.json?ref=${commit}`]);
+    const contents = ghJson<GithubContentsResponse>(['api', `repos/${codeHostProject}/contents/manifest.json?ref=${commit}`]);
     if (contents.encoding !== 'base64' || typeof contents.content !== 'string') {
       throw new Error('evidence manifest is not available as a GitHub blob');
     }
@@ -184,13 +186,39 @@ export const githubCodeHost: CodeHost = {
     }
     if (!Array.isArray(manifest.files) || manifest.files.length === 0) throw new Error('evidence manifest has no artifacts');
     const byPath = new Map<string, GithubTreeEntry>(tree.tree.map((entry) => [entry.path, entry]));
+    const expectedPaths = new Set(['manifest.json', ...manifest.files.map((file) => file.name)]);
+    if (tree.tree.length !== expectedPaths.size || tree.tree.some((entry) =>
+      entry.type !== 'blob' || entry.mode !== '100644' || !expectedPaths.has(entry.path))) {
+      throw new Error('evidence commit contains unexpected or unsupported tree entries');
+    }
     const sides = new Set<string>();
+    const names = new Set<string>();
+    let totalBytes = 0;
     for (const file of manifest.files) {
+      const parts = typeof file.source === 'string' ? file.source.split('/') : [];
+      const safeName = typeof file.source === 'string'
+        ? `issue-${issue}-${file.source.replace(/[^A-Za-z0-9._/-]+/g, '-').replaceAll('/', '-')}`
+        : '';
+      if (parts.length < 2 || !['before', 'after'].includes(parts[0]) ||
+          parts.some((part) => !part || part === '.' || part === '..' || part.startsWith('.')) ||
+          file.name !== safeName || names.has(file.name) || file.bytes > 50 * 1024 * 1024) {
+        throw new Error(`evidence manifest contains an unsafe or oversized artifact path: ${file.name}`);
+      }
+      names.add(file.name);
+      totalBytes += file.bytes;
+      if (totalBytes > 100 * 1024 * 1024) throw new Error('evidence manifest exceeds the 100 MB total cap');
       const entry = byPath.get(file.name);
       if (!entry || entry.type !== 'blob' || entry.mode !== '100644' || entry.sha !== file.sha ||
           !Number.isSafeInteger(file.bytes) || file.bytes <= 0 || entry.size !== file.bytes ||
-          !/^[a-f0-9]{40}$/i.test(file.sha ?? '')) {
+          !/^[a-f0-9]{40}$/i.test(file.sha ?? '') || !/^[a-f0-9]{64}$/i.test(file.sha256 ?? '')) {
         throw new Error(`evidence artifact is missing or does not match its manifest: ${file.name}`);
+      }
+      const artifact = ghJson<GithubContentsResponse>([
+        'api', `repos/${codeHostProject}/contents/${file.name.split('/').map(encodeURIComponent).join('/')}?ref=${commit}`,
+      ]);
+      if (artifact.sha !== file.sha || artifact.encoding !== 'base64' || typeof artifact.content !== 'string' ||
+          createHash('sha256').update(Buffer.from(artifact.content, 'base64')).digest('hex') !== file.sha256) {
+        throw new Error(`evidence artifact SHA-256 does not match its contents: ${file.name}`);
       }
       if (typeof file.source === 'string') sides.add(file.source.split('/')[0]);
     }

@@ -310,6 +310,15 @@ else if (args[0] === 'api' && args[1].includes('/contents/manifest.json?ref=')) 
   const sha = git(['rev-parse', commit + ':manifest.json']);
   process.stdout.write(JSON.stringify({ sha, encoding: 'base64', content: Buffer.from(content).toString('base64') }) + String.fromCharCode(10));
 }
+else if (args[0] === 'api' && args[1].includes('/contents/') && args[1].includes('?ref=')) {
+  const [, rest] = args[1].split('/contents/');
+  const [encodedPath, commitPart] = rest.split('?ref=');
+  const artifactPath = encodedPath.split('/').map(decodeURIComponent).join('/');
+  const sha = git(['rev-parse', commitPart + ':' + artifactPath]);
+  const blob = spawnSync(process.env.FAKE_REAL_GIT, ['--git-dir', process.env.FAKE_REMOTE, 'cat-file', 'blob', sha]);
+  if (blob.status !== 0) throw new Error('fake remote artifact lookup failed');
+  process.stdout.write(JSON.stringify({ sha, encoding: 'base64', content: blob.stdout.toString('base64') }) + String.fromCharCode(10));
+}
 else { process.stderr.write('unsupported fake gh call: ' + args.join(' ') + String.fromCharCode(10)); process.exit(2); }
 `;
 write(path.join(BIN, 'gh'), ghSource);

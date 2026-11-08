@@ -186,6 +186,10 @@ function validateConfig(cfg, file) {
         throw new Error(`${file}: unsupported provider "${provider}" for "${project}"`);
       }
     }
+    if (repo.code_host_project !== undefined && (typeof repo.code_host_project !== 'string' ||
+        !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo.code_host_project))) {
+      throw new Error(`${file}: repos.${project}.code_host_project must be an owner/repository id`);
+    }
     for (const accountField of ['account', 'tracker_account', 'code_host_account']) {
       if (repo[accountField] !== undefined && (typeof repo[accountField] !== 'string' || !repo[accountField])) {
         throw new Error(`${file}: repos.${project}.${accountField} must be a non-empty account name`);
@@ -280,6 +284,7 @@ export function repoConfig(cfg, project) {
     provider: tracker === codeHost ? tracker : `${tracker}+${codeHost}`,
     tracker,
     code_host: codeHost,
+    code_host_project: own.code_host_project ?? project,
     account,
     tracker_account: own.tracker_account ?? account,
     code_host_account: own.code_host_account ?? account,
