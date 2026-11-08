@@ -1071,7 +1071,19 @@ setInterval(() => {}, 1000);
     assert.ok(!run.args.some((arg) => /docker\.sock|\.ssh|\.config\/issue-orchestrator|\.local\/share\/opencode/i.test(arg)));
     assert.ok(run.args.includes('--env=HOME=/tmp/home'));
     assert.ok(run.args.includes(`--user=${process.getuid()}:${process.getgid()}`), 'bind mounts use the exact host UID/GID');
-    assert.ok(!mounts.some((mount) => mount.includes(os.homedir()) || mount.includes(path.join(TMP, 'trusted-opencode-data'))));
+    // CI keeps the checkout, pnpm store and fixture under the runner's HOME, so
+    // mounted paths may legitimately live below it. Forbid the sensitive roots
+    // themselves, never a path merely because HOME is one of its ancestors.
+    const mountSources = mounts.map((mount) => /^--mount=[^,]*,source=([^,]+)/.exec(mount)?.[1]).filter(Boolean);
+    const forbiddenSources = [
+      path.parse(os.homedir()).root, os.homedir(),
+      path.join(os.homedir(), '.ssh'),
+      path.join(os.homedir(), '.config', 'issue-orchestrator'),
+      path.join(os.homedir(), '.local', 'share', 'opencode'),
+      path.join(TMP, 'trusted-opencode-data'),
+    ];
+    assert.ok(!mountSources.some((source) => forbiddenSources.includes(source)),
+      'no mount may expose the filesystem root, host credential directories, or the trusted OpenCode data directory');
     assert.ok(!run.args.some((arg) => /(?:GITHUB_TOKEN|AWS_SECRET|SSH_AUTH_SOCK|DOCKER_HOST|OPENCODE_CONFIG)=/i.test(arg)));
     assert.deepEqual(run.args.filter((arg) => arg.startsWith('--env=')), [
       '--env=HOME=/tmp/home', '--env=TMPDIR=/tmp',
