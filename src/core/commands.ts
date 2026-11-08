@@ -44,6 +44,7 @@ import { runJournaledSideEffect, sideEffectKey, type SideEffectObservation } fro
 import { getAgentRunner, type AgentRole } from '../providers/index.js';
 import type { WorkflowState } from './state-machine.js';
 import { cleanupOciCommandSandbox, prepareOciCommandSandbox, runOciCommand } from '../providers/oci-sandbox.js';
+import { probeExecutable, probeGithubIdentity, probeGitlabIdentity } from '../providers/doctor.js';
 
 const CHECKPOINTS = new Set([
   'claimed', 'triaged', 'isolated', 'before-evidence', 'implemented',
@@ -59,12 +60,15 @@ const SEVERITY = {
   'severity:low': 3,
   'severity:info': 4,
 };
+const JOB_STATES = ['READY', 'CLAIMED', 'RUNNING', 'FAILED', 'BLOCKED', 'DONE', 'RELEASED', 'ABANDONED', 'CANCELLED', 'STALE'];
 
 const HELP = `Usage: issue-orchestrator <command> [args] [--config <path>]
 
   run --once [--project <owner/repo>] [--dry-run]
                                   run one trusted issue through review and release
-  status                          config, model, lock and recovery (may update tracker)
+  doctor [--json]                 read-only local dependency/config diagnostics
+  jobs list|show [id] [--json]     inspect persisted jobs without ownership secrets
+  status [--json]                 config, queue, lease and recovery status (may update tracker)
   list [--project <p>] [--all-authors] [--limit <n>]
                                   open issues in queue order
   view <project> <issue>          issue body + comments, trusted flagged
@@ -797,8 +801,17 @@ function cmdStatus(opts) {
     status: effect.status,
     reason: effect.status === 'UNCERTAIN' ? effect.result?.reason ?? 'external state is uncertain' : undefined,
   }));
+  const queueCounts = getRuntimeStore().rows('SELECT state,COUNT(*) AS count FROM jobs GROUP BY state');
+  const counts = Object.fromEntries(JOB_STATES.map((state) => [state, 0]));
+  for (const row of queueCounts) counts[String(row.state)] = Number(row.count);
+  const activeLeases = getRuntimeStore().rows("SELECT id,project_id,state,lease_expires_at FROM jobs WHERE state IN ('CLAIMED','RUNNING') ORDER BY id")
+    .map((lease) => ({ ...lease, expired: typeof lease.lease_expires_at === 'string' && Date.parse(lease.lease_expires_at) <= Date.now() }));
   console.log(JSON.stringify({
     config: cfg.__file,
+    database_path: databasePath(),
+    queue_counts: counts,
+    active_leases: activeLeases,
+    next_run: null,
     provider: cfg.provider ?? 'github',
     tracker: cfg.tracker ?? cfg.defaults?.tracker ?? cfg.provider ?? 'github',
     code_host: cfg.code_host ?? cfg.defaults?.code_host ?? cfg.provider ?? 'github',
@@ -813,6 +826,75 @@ function cmdStatus(opts) {
     pending_side_effects: pendingSideEffects,
   }, null, 2));
   return 0;
+}
+
+function cmdJobs(opts) {
+  const [action, idArg] = opts._;
+  if (!['list', 'show'].includes(action) || (action === 'show' && !idArg)) {
+    throw new CliError('usage: jobs list|show [id]');
+  }
+  const store = getRuntimeStore({ importLegacy: false });
+  const fields = 'j.id,j.project_id,w.external_id,w.title,w.url,j.state,j.workflow_state,j.attempts,j.max_attempts,j.branch,j.change_number,j.change_number AS pull_request,j.head_sha,j.evidence_commit,j.error_class AS last_error,j.error_class,j.updated_at';
+  const rows = action === 'show'
+    ? store.rows(`SELECT ${fields} FROM jobs j JOIN work_items w ON w.id=j.work_item_id WHERE j.id=?`, Number(idArg))
+    : store.rows(`SELECT ${fields} FROM jobs j JOIN work_items w ON w.id=j.work_item_id ORDER BY j.updated_at DESC LIMIT 100`);
+  if (action === 'show' && !rows.length) throw new CliError(`Job ${idArg} not found`);
+  const jobs = rows.map((job) => ({ ...job, evidence: store.rows('SELECT kind,sha256,commit_sha,created_at FROM artifacts WHERE job_id=? ORDER BY id', Number(job.id)) }));
+  console.log(JSON.stringify(action === 'show' ? jobs[0] : jobs, null, 2));
+  return 0;
+}
+
+function cmdDoctor(opts) {
+  const cfg = requireConfig(opts);
+  const checks = [];
+  const repoConfigs = Object.keys(cfg.repos).map((project) => repoConfig(cfg, project));
+  const githubAccounts = [...new Set(repoConfigs.flatMap((rc) => [
+    ...(rc.tracker === 'github' && rc.tracker_account ? [rc.tracker_account] : []),
+    ...(rc.code_host === 'github' && rc.code_host_account ? [rc.code_host_account] : []),
+  ]))];
+  const gitlabAccounts = [...new Set(repoConfigs.flatMap((rc) => [
+    ...(rc.tracker === 'gitlab' && rc.tracker_account ? [rc.tracker_account] : []),
+    ...(rc.code_host === 'gitlab' && rc.code_host_account ? [rc.code_host_account] : []),
+  ]))];
+  if (githubAccounts.length) checks.push(probeGithubIdentity(githubAccounts));
+  if (gitlabAccounts.length) checks.push(probeGitlabIdentity(gitlabAccounts));
+  checks.push(probeExecutable('opencode', ['--version']));
+  checks.push(probeExecutable('git', ['--version']));
+  const model = cfg.model;
+  const modelFile = process.env.OPENCODE_CONFIG || path.join(os.homedir(), '.config', 'opencode', 'opencode.jsonc');
+  let available = false;
+  if (fs.existsSync(modelFile)) {
+    try {
+      const op = parseJsonc(fs.readFileSync(modelFile, 'utf8'), modelFile);
+      available = typeof model === 'string' && model.length > 0 &&
+        [op.agents?.general?.model, op.agents?.explore?.model, op.model].includes(model);
+    } catch { /* report unavailable without exposing config contents */ }
+  }
+  checks.push({ name: 'model', status: available ? 'ok' : 'failed', message: available ? `${model} configured in OpenCode` : `Configured model ${model} is not selected in OpenCode config.` });
+  let disk;
+  try {
+    const directory = path.dirname(databasePath());
+    fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const free = fs.statfsSync(directory);
+    const availableBytes = Number(free.bavail) * Number(free.bsize);
+    const enoughSpace = availableBytes > 100 * 1024 * 1024;
+    disk = {
+      name: 'disk', status: enoughSpace ? 'ok' : 'failed', available_bytes: availableBytes,
+      message: enoughSpace ? 'sufficient free space' : 'Less than 100 MiB is available in the runtime directory.',
+    };
+  } catch {
+    disk = { name: 'disk', status: 'failed', message: 'Cannot inspect free space for the runtime directory.' };
+  }
+  checks.push(disk);
+  try {
+    getRuntimeStore({ importLegacy: false }).counts();
+    checks.push({ name: 'sqlite', status: 'ok', path: databasePath(), message: 'database opened successfully' });
+  } catch {
+    checks.push({ name: 'sqlite', status: 'failed', path: databasePath(), message: 'Cannot open or migrate the runtime database.' });
+  }
+  if (opts.json) console.log(JSON.stringify({ schema_version: 1, checks }, null, 2));
+  else for (const check of checks) console.log(`${check.status === 'ok' ? 'OK' : 'FAIL'} ${check.name}: ${check.message ?? check.available_bytes ?? check.path}`);
+  return checks.every((check) => check.status === 'ok') ? 0 : 1;
 }
 
 function cmdList(opts) {
@@ -3087,6 +3169,8 @@ function setModel(opts, model) {
 }
 
 const COMMANDS = {
+  doctor: cmdDoctor,
+  jobs: cmdJobs,
   run: cmdRun,
   status: cmdStatus,
   list: cmdList,
