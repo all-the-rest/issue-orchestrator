@@ -41,7 +41,7 @@ const DOD_CONFIG = {
   evidence_class: 'cli',
   acceptance_source: 'issue_body',
 };
-const DEMO_REPO_CONFIG = `"reisi007/demo": { "account": "reisi007", "enabled": true, "local_only": true, "dod": ${JSON.stringify(DOD_CONFIG)} }`;
+const DEMO_REPO_CONFIG = `"reisi007/demo": { "account": "reisi007", "enabled": true, "local_only": true, "auto_merge": true, "dod": ${JSON.stringify(DOD_CONFIG)} }`;
 
 function stableJson(value) {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
@@ -366,7 +366,7 @@ write(CONFIG, `{
   "evidence": { "branch_prefix": "agent-evidence" },
   "merge": { "method": "squash" },
   "repos": {
-    "reisi007/demo": { "account": "reisi007", "enabled": true, "local_only": true, "dod": ${JSON.stringify(DOD_CONFIG)} },
+    ${DEMO_REPO_CONFIG},
     "reisi007/paused": { "account": "reisi007", "enabled": false, "dod": ${JSON.stringify(DOD_CONFIG)} },
   },
 }
@@ -622,7 +622,11 @@ assert.equal(status.projects.find((p) => p.project === 'reisi007/demo').auto_mer
 assert.equal(status.projects.find((p) => p.project === 'reisi007/demo').tracker, 'github');
 assert.equal(status.projects.find((p) => p.project === 'reisi007/demo').code_host, 'github');
 assert.equal(status.lock, null);
-ok('status reports config, model, enabled auto-merge default, disabled-project state and no lock');
+ok('status reports explicit auto-merge opt-in, disabled-project state and no lock');
+const manualDefault = path.join(TMP, 'manual-merge-default.jsonc');
+write(manualDefault, fs.readFileSync(CONFIG, 'utf8').replace(', "auto_merge": true', ''));
+assert.equal(json(runOk(['status'], { env: { ISSUE_ORCHESTRATOR_CONFIG: manualDefault } }))
+  .projects.find((project) => project.project === 'reisi007/demo').auto_merge, false);
 
 assert.equal(getTracker('github').capabilities.capabilities.labels, true);
 assert.deepEqual(getCodeHost('github').capabilities.capabilities.mergeMethods, ['squash', 'merge', 'rebase']);
@@ -975,7 +979,7 @@ write(CONFIG, originalConfig.replace(
 ));
 runRefused(mergeArgs);
 write(CONFIG, originalConfig);
-ok('enabled repos auto-merge by default; explicit auto_merge false overrides that default');
+ok('auto_merge requires explicit opt-in; false explicitly retains human review');
 
 const mergeCases = [
   ['pr-untrusted.json', 'marker from an untrusted author'],

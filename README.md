@@ -170,8 +170,11 @@ report. The schema-2 manifest includes its evidence class and report; the issue
 receives a journaled proof comment with SHA-pinned before/after artifact links,
 commands/results, the evidence commit, exact source head, and change-request
 link. Merge separately requires the nonempty provider-required check set plus
-all configured required check names to be green. `auto_merge` remains true by
-default; set it false per repository to leave merge approval to a human.
+all configured required check names to be green. `auto_merge` defaults to false;
+explicitly set it true only with server-side branch protection and trusted
+approval rules. The CLI cannot replace those controls. Binary evidence and
+customer-data evidence require manual inspection. See [`SECURITY.md`](SECURITY.md)
+and the [unattended-run threat model](docs/threat-model.md).
 
 ## Architecture
 

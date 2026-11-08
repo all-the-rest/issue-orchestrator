@@ -207,6 +207,7 @@ function agentPermissions(role: AgentRole, worktree: string) {
     { action: 'edit', resource: worktreeFiles, effect: 'allow' },
     { action: 'shell', resource: '*', effect: 'allow' },
     { action: 'shell', resource: '*git push*', effect: 'deny' },
+    { action: 'shell', resource: '*git merge*', effect: 'deny' },
     { action: 'shell', resource: '*gh*', effect: 'deny' },
     { action: 'shell', resource: '*glab*', effect: 'deny' },
   ];
@@ -287,7 +288,7 @@ function scrubEnvironment(
   source: NodeJS.ProcessEnv,
   configFile: string,
   agentPath: string,
-  privatePaths: { home: string; temp: string; xdgConfig: string; xdgCache: string; xdgState: string },
+  privatePaths: { home: string; temp: string; xdgConfig: string; xdgCache: string; xdgState: string; xdgData: string },
   executionId: string,
 ): NodeJS.ProcessEnv {
   const clean: NodeJS.ProcessEnv = {};
@@ -301,16 +302,17 @@ function scrubEnvironment(
         key === 'OPENCODE_CONFIG') continue;
     clean[key] = value;
   }
-  // OpenCode is the trusted control plane and needs its persisted provider auth.
-  // Agent tools remain constrained by the generated config; builder shell runs
-  // in a separate container that receives neither these paths nor credentials.
-  clean.HOME = source.HOME ?? os.homedir();
-  clean.USERPROFILE = source.USERPROFILE ?? clean.HOME;
+  // The model process gets private home/config/data paths rather than the
+  // operator's saved OpenCode auth. Provider authentication must be provisioned
+  // separately; builder shell runs in OCI without these paths or credentials.
+  clean.HOME = privatePaths.home;
+  clean.USERPROFILE = privatePaths.home;
   clean.APPDATA = path.join(privatePaths.home, 'AppData', 'Roaming');
   clean.LOCALAPPDATA = path.join(privatePaths.home, 'AppData', 'Local');
   clean.XDG_CONFIG_HOME = privatePaths.xdgConfig;
   clean.XDG_CACHE_HOME = privatePaths.xdgCache;
   clean.XDG_STATE_HOME = privatePaths.xdgState;
+  clean.XDG_DATA_HOME = privatePaths.xdgData;
   clean.TMPDIR = privatePaths.temp;
   clean.TMP = privatePaths.temp;
   clean.TEMP = privatePaths.temp;
@@ -321,6 +323,67 @@ function scrubEnvironment(
   clean.ISSUE_ORCHESTRATOR_EXECUTION_ID = executionId;
   clean.NO_COLOR = '1';
   return clean;
+}
+
+function seedOpenCodeProviderAuth(source: NodeJS.ProcessEnv, privateDataHome: string) {
+  const sourceDataHome = source.XDG_DATA_HOME || path.join(source.HOME || os.homedir(), '.local', 'share');
+  const sourceAuth = path.join(sourceDataHome, 'opencode', 'auth.json');
+  const targetDirectory = path.join(privateDataHome, 'opencode');
+  const targetAuth = path.join(targetDirectory, 'auth.json');
+  fs.mkdirSync(targetDirectory, { recursive: true, mode: 0o700 });
+
+  const validateAuthFile = (file: string, label: string) => {
+    const stat = fs.lstatSync(file);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 1024 * 1024 ||
+        (typeof process.getuid === 'function' && stat.uid !== process.getuid()) || (stat.mode & 0o077) !== 0) {
+      throw new AgentRunnerError('AGENT_SPAWN_FAILED', `${label} is not a private regular OpenCode auth file`);
+    }
+    let parsed: unknown;
+    try { parsed = JSON.parse(fs.readFileSync(file, 'utf8')); }
+    catch (error) { throw new AgentRunnerError('AGENT_SPAWN_FAILED', `${label} is not valid JSON`, undefined, error); }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new AgentRunnerError('AGENT_SPAWN_FAILED', `${label} must contain an OpenCode provider-auth object`);
+    }
+    return parsed;
+  };
+
+  try {
+    fs.lstatSync(targetAuth);
+    return collectProviderAuthSecrets(validateAuthFile(targetAuth, 'Private OpenCode auth'));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  try {
+    fs.lstatSync(sourceAuth);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw new AgentRunnerError('AGENT_SPAWN_FAILED', 'Could not inspect configured OpenCode provider auth', undefined, error);
+  }
+  const auth = validateAuthFile(sourceAuth, 'Configured OpenCode auth');
+  fs.copyFileSync(sourceAuth, targetAuth, fs.constants.COPYFILE_EXCL);
+  fs.chmodSync(targetAuth, 0o600);
+  return collectProviderAuthSecrets(auth);
+}
+
+function collectProviderAuthSecrets(value: unknown): string[] {
+  if (typeof value === 'string') return value.length >= 8 ? [value] : [];
+  if (Array.isArray(value)) return value.flatMap((item) => collectProviderAuthSecrets(item));
+  if (!value || typeof value !== 'object') return [];
+  return Object.values(value).flatMap((entry) => collectProviderAuthSecrets(entry));
+}
+
+function redactLogText(text: string, environment: NodeJS.ProcessEnv, additionalSecrets: string[] = []): string {
+  let redacted = text;
+  const secrets = Object.entries(environment)
+    .filter(([key, value]) => value && /(?:token|secret|password|passwd|credential|authorization|api[_-]?key|access[_-]?key|private[_-]?key|cookie)/i.test(key))
+    .map(([, value]) => value!)
+    .filter((value) => value.length >= 4)
+    .concat(additionalSecrets.filter((value) => value.length >= 4))
+    .sort((a, b) => b.length - a.length);
+  for (const secret of secrets) redacted = redacted.split(secret).join('[REDACTED]');
+  return redacted
+    .replace(/\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16})\b/g, '[REDACTED]')
+    .replace(/((?:access[_-]?token|refresh[_-]?token|token|api[_-]?key|authorization|password|secret)\s*["']?\s*[:=]\s*["']?)[^\s,"'}]+/ig, '$1[REDACTED]');
 }
 
 function canonicalWorktree(candidate: string): string {
@@ -425,9 +488,10 @@ function preparePrivateAgentDirectories(sessionDirectory: string) {
   const xdgConfig = ensurePrivateDirectory(path.join(sessionDirectory, 'xdg-config'));
   const xdgCache = ensurePrivateDirectory(path.join(sessionDirectory, 'xdg-cache'));
   const xdgState = ensurePrivateDirectory(path.join(sessionDirectory, 'xdg-state'));
+  const xdgData = ensurePrivateDirectory(path.join(sessionDirectory, 'xdg-data'));
   ensurePrivateDirectory(path.join(home, 'AppData', 'Roaming'));
   ensurePrivateDirectory(path.join(home, 'AppData', 'Local'));
-  return { cwd, home, temp, xdgConfig, xdgCache, xdgState };
+  return { cwd, home, temp, xdgConfig, xdgCache, xdgState, xdgData };
 }
 
 function openSessionLog(file: string, resume: boolean) {
@@ -1162,7 +1226,8 @@ export class OpenCodeAgentRunner implements AgentRunner {
     const sessions = ensureAgentSessionDirectory(worktree);
     const safeId = safeSessionPart(record.externalSessionId);
     const sessionDirectory = ensurePrivateDirectory(path.join(sessions, safeId));
-    const privatePaths = preparePrivateAgentDirectories(sessionDirectory);
+      const privatePaths = preparePrivateAgentDirectories(sessionDirectory);
+      const providerAuthSecrets = seedOpenCodeProviderAuth(this.environment, privatePaths.xdgData);
     const sandbox = role === 'builder'
       ? requireBuilderSandbox(worktree, this.containerRuntime, this.environment, record.externalSessionId)
       : undefined;
@@ -1225,8 +1290,9 @@ export class OpenCodeAgentRunner implements AgentRunner {
     let closedOutcome: ProcessOutcome | undefined;
     const usage = { ...ZERO_USAGE };
     let ndjsonBytes = 0;
-    let stderrBytes = 0;
     let pendingLine = '';
+    const stderrChunks: Buffer[] = [];
+    let stderrCapturedBytes = 0;
     let outputFailure: AgentRunnerError | undefined;
 
     const renewOwnership = () => {
@@ -1432,10 +1498,13 @@ export class OpenCodeAgentRunner implements AgentRunner {
           return;
         }
         try {
-          fs.writeSync(ndjsonFd!, chunk);
           pendingLine += chunk.toString('utf8');
           const lines = pendingLine.split('\n');
           pendingLine = lines.pop() ?? '';
+          if (lines.length) {
+            const completeLines = lines.map((line) => redactLogText(`${line}\n`, this.environment, providerAuthSecrets)).join('');
+            fs.writeSync(ndjsonFd!, completeLines);
+          }
           for (const line of lines) onLine(line);
           if (pendingLine.length > 1024 * 1024) {
             outputFailure = new AgentRunnerError('AGENT_OUTPUT_LIMIT', 'OpenCode emitted an oversized NDJSON line', record.externalSessionId);
@@ -1454,10 +1523,12 @@ export class OpenCodeAgentRunner implements AgentRunner {
       });
       child.stderr?.on('data', (chunk: Buffer) => {
         if (!renewOwnership()) return;
-        stderrBytes += chunk.length;
-        if (stderrBytes <= MAX_STDERR_BYTES) {
-          try { fs.writeSync(stderrFd!, chunk.subarray(0, Math.max(0, MAX_STDERR_BYTES - (stderrBytes - chunk.length)))); }
-          catch { /* stderr capture is diagnostic only */ }
+        const redactionLookahead = 1024 * 1024;
+        const remaining = MAX_STDERR_BYTES + redactionLookahead - stderrCapturedBytes;
+        if (remaining > 0) {
+          const captured = chunk.subarray(0, remaining);
+          stderrChunks.push(captured);
+          stderrCapturedBytes += captured.length;
         }
       });
 
@@ -1546,9 +1617,16 @@ export class OpenCodeAgentRunner implements AgentRunner {
       }
       cleanupSandboxContainers(true);
       if (!renewOwnership()) throw leaseFailure;
+      try {
+        const completeStderr = redactLogText(Buffer.concat(stderrChunks).toString('utf8'), this.environment, providerAuthSecrets);
+        fs.writeSync(stderrFd!, Buffer.from(completeStderr).subarray(0, MAX_STDERR_BYTES));
+      } catch { /* stderr capture is diagnostic only */ }
       // A final event without a trailing newline still decides the run: a
       // question tool must fail closed before any result is accepted.
-      if (pendingLine.trim()) onLine(pendingLine);
+      if (pendingLine) {
+        fs.writeSync(ndjsonFd!, redactLogText(pendingLine, this.environment, providerAuthSecrets));
+        if (pendingLine.trim()) onLine(pendingLine);
+      }
 
       if (active.stopReason === 'timeout') {
         throw new AgentRunnerError('AGENT_TIMEOUT', `OpenCode exceeded the ${timeoutMs}ms wall-clock timeout`, record.externalSessionId);
