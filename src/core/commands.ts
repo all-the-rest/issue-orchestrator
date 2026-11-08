@@ -67,7 +67,9 @@ const HELP = `Usage: issue-orchestrator <command> [args] [--config <path>]
   run --once [--project <owner/repo>] [--dry-run]
                                   run one trusted issue through review and release
   doctor [--json]                 read-only local dependency/config diagnostics
-  jobs list|show [id] [--json]     inspect persisted jobs without ownership secrets
+  jobs list|show|retry|cancel <id> inspect or safely control persisted jobs
+  logs [--job <id>] [--follow] [--json] read bounded agent session logs
+  project add <id> --from <id> | remove|pause|resume <id>
   status [--json]                 config, queue, lease and recovery status (may update tracker)
   list [--project <p>] [--all-authors] [--limit <n>]
                                   open issues in queue order
@@ -830,10 +832,21 @@ function cmdStatus(opts) {
 
 function cmdJobs(opts) {
   const [action, idArg] = opts._;
-  if (!['list', 'show'].includes(action) || (action === 'show' && !idArg)) {
-    throw new CliError('usage: jobs list|show [id]');
+  if (!['list', 'show', 'retry', 'cancel'].includes(action) || (action !== 'list' && !idArg)) {
+    throw new CliError('usage: jobs list|show|retry|cancel [id]');
   }
+  if (action !== 'list' && !/^[1-9]\d*$/.test(idArg)) throw new CliError('job id must be a positive integer');
   const store = getRuntimeStore({ importLegacy: false });
+  if (action === 'cancel') {
+    store.operatorCancel(Number(idArg));
+    console.log(opts.json ? JSON.stringify({ cancelled: Number(idArg) }) : `Cancelled job ${idArg}`);
+    return 0;
+  }
+  if (action === 'retry') {
+    const id = store.operatorRetry(Number(idArg));
+    console.log(opts.json ? JSON.stringify({ retried: Number(idArg), job_id: id }) : `Created retry job ${id} from job ${idArg}`);
+    return 0;
+  }
   const fields = 'j.id,j.project_id,w.external_id,w.title,w.url,j.state,j.workflow_state,j.attempts,j.max_attempts,j.branch,j.change_number,j.change_number AS pull_request,j.head_sha,j.evidence_commit,j.error_class AS last_error,j.error_class,j.updated_at';
   const rows = action === 'show'
     ? store.rows(`SELECT ${fields} FROM jobs j JOIN work_items w ON w.id=j.work_item_id WHERE j.id=?`, Number(idArg))
@@ -842,6 +855,273 @@ function cmdJobs(opts) {
   const jobs = rows.map((job) => ({ ...job, evidence: store.rows('SELECT kind,sha256,commit_sha,created_at FROM artifacts WHERE job_id=? ORDER BY id', Number(job.id)) }));
   console.log(JSON.stringify(action === 'show' ? jobs[0] : jobs, null, 2));
   return 0;
+}
+
+async function cmdLogs(opts) {
+  if (opts.job !== undefined && !/^[1-9]\d*$/.test(String(opts.job))) throw new CliError('--job must be a positive integer');
+  const store = getRuntimeStore({ importLegacy: false });
+  const sessions = store.rows(`SELECT s.session_id,s.ndjson_path,s.stderr_path,s.status FROM agent_sessions s${opts.job ? ' WHERE s.job_id=?' : ''} ORDER BY s.id DESC LIMIT 100`, ...(opts.job ? [Number(opts.job)] : []));
+  const root = path.join(path.dirname(databasePath()), 'agent-sessions');
+  try {
+    const rootStat = fs.lstatSync(root);
+    if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) throw new CliError('Agent session log root is not a regular directory');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  const output = [];
+  const snapshotCursors = new Map();
+  for (const session of sessions) {
+    if (typeof session.session_id !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(session.session_id)) continue;
+    const dir = path.join(root, session.session_id);
+    for (const [kind, leaf] of [['ndjson', 'ndjson_path'], ['stderr', 'stderr_path']]) {
+      const candidate = path.join(dir, kind === 'ndjson' ? 'events.ndjson' : 'stderr.log');
+      const raw = session[leaf];
+      if (typeof raw !== 'string' || path.resolve(raw) !== candidate) continue;
+      try {
+        const ds = fs.lstatSync(dir); const stat = fs.lstatSync(candidate);
+        if (!ds.isDirectory() || ds.isSymbolicLink() || !stat.isFile() || stat.isSymbolicLink()) continue;
+        const fd = fs.openSync(candidate, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+        try {
+          const fileSize = fs.fstatSync(fd).size;
+          const size = Math.min(fileSize, 64 * 1024);
+          const buffer = Buffer.alloc(size); fs.readSync(fd, buffer, 0, size, Math.max(0, fileSize - size));
+          output.push({ session_id: session.session_id, kind, content: buffer.toString('utf8') });
+          snapshotCursors.set(`${session.session_id}:${kind}`, fileSize);
+        } finally { fs.closeSync(fd); }
+      } catch { /* missing log is a normal state */ }
+    }
+  }
+  if (opts.follow) {
+    // Follow is a bounded polling stream; each emitted event is one JSON line.
+    if (opts.json) console.log(JSON.stringify({ schema_version: 1, event: 'snapshot', logs: output }));
+    else for (const log of output) process.stdout.write(`--- ${log.session_id} ${log.kind} ---\n${log.content}\n`);
+    let done = false;
+    process.on('SIGINT', () => { done = true; });
+    // Continue from the exact fd size used for each snapshot read. A later
+    // stat here could skip bytes appended between the snapshot and cursor read.
+    const cursors = snapshotCursors;
+    while (!done) {
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      for (const session of sessions) {
+        if (typeof session.session_id !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(session.session_id)) continue;
+        for (const kind of ['ndjson', 'stderr']) {
+          const file = path.join(root, session.session_id, kind === 'ndjson' ? 'events.ndjson' : 'stderr.log');
+          const key = `${session.session_id}:${kind}`;
+          try {
+            const ds = fs.lstatSync(path.dirname(file)), stat = fs.lstatSync(file);
+            if (!ds.isDirectory() || ds.isSymbolicLink() || !stat.isFile() || stat.isSymbolicLink()) continue;
+            const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+            try {
+              const offset = cursors.get(key) ?? 0;
+              const length = Math.min(Math.max(0, stat.size - offset), 16 * 1024);
+              if (!length) continue;
+              const buffer = Buffer.alloc(length); fs.readSync(fd, buffer, 0, length, offset); cursors.set(key, offset + length);
+              const event = { schema_version: 1, event: 'append', session_id: session.session_id, kind, content: buffer.toString('utf8') };
+              if (opts.json) console.log(JSON.stringify(event)); else process.stdout.write(event.content);
+            } finally { fs.closeSync(fd); }
+          } catch { /* missing log is expected */ }
+        }
+      }
+    }
+    return 0;
+  }
+  if (opts.json) console.log(JSON.stringify({ schema_version: 1, logs: output }));
+  else for (const log of output) process.stdout.write(`--- ${log.session_id} ${log.kind} ---\n${log.content}\n`);
+  return 0;
+}
+
+function cmdProject(opts) {
+  const [action, id] = opts._;
+  const cfg = requireConfig(opts);
+  if (!['add', 'remove', 'pause', 'resume'].includes(action) || !id) throw new CliError('usage: project add <id> --from <existing> | project remove|pause|resume <id>');
+  const file = configFile(opts);
+  const st = fs.lstatSync(file);
+  if (!st.isFile() || st.isSymbolicLink()) throw new CliError('Refusing to edit a symlink or non-regular config file');
+  const original = fs.readFileSync(file, 'utf8');
+  const text = original;
+  const rootOpen = skipJsoncTrivia(text, 0);
+  const rootMembers = scanJsoncObject(text, rootOpen);
+  const reposMembers = rootMembers?.filter((member) => member.key === 'repos') ?? [];
+  if (reposMembers.length !== 1 || text[reposMembers[0].valueStart] !== '{') throw new CliError('Cannot safely locate repos object; config unchanged');
+  const open = reposMembers[0].valueStart;
+  const close = findJsoncClose(text, open);
+  const members = scanJsoncObject(text, open);
+  if (close < 0 || !members) throw new CliError('Cannot safely parse repos object; config unchanged');
+  const has = Object.hasOwn(cfg.repos, id);
+  let replacement;
+  if (action === 'add') {
+    const source = String(opts.from ?? '');
+    if (has || !source || !Object.hasOwn(cfg.repos, source)) throw new CliError('project add requires a new id and --from <existing project>');
+    if (!/^[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)+$/.test(id)) throw new CliError(`Invalid project id "${id}"`);
+    // Clone a validated project and insert it beside existing entries.
+    const clone = JSON.stringify(cfg.repos[source], null, 2).replace(/^/gm, '  ');
+    if (!members.length) {
+      if (containsJsoncComment(text.slice(open + 1, close))) throw new CliError('Comments in the empty repos object prevent a safe append; config unchanged');
+      replacement = text.slice(0, open + 1) + `\n  ${JSON.stringify(id)}: ${clone}\n` + text.slice(close);
+    } else {
+      const last = members.at(-1);
+      const triviaStart = last.commaIndex === null ? last.valueEnd : last.commaIndex + 1;
+      if (containsJsoncComment(text.slice(triviaStart, close))) throw new CliError('A trailing repos comment prevents a safe append; config unchanged');
+      const insertAt = last.commaIndex === null ? last.valueEnd : last.commaIndex + 1;
+      const separator = last.commaIndex === null ? ',' : '';
+      replacement = text.slice(0, insertAt) + `${separator}\n  ${JSON.stringify(id)}: ${clone}` + text.slice(insertAt);
+    }
+  } else {
+    if (!has) throw new CliError(`Project "${id}" is not configured`);
+    if (action === 'remove' && Object.keys(cfg.repos).length <= 1) throw new CliError('Cannot remove the last configured project');
+    const projectMembers = members.filter((member) => member.key === id);
+    if (projectMembers.length !== 1) throw new CliError('Cannot safely locate unique project entry; config unchanged');
+    const project = projectMembers[0];
+    const valueOpen = project.valueStart;
+    const valueClose = findJsoncClose(text, valueOpen);
+    if (text[valueOpen] !== '{' || valueClose < 0) throw new CliError('Cannot safely locate project object; config unchanged');
+    if (action === 'pause' || action === 'resume') {
+      const props = scanJsoncObject(text, valueOpen);
+      if (!props) throw new CliError('Cannot safely parse project object; config unchanged');
+      const enabled = props.filter((member) => member.key === 'enabled');
+      if (enabled.length > 1) throw new CliError('Duplicate enabled fields prevent a safe project update; config unchanged');
+      if (enabled.length === 1) {
+        if (!['true', 'false'].includes(text.slice(enabled[0].valueStart, enabled[0].valueEnd))) throw new CliError('Project enabled field is not a boolean; config unchanged');
+        replacement = text.slice(0, enabled[0].valueStart) + String(action === 'resume') + text.slice(enabled[0].valueEnd);
+      } else {
+        const last = props.at(-1);
+        if (last && containsJsoncComment(text.slice(last.commaIndex === null ? last.valueEnd : last.commaIndex + 1, valueClose))) {
+          throw new CliError('A trailing project comment prevents a safe enabled-field insertion; config unchanged');
+        }
+        const insertionPoint = last ? (last.commaIndex === null ? last.valueEnd : last.commaIndex + 1) : valueOpen + 1;
+        const separator = last && last.commaIndex === null ? ',' : '';
+        replacement = text.slice(0, insertionPoint) + `${separator}\n          "enabled": ${action === 'resume'}` + text.slice(insertionPoint);
+      }
+    } else {
+      const index = members.indexOf(project);
+      let start = project.keyStart, end = project.valueEnd;
+      if (project.commaIndex !== null) {
+        if (containsJsoncComment(text.slice(project.valueEnd, project.commaIndex))) throw new CliError('A comment before the project separator prevents a safe removal; config unchanged');
+        end = project.commaIndex + 1;
+      } else if (index > 0) {
+        const previous = members[index - 1];
+        if (previous.commaIndex === null || containsJsoncComment(text.slice(previous.commaIndex + 1, project.keyStart))) {
+          throw new CliError('Cannot safely remove project entry with adjacent comments; config unchanged');
+        }
+        start = previous.commaIndex;
+      } else if (containsJsoncComment(text.slice(project.valueEnd, close))) {
+        throw new CliError('A trailing repos comment prevents a safe removal; config unchanged');
+      }
+      replacement = text.slice(0, start) + text.slice(end);
+    }
+  }
+  parseJsonc(replacement, file);
+  // Validate complete config before touching the original.
+  const temp = `${file}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    fs.writeFileSync(temp, replacement, { mode: st.mode & 0o777, flag: 'wx' });
+    loadConfig(temp);
+    const currentStat = fs.lstatSync(file);
+    if (!currentStat.isFile() || currentStat.isSymbolicLink() || currentStat.dev !== st.dev || currentStat.ino !== st.ino || fs.readFileSync(file, 'utf8') !== original) {
+      throw new CliError('Config changed during project edit; refusing to overwrite it');
+    }
+    fs.renameSync(temp, file);
+  } finally { try { fs.unlinkSync(temp); } catch { /* renamed or absent */ } }
+  console.log(opts.json ? JSON.stringify({ action, project: id }) : `Project ${id}: ${action}`);
+  return 0;
+}
+
+function skipJsoncTrivia(text, start) {
+  let i = start;
+  while (i < text.length) {
+    if (/\s/.test(text[i])) { i++; continue; }
+    if (text[i] === '/' && text[i + 1] === '/') { i += 2; while (i < text.length && text[i] !== '\n') i++; continue; }
+    if (text[i] === '/' && text[i + 1] === '*') {
+      const end = text.indexOf('*/', i + 2);
+      if (end < 0) return text.length;
+      i = end + 2; continue;
+    }
+    break;
+  }
+  return i;
+}
+
+function scanJsonStringEnd(text, start) {
+  if (text[start] !== '"') return -1;
+  let escaped = false;
+  for (let i = start + 1; i < text.length; i++) {
+    if (escaped) escaped = false;
+    else if (text[i] === '\\') escaped = true;
+    else if (text[i] === '"') return i + 1;
+  }
+  return -1;
+}
+
+function scanJsoncValueEnd(text, start) {
+  if (text[start] === '"') return scanJsonStringEnd(text, start);
+  if (text[start] !== '{' && text[start] !== '[') {
+    let i = start;
+    while (i < text.length && !/[,}\]\s]/.test(text[i]) && !(text[i] === '/' && ['/', '*'].includes(text[i + 1]))) i++;
+    return i > start ? i : -1;
+  }
+  const stack = [text[start] === '{' ? '}' : ']'];
+  let string = false, escaped = false;
+  for (let i = start + 1; i < text.length; i++) {
+    const c = text[i], n = text[i + 1];
+    if (string) { if (escaped) escaped = false; else if (c === '\\') escaped = true; else if (c === '"') string = false; continue; }
+    if (c === '/' && n === '/') { i += 2; while (i < text.length && text[i] !== '\n') i++; continue; }
+    if (c === '/' && n === '*') { const end = text.indexOf('*/', i + 2); if (end < 0) return -1; i = end + 1; continue; }
+    if (c === '"') { string = true; continue; }
+    if (c === '{') stack.push('}');
+    else if (c === '[') stack.push(']');
+    else if (c === '}' || c === ']') { if (stack.pop() !== c) return -1; if (!stack.length) return i + 1; }
+  }
+  return -1;
+}
+
+function scanJsoncObject(text, open) {
+  if (text[open] !== '{') return null;
+  const properties = [];
+  let i = skipJsoncTrivia(text, open + 1);
+  while (i < text.length && text[i] !== '}') {
+    const keyStart = i, keyEnd = scanJsonStringEnd(text, i);
+    if (keyEnd < 0) return null;
+    let key;
+    try { key = JSON.parse(text.slice(keyStart, keyEnd)); } catch { return null; }
+    i = skipJsoncTrivia(text, keyEnd);
+    if (text[i] !== ':') return null;
+    const valueStart = skipJsoncTrivia(text, i + 1), valueEnd = scanJsoncValueEnd(text, valueStart);
+    if (valueEnd < 0) return null;
+    i = skipJsoncTrivia(text, valueEnd);
+    let commaIndex = null;
+    if (text[i] === ',') { commaIndex = i; i = skipJsoncTrivia(text, i + 1); }
+    else if (text[i] !== '}') return null;
+    properties.push({ key, keyStart, valueStart, valueEnd, commaIndex });
+  }
+  return text[i] === '}' ? properties : null;
+}
+
+function containsJsoncComment(text) {
+  let string = false, escaped = false;
+  for (let i = 0; i < text.length - 1; i++) {
+    const c = text[i], n = text[i + 1];
+    if (string) { if (escaped) escaped = false; else if (c === '\\') escaped = true; else if (c === '"') string = false; continue; }
+    if (c === '"') string = true;
+    else if (c === '/' && (n === '/' || n === '*')) return true;
+  }
+  return false;
+}
+
+function findJsoncClose(text, open) {
+  if (open < 0) return -1;
+  let depth = 0, string = false, escape = false, line = false, block = false;
+  for (let i = open; i < text.length; i++) {
+    const c = text[i], n = text[i + 1];
+    if (line) { if (c === '\n') line = false; continue; }
+    if (block) { if (c === '*' && n === '/') { block = false; i++; } continue; }
+    if (string) { if (escape) escape = false; else if (c === '\\') escape = true; else if (c === '"') string = false; continue; }
+    if (c === '/' && n === '/') { line = true; i++; continue; }
+    if (c === '/' && n === '*') { block = true; i++; continue; }
+    if (c === '"') { string = true; continue; }
+    if (c === '{') depth++;
+    if (c === '}' && --depth === 0) return i;
+  }
+  return -1;
 }
 
 function cmdDoctor(opts) {
@@ -3171,6 +3451,8 @@ function setModel(opts, model) {
 const COMMANDS = {
   doctor: cmdDoctor,
   jobs: cmdJobs,
+  logs: cmdLogs,
+  project: cmdProject,
   run: cmdRun,
   status: cmdStatus,
   list: cmdList,

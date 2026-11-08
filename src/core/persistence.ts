@@ -1984,6 +1984,41 @@ export class SQLiteStore {
   rows(sql: string, ...params: SQLInputValue[]): SqlRow[] {
     return this.db.prepare(sql).all(...params);
   }
+
+  operatorCancel(jobId: number) {
+    return this.transaction(() => {
+      const job = asSqlRow<SqlRow>(this.db.prepare('SELECT state,workflow_state,work_item_id FROM jobs WHERE id=?').get(jobId));
+      if (!job) throw new Error(`Job ${jobId} not found`);
+      if (job.state !== 'READY') throw new Error(`Job ${jobId} is ${String(job.state)}; only READY queued jobs can be cancelled`);
+      if (typeof job.workflow_state !== 'string' || !isWorkflowState(job.workflow_state)) throw new Error(`Job ${jobId} has invalid workflow state; refusing cancellation`);
+      const stamp = nowIso();
+      this.transitionWorkflowInTransaction(jobId, 'CANCELLED', 'cli', 'cancelled by operator');
+      this.db.prepare("UPDATE jobs SET state='CANCELLED',workflow_state='CANCELLED',updated_at=? WHERE id=? AND state='READY'").run(stamp, jobId);
+      this.recordTransition(jobId, 'READY', 'CANCELLED', 'cancelled by operator', 'cli', stamp);
+      const item = this.db.prepare("UPDATE work_items SET state='CANCELLED',updated_at=? WHERE id=? AND state='READY'").run(stamp, job.work_item_id);
+      if (Number(item.changes) !== 1) throw new Error(`Job ${jobId}'s work item is not READY; refusing cancellation`);
+    });
+  }
+
+  operatorRetry(jobId: number) {
+    return this.transaction(() => {
+      const job = asSqlRow<SqlRow>(this.db.prepare('SELECT * FROM jobs WHERE id=?').get(jobId));
+      if (!job) throw new Error(`Job ${jobId} not found`);
+      if (job.state !== 'FAILED') throw new Error(`Job ${jobId} is ${String(job.state)}; only FAILED jobs can be retried`);
+      if (job.workflow_state !== 'FAILED') throw new Error(`Job ${jobId} has workflow state ${String(job.workflow_state)}; refusing unsafe retry`);
+      if (Number(job.attempts) >= Number(job.max_attempts)) throw new Error(`Job ${jobId} exhausted max_attempts (${job.attempts}/${job.max_attempts})`);
+      if (job.branch || job.change_number || job.head_sha || job.evidence_commit) throw new Error(`Job ${jobId} has workflow identifiers; manual recovery required`);
+      if (this.db.prepare('SELECT 1 FROM artifacts WHERE job_id=? LIMIT 1').get(jobId) || this.db.prepare('SELECT 1 FROM side_effect_journal WHERE job_id=? LIMIT 1').get(jobId)) throw new Error(`Job ${jobId} has artifact or side-effect history; manual recovery required`);
+      if (this.db.prepare("SELECT 1 FROM jobs WHERE state IN ('CLAIMED','RUNNING') LIMIT 1").get()) throw new Error('Queue has an active job; retry after it is released');
+      if (this.db.prepare("SELECT 1 FROM jobs WHERE work_item_id=? AND state='READY' LIMIT 1").get(job.work_item_id)) throw new Error('Work item already has a READY job; retry refused');
+      const stamp = nowIso();
+      const created = asSqlRow<IdRow>(this.db.prepare("INSERT INTO jobs(project_id,work_item_id,provider,state,workflow_state,attempts,max_attempts,created_at,updated_at) VALUES (?,?,?,'READY','READY',?,?,?,?) RETURNING id").get(job.project_id, job.work_item_id, job.provider, job.attempts, job.max_attempts, stamp, stamp));
+      if (!created) throw new Error('Could not create retry job');
+      this.recordTransition(Number(created.id), null, 'READY', `retry of failed job ${jobId}`, 'cli', stamp);
+      this.db.prepare("UPDATE work_items SET state='READY',updated_at=? WHERE id=?").run(stamp, job.work_item_id);
+      return Number(created.id);
+    });
+  }
 }
 
 let runtimeStore: SQLiteStore | undefined;

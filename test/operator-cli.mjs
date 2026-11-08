@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { SQLiteStore } from '../dist/core/persistence.js';
 
@@ -41,6 +41,9 @@ function env(extra = {}) {
 function run(args, extraEnv = {}) {
   const result = spawnSync(process.execPath, [cli, ...args], { env: env(extraEnv), encoding: 'utf8' });
   return { code: result.status, stdout: result.stdout.trim(), stderr: result.stderr.trim() };
+}
+function storeForOperator(runtimeHome) {
+  return new SQLiteStore(path.join(runtimeHome, 'orchestrator.sqlite3'));
 }
 
 try {
@@ -108,6 +111,117 @@ try {
   assert.deepEqual(status.active_leases, []);
   assert.equal(status.next_run, null);
   assert(!JSON.stringify(status).includes('owner_token'));
+
+  // A clean failed job can be retried without changing its history.
+  const retryable = storeForOperator(home);
+  const queuedRetry = retryable.recordEventAndEnqueue({
+    project: 'owner/repo', provider: 'github', kind: 'issue', payload: { id: 18 },
+    workItemId: 18, title: 'Retry fixture', author: 'configured-account', url: 'https://example.test/issues/18',
+  });
+  const retrySource = Number(queuedRetry.job.id);
+  retryable.db.prepare("UPDATE jobs SET state='FAILED',workflow_state='FAILED',attempts=1,max_attempts=3 WHERE id=?").run(retrySource);
+  retryable.close();
+  const retried = run(['jobs', 'retry', String(retrySource), '--json']);
+  assert.equal(retried.code, 0, retried.stderr);
+  const retryResult = JSON.parse(retried.stdout);
+  assert.equal(retryResult.retried, retrySource);
+  assert.notEqual(retryResult.job_id, retrySource);
+  const verifyRetry = storeForOperator(home);
+  assert.equal(verifyRetry.rows('SELECT state FROM jobs WHERE id=?', retrySource)[0].state, 'FAILED');
+  assert.equal(verifyRetry.rows('SELECT attempts FROM jobs WHERE id=?', retryResult.job_id)[0].attempts, 1);
+  verifyRetry.db.prepare('UPDATE jobs SET attempts=max_attempts WHERE id=?').run(retrySource);
+  verifyRetry.close();
+  assert.match(run(['jobs', 'retry', String(retrySource)]).stderr, /exhausted max_attempts/);
+  const verifyCancel = storeForOperator(home);
+  const cancelQueue = verifyCancel.recordEventAndEnqueue({ project: 'owner/repo', provider: 'github', kind: 'issue', payload: { id: 19 }, workItemId: 19, title: 'Cancel fixture' });
+  const cancelId = Number(cancelQueue.job.id);
+  verifyCancel.close();
+  assert.equal(run(['jobs', 'cancel', String(cancelId)]).code, 0);
+  assert.match(run(['jobs', 'cancel', String(cancelId)]).stderr, /only READY/);
+
+  const logStore = storeForOperator(home);
+  const sessionId = 'safe-session_1';
+  const sessionDir = path.join(home, 'agent-sessions', sessionId);
+  fs.mkdirSync(sessionDir, { recursive: true });
+  fs.writeFileSync(path.join(sessionDir, 'events.ndjson'), '{"event":"hello"}\n');
+  fs.writeFileSync(path.join(sessionDir, 'stderr.log'), 'fixture stderr\n');
+  logStore.db.prepare("INSERT INTO agent_sessions(job_id,session_id,external_session_id,status,ndjson_path,stderr_path,created_at,updated_at) VALUES (?,?,'external','DONE',?,?,datetime('now'),datetime('now'))").run(retryResult.job_id, sessionId, path.join(sessionDir, 'events.ndjson'), path.join(sessionDir, 'stderr.log'));
+  logStore.close();
+  const logs = run(['logs', '--job', String(retryResult.job_id), '--json']);
+  assert.equal(logs.code, 0, logs.stderr);
+  assert.equal(JSON.parse(logs.stdout).logs.length, 2);
+  assert.doesNotMatch(logs.stdout, /execution_token|owner_token|credential/i);
+  const followChild = spawn(process.execPath, [cli, 'logs', '--job', String(retryResult.job_id), '--follow', '--json'], { env: env(), stdio: ['ignore', 'pipe', 'pipe'] });
+  let followOutput = '', followError = '';
+  followChild.stdout.setEncoding('utf8'); followChild.stderr.setEncoding('utf8');
+  followChild.stdout.on('data', (chunk) => { followOutput += chunk; });
+  followChild.stderr.on('data', (chunk) => { followError += chunk; });
+  const snapshotAt = await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error(`logs --follow timed out: ${followError}`)), 3000);
+    followChild.stdout.on('data', () => {
+      const index = followOutput.indexOf('\n');
+      if (index !== -1) { clearTimeout(timeout); resolve(index + 1); }
+    });
+    followChild.once('error', (error) => { clearTimeout(timeout); reject(error); });
+  });
+  fs.appendFileSync(path.join(sessionDir, 'events.ndjson'), '{"event":"follow"}\n');
+  await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error(`logs append event timed out: ${followError}`)), 3000);
+    followChild.stdout.on('data', () => {
+      if (followOutput.slice(snapshotAt).includes('"event":"append"')) { clearTimeout(timeout); resolve(); }
+    });
+    followChild.once('error', (error) => { clearTimeout(timeout); reject(error); });
+  });
+  followChild.kill('SIGINT');
+  await new Promise((resolve, reject) => {
+    followChild.once('close', (code, signal) => (code === 0 || signal === 'SIGINT') ? resolve() : reject(new Error(`logs follow exited ${code}/${signal}: ${followError}`)));
+  });
+  const followLines = followOutput.trim().split('\n').map(JSON.parse);
+  assert.equal(followLines[0].event, 'snapshot');
+  assert(followLines.slice(1).some((event) => event.event === 'append' && event.content.includes('follow')));
+  const outside = path.join(root, 'outside.log'); fs.writeFileSync(outside, 'DO NOT READ');
+  const hostile = storeForOperator(home);
+  hostile.db.prepare('UPDATE agent_sessions SET stderr_path=? WHERE session_id=?').run(outside, sessionId);
+  fs.unlinkSync(path.join(sessionDir, 'events.ndjson'));
+  fs.symlinkSync(outside, path.join(sessionDir, 'events.ndjson'));
+  hostile.db.prepare('UPDATE agent_sessions SET ndjson_path=? WHERE session_id=?').run(path.join(sessionDir, 'events.ndjson'), sessionId);
+  hostile.close();
+  const refusedLogs = run(['logs', '--job', String(retryResult.job_id), '--json']);
+  assert.deepEqual(JSON.parse(refusedLogs.stdout).logs, []);
+  assert.doesNotMatch(refusedLogs.stdout, /DO NOT READ/);
+  fs.unlinkSync(path.join(sessionDir, 'events.ndjson'));
+
+  const projectAdd = run(['project', 'add', 'owner/clone', '--from', 'owner/repo', '--json']);
+  assert.equal(projectAdd.code, 0, projectAdd.stderr);
+  assert.match(fs.readFileSync(config, 'utf8'), /"owner\/repo"/);
+  const pause = run(['project', 'pause', 'owner/clone']); assert.equal(pause.code, 0, pause.stderr);
+  const resume = run(['project', 'resume', 'owner/clone']); assert.equal(resume.code, 0, resume.stderr);
+  const remove = run(['project', 'remove', 'owner/clone']); assert.equal(remove.code, 0, remove.stderr);
+
+  const commentedConfig = path.join(root, 'commented-config.jsonc');
+  fs.writeFileSync(commentedConfig, `{
+  // root comment must survive edits
+  "model": "openai/test-model",
+  "accounts": ["configured-account"],
+  "repos": {
+    // project comment must survive append
+    "owner/repo": {
+      "account": "configured-account", // account detail
+      "dod": ${JSON.stringify(dod)}
+    }
+  }
+}\n`);
+  const configEnv = { ISSUE_ORCHESTRATOR_CONFIG: commentedConfig };
+  assert.equal(run(['project', 'add', 'owner/second', '--from', 'owner/repo'], configEnv).code, 0);
+  const commentedAfterAdd = fs.readFileSync(commentedConfig, 'utf8');
+  assert.match(commentedAfterAdd, /root comment must survive edits/);
+  assert.match(commentedAfterAdd, /project comment must survive append/);
+  assert.equal(run(['project', 'pause', 'owner/second'], configEnv).code, 0);
+  assert.equal(run(['project', 'status', 'owner/second'], configEnv).code, 1, 'unsupported project action must refuse without writing');
+  assert.equal(run(['project', 'remove', 'owner/second'], configEnv).code, 0);
+  const commentedAfterRemove = fs.readFileSync(commentedConfig, 'utf8');
+  assert.match(commentedAfterRemove, /root comment must survive edits/);
+  assert.doesNotMatch(commentedAfterRemove, /owner\/second/);
   console.log('PASS doctor and jobs CLI provide stable sanitized JSON and actionable dependency/account failures');
 } finally {
   fs.rmSync(root, { recursive: true, force: true });
