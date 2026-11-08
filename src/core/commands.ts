@@ -19,6 +19,14 @@ import {
   quarantineCorruptLegacyLock,
   parseJsonc,
 } from './config.js';
+import {
+  dodReportPath,
+  executeDodCommands,
+  readDodReport,
+  saveDodReport,
+  validateDodReport,
+  type DodReport,
+} from './dod.js';
 import { getCodeHost, getTracker } from '../providers/index.js';
 import { git } from '../git/index.js';
 import {
@@ -71,6 +79,8 @@ const HELP = `Usage: issue-orchestrator <command> [args] [--config <path>]
   merge <project> <number> --owner-token <token>
                                   SHA-bound evidence/review/tests + required checks
   evidence <project> <issue> --dir <dir> --owner-token <token>
+  dod verify <project> <issue> --owner-token <token> [--plan] [--report <path>]
+                                  execute or plan the configured project DoD
   ensure-labels [--project <p>]
   capture-model [--write]         read the global OpenCode model
   set-model <provider/model>      write model into the config
@@ -258,6 +268,58 @@ function labelNames(issue) {
 
 function authorLogin(author) {
   return typeof author === 'string' ? author : author?.login ?? null;
+}
+
+const ACCEPTANCE_MARKER = '<!-- issue-orchestrator:acceptance -->';
+
+function issueAcceptance(rc, tracker, project, issueNumber, issueData, { allowClosed = false } = {}) {
+  if (Number(issueData?.number) !== Number(issueNumber)) {
+    throw new CliError(`tracker returned a different issue than ${project}#${issueNumber}; refused`);
+  }
+  assertTrustedIssue(rc, issueData, { allowClosed });
+  let text;
+  if (rc.dod.acceptance_source === 'issue_body') {
+    text = issueData.body;
+  } else {
+    let comments;
+    try { comments = tracker.getComments({ project, number: Number(issueNumber) }); }
+    catch (error) { throw new CliError(`could not verify the trusted triage acceptance comment: ${error.message}`); }
+    const occurrences = (comments ?? []).flatMap((comment) => {
+      if (typeof comment?.body !== 'string') return [];
+      return [...comment.body.matchAll(/<!-- issue-orchestrator:acceptance -->/g)]
+        .map((match) => ({ comment, index: match.index ?? -1 }));
+    });
+    if (occurrences.length !== 1) {
+      throw new CliError(`triage acceptance requires exactly one acceptance marker occurrence; found ${occurrences.length}; refused`);
+    }
+    const [{ comment, index }] = occurrences;
+    if (!/(?:^|\r?\n)<!-- issue-orchestrator:acceptance -->(?:\r?\n|$)/.test(comment.body)) {
+      throw new CliError('triage acceptance marker must be a dedicated comment line; refused');
+    }
+    const author = authorLogin(comment.author);
+    if (!author || !rc.trusted_authors.includes(author)) {
+      throw new CliError('triage acceptance comment is not authored by a configured trusted author; refused');
+    }
+    text = comment.body.slice(index + ACCEPTANCE_MARKER.length).trim();
+  }
+  if (typeof text !== 'string' || !text.trim()) {
+    throw new CliError(`configured acceptance source ${rc.dod.acceptance_source} is empty; refused`);
+  }
+  if (containsSecretLikeContent(text)) throw new CliError('acceptance text looks credential-like; refusing to include it in a DoD report');
+  return text;
+}
+
+function requiredChecksResult(result, expectedNames) {
+  const checks = result?.checks;
+  if (!Array.isArray(checks) || checks.length === 0) return 'provider returned no required checks';
+  const names = checks.map((check) => check?.name);
+  const missing = expectedNames.filter((name) => !names.includes(name));
+  if (missing.length) return `required checks missing from provider result: ${missing.join(', ')}`;
+  if (result.status === 8) return 'required checks still pending';
+  const notGreen = checks.filter((check) => check?.bucket !== 'pass').map((check) => check?.name ?? '(unnamed)');
+  if (notGreen.length) return `required checks are not green: ${notGreen.join(', ')}`;
+  if (result.status !== 0) return 'required checks are unavailable or failed';
+  return null;
 }
 
 function observeIssueLabel(tracker, project, issue, label, action): SideEffectObservation {
@@ -675,6 +737,7 @@ function cmdStatus(opts) {
       local_only: rc.local_only,
       auto_merge: rc.auto_merge,
       base_branch: rc.base_branch,
+      definition_of_done: rc.dod,
     };
   });
   const currentLock = readLock(lockPath(configFile(opts)), configFile(opts));
@@ -1231,7 +1294,10 @@ function cmdChecks(opts) {
   const after = codeHost.getChange({ project, number: Number(number) });
   const changedDuringChecks = after.headRefOid !== before.headRefOid;
   // A killed process or an undocumented status is never "green".
-  const status = !changedDuringChecks && (raw === 0 || raw === 8) ? raw : 1;
+  const checkFailure = requiredChecksResult(raw, rc.dod.required_checks);
+  const status = changedDuringChecks ? 1 :
+    checkFailure === 'required checks still pending' ? 8 :
+      !checkFailure && (raw.status === 0 || raw.status === 8) ? raw.status : 1;
   console.log(JSON.stringify({
     project,
     number: Number(number),
@@ -1240,6 +1306,9 @@ function cmdChecks(opts) {
     status,
     green: status === 0,
     pending: status === 8,
+    required_checks: rc.dod.required_checks,
+    reported_checks: (raw.checks ?? []).map((check) => ({ name: check.name, bucket: check.bucket })),
+    reason: changedDuringChecks ? 'head changed while checks ran' : checkFailure,
   }, null, 2));
   return status;
 }
@@ -1266,11 +1335,14 @@ function cmdMerge(opts) {
   if (!validSha(lock.head_sha) || !validSha(lock.evidence_commit)) {
     throw new CliError('lock has no SHA-bound review head or evidence commit; merge refused');
   }
-
   // Fail closed: a provider that does not report these fields is not evidence
   // that the change request is mergeable.
   const view = codeHost.getChange({ project, number: changeNumber });
   const alreadyMerged = view.state === 'MERGED';
+  const acceptedIssue = tracker.getWorkItem({ project, number: Number(lock.issue) });
+  const acceptanceText = issueAcceptance(rc, tracker, project, Number(lock.issue), acceptedIssue, {
+    allowClosed: alreadyMerged,
+  });
   if ((!alreadyMerged && view.state !== 'OPEN') || view.isDraft !== false) {
     throw new CliError(`change request is ${view.state}${view.isDraft ? ' (draft)' : ''}; merge refused`);
   }
@@ -1309,20 +1381,35 @@ function cmdMerge(opts) {
   if (!hasTrustedMarker(view, evidenceMarker, markerAuthors)) {
     throw new CliError('missing exact-head evidence marker by a trusted author; merge refused');
   }
-  codeHost.verifyEvidence({
+  const evidenceResult = codeHost.verifyEvidence({
     project,
     commit: lock.evidence_commit,
     issue: lock.issue,
     change: changeNumber,
     head: lock.head_sha,
+    evidenceClass: rc.dod.evidence_class,
   });
+  const reportError = validateDodReport(evidenceResult.manifest.dod_report, {
+    project,
+    issue: Number(lock.issue),
+    head: lock.head_sha,
+    evidenceClass: rc.dod.evidence_class,
+    acceptanceSource: rc.dod.acceptance_source,
+    acceptanceText,
+    dod: rc.dod,
+  });
+  if (reportError) throw new CliError(`${reportError}; merge refused`);
+  if (containsSecretLikeFields(evidenceResult.manifest.dod_report)) {
+    throw new CliError('DoD report contains credential-like content; merge refused');
+  }
 
-  const status = codeHost.getChecks({ project, number: changeNumber, required: true });
-  if (status !== 0) {
+  const checkResult = codeHost.getChecks({ project, number: changeNumber, required: true });
+  const checkFailure = requiredChecksResult(checkResult, rc.dod.required_checks);
+  if (checkFailure) {
     throw new CliError(
-      status === 8
+      checkResult.status === 8 && checkFailure === 'required checks still pending'
         ? 'required checks still pending; merge refused'
-        : 'required checks are not green or unavailable; merge refused',
+        : `${checkFailure}; merge refused`,
     );
   }
   const finalView = codeHost.getChange({ project, number: changeNumber });
@@ -1340,6 +1427,16 @@ function cmdMerge(opts) {
       !hasTrustedMarker(finalView, testsMarker, markerAuthors) ||
       !hasTrustedMarker(finalView, evidenceMarker, markerAuthors)) {
     throw new CliError('review, test or evidence authorization changed during final checks; merge refused');
+  }
+  const finalCheckResult = codeHost.getChecks({ project, number: changeNumber, required: true });
+  const finalCheckFailure = requiredChecksResult(finalCheckResult, rc.dod.required_checks);
+  if (finalCheckFailure) throw new CliError(`${finalCheckFailure}; merge refused`);
+  const finalIssue = tracker.getWorkItem({ project, number: Number(lock.issue) });
+  const finalAcceptanceText = issueAcceptance(rc, tracker, project, Number(lock.issue), finalIssue, {
+    allowClosed: alreadyMerged,
+  });
+  if (finalAcceptanceText !== acceptanceText) {
+    throw new CliError('acceptance source changed during final checks; merge refused');
   }
 
   const store = getRuntimeStore();
@@ -1454,6 +1551,167 @@ function crashAfterMergedOutcomeForTest() {
   }
 }
 
+function cmdDodVerify(opts) {
+  const [subcommand, project, issueText] = opts._;
+  if (subcommand !== 'verify' || !project || !issueText) {
+    throw new CliError('usage: dod verify <project> <issue> --owner-token <token> [--plan] [--report <path>]');
+  }
+  const issue = Number(issueText);
+  if (!Number.isSafeInteger(issue) || issue <= 0) throw new CliError(`invalid issue number: ${issueText}`);
+  if (opts.report === true) throw new CliError('--report requires a file path');
+  const cfg = requireConfig(opts);
+  const { rc, tracker, codeHost } = context(cfg, project);
+  assertEnabled(rc, project);
+  const lock = ownedLock(opts, { project, issue });
+  if (!lock.branch || !validSha(lock.head_sha)) {
+    throw new CliError('DoD verification requires the active issue branch and its exact full head SHA');
+  }
+  let root: string;
+  let branch: string;
+  let head: string;
+  let dirty: string;
+  try {
+    root = git(['rev-parse', '--show-toplevel']);
+    branch = git(['branch', '--show-current']);
+    head = git(['rev-parse', 'HEAD']);
+    dirty = git(['status', '--porcelain']);
+  } catch {
+    throw new CliError('dod verify must run inside the active issue worktree');
+  }
+  if (branch !== lock.branch) throw new CliError(`current branch is ${branch || '(detached)'}, expected ${lock.branch}; DoD verification refused`);
+  if (head !== lock.head_sha) throw new CliError('current full head SHA does not match the active issue checkpoint; DoD verification refused');
+  if (dirty) throw new CliError('DoD verification refuses a dirty issue worktree');
+  if (!validSha(head)) throw new CliError('could not determine the exact full issue head SHA');
+  if (opts.report) {
+    const requestedReport = path.resolve(String(opts.report));
+    const relativeReport = path.relative(root, requestedReport);
+    if (relativeReport === '' || (!relativeReport.startsWith(`..${path.sep}`) && relativeReport !== '..' && !path.isAbsolute(relativeReport))) {
+      throw new CliError('--report must be outside the issue worktree so it cannot dirty the verified head');
+    }
+  }
+  verifyAccount(tracker, codeHost, rc);
+  try { codeHost.verifyRepository({ project }); }
+  catch (error) { throw new CliError(`DoD verification requires the configured project origin: ${error.message}`); }
+  const issueData = tracker.getWorkItem({ project, number: issue });
+  const acceptanceText = issueAcceptance(rc, tracker, project, issue, issueData);
+  let report: DodReport = executeDodCommands({
+    project,
+    issue,
+    head,
+    evidenceClass: rc.dod.evidence_class,
+    acceptanceSource: rc.dod.acceptance_source,
+    acceptanceText,
+    dod: rc.dod,
+    cwd: root,
+    plan: !!opts.plan,
+  });
+  let worktreeFailure: string | null = null;
+  if (!opts.plan) {
+    try {
+      const branchAfter = git(['branch', '--show-current']);
+      const headAfter = git(['rev-parse', 'HEAD']);
+      const dirtyAfter = git(['status', '--porcelain']);
+      if (branchAfter !== branch) worktreeFailure = 'issue worktree branch changed while DoD commands ran';
+      else if (headAfter !== head) worktreeFailure = 'issue worktree head changed while DoD commands ran';
+      else if (dirtyAfter) worktreeFailure = 'DoD commands left the issue worktree dirty';
+    } catch {
+      worktreeFailure = 'could not revalidate the issue worktree after DoD commands';
+    }
+    if (worktreeFailure) {
+      report = {
+        ...report,
+        overall: report.overall === 'passed' ? 'failed' : report.overall,
+        worktree_failure: worktreeFailure,
+      };
+    }
+  }
+  const reason = validateDodReport(report, {
+    project,
+    issue,
+    head,
+    evidenceClass: rc.dod.evidence_class,
+    acceptanceSource: rc.dod.acceptance_source,
+    acceptanceText,
+    dod: rc.dod,
+  }, { requirePassed: report.overall === 'passed' });
+  let internalReport;
+  try {
+    const hasCredentialLikeOutput = containsSecretLikeFields(report);
+    internalReport = saveDodReport(
+      project,
+      issue,
+      head,
+      report,
+      opts.report && !hasCredentialLikeOutput ? String(opts.report) : undefined,
+    );
+    if (hasCredentialLikeOutput) {
+      throw new CliError(`DoD report contains credential-like output; kept private at ${internalReport} and suppressed`);
+    }
+  } catch (error) {
+    if (error instanceof CliError) throw error;
+    throw new CliError(`could not save the DoD report: ${error.message}`);
+  }
+  console.log(JSON.stringify({ ...report, report_file: internalReport }, null, 2));
+  if (reason) throw new CliError(`DoD verification refused: ${reason}`);
+  if (worktreeFailure) throw new CliError(`DoD verification refused: ${worktreeFailure}`);
+  if (report.overall === 'failed') {
+    const failed = Object.entries(report.commands)
+      .filter(([, result]) => result.passed === false)
+      .map(([category]) => category);
+    throw new CliError(`DoD commands failed: ${failed.join(', ')}`);
+  }
+  return 0;
+}
+
+function evidenceProofComment({ project, issue, change, head, evidence, report, view }: {
+  project: string;
+  issue: number;
+  change: number;
+  head: string;
+  evidence: Record<string, any>;
+  report: DodReport;
+  view: Record<string, any>;
+}) {
+  const cell = (value) => String(value).replaceAll('|', '\\|').replace(/[\r\n]/g, ' ').replaceAll('`', '\\`');
+  const artifacts = evidence.files ?? [];
+  const rows = artifacts.map((file) => {
+    const side = String(file.source).split('/')[0];
+    return `| ${side} | ${cell(file.source)} | [${cell(file.name)}](${file.url}) |`;
+  });
+  const commandRows = Object.entries(report.commands).map(([category, result]) => {
+    const command = result.command === null ? '—' : `\`${cell(JSON.stringify(result.command))}\``;
+    const outcome = result.status === 'skipped' ? 'skipped (configured null)' :
+      `${result.status}; exit ${result.exit_code}; timeout ${result.timed_out ? 'yes' : 'no'}`;
+    return `| ${category} | ${command} | ${outcome} |`;
+  });
+  return [
+    '## Verified Definition of Done',
+    '',
+    `Project/issue: \`${project}#${issue}\``,
+    `Change request: [#${change}](${view.url ?? `https://github.com/${project}/pull/${change}`})`,
+    `Exact head SHA: \`${head}\``,
+    `Evidence commit: \`${evidence.commit}\``,
+    `Evidence class: \`${report.evidence_class}\``,
+    `Acceptance source: \`${report.acceptance_source}\``,
+    '',
+    '### Before/after artifacts',
+    '',
+    '| Side | Source | SHA-pinned artifact |',
+    '| --- | --- | --- |',
+    ...rows,
+    '',
+    `Manifest: [manifest.json](${evidence.manifest})`,
+    '',
+    '### Configured commands',
+    '',
+    '| Gate | Command (argv) | Result |',
+    '| --- | --- | --- |',
+    ...commandRows,
+    '',
+    'All configured commands were executed successfully; explicitly null gates were skipped.',
+  ].join('\n');
+}
+
 function cmdEvidence(opts) {
   const cfg = requireConfig(opts);
   const [project, issue] = requirePositional(
@@ -1478,10 +1736,43 @@ function cmdEvidence(opts) {
     throw new CliError('change request does not match the active issue/branch/base; evidence refused');
   }
   let localHead: string;
-  try { localHead = git(['rev-parse', 'HEAD']); } catch { localHead = ''; }
+  let localBranch: string;
+  let localDirty: string;
+  try {
+    localHead = git(['rev-parse', 'HEAD']);
+    localBranch = git(['branch', '--show-current']);
+    localDirty = git(['status', '--porcelain']);
+  } catch {
+    localHead = '';
+    localBranch = '';
+    localDirty = 'unknown';
+  }
+  if (localBranch !== lock.branch) throw new CliError('local worktree branch differs from the active issue branch; evidence refused');
+  if (localDirty) throw new CliError('evidence refuses a dirty issue worktree');
   if (localHead !== view.headRefOid) {
     throw new CliError('local worktree head differs from the change request; evidence refused');
   }
+  let report;
+  try { report = readDodReport(dodReportPath(project, Number(issue), view.headRefOid)); }
+  catch (error) { throw new CliError(`verified DoD report is unavailable: ${error.message}`); }
+  const acceptanceText = issueAcceptance(
+    rc,
+    tracker,
+    project,
+    Number(issue),
+    tracker.getWorkItem({ project, number: Number(issue) }),
+  );
+  const reportError = validateDodReport(report, {
+    project,
+    issue: Number(issue),
+    head: view.headRefOid,
+    evidenceClass: rc.dod.evidence_class,
+    acceptanceSource: rc.dod.acceptance_source,
+    acceptanceText,
+    dod: rc.dod,
+  });
+  if (reportError) throw new CliError(`${reportError}; evidence refused`);
+  if (containsSecretLikeFields(report)) throw new CliError('DoD report contains credential-like content; evidence refused');
   const evidenceIdentity = {
     project,
     issue: Number(issue),
@@ -1491,6 +1782,8 @@ function cmdEvidence(opts) {
   const preparedEvidence = prepareEvidenceManifest({
     ...evidenceIdentity,
     dir: String(opts.dir),
+    evidenceClass: rc.dod.evidence_class,
+    dodReport: report,
   });
   saveCheckpoint(lock, 'evidence-publishing', { head_sha: view.headRefOid }, opts);
   const store = getRuntimeStore();
@@ -1536,10 +1829,33 @@ function cmdEvidence(opts) {
       branchPrefix: rc.evidence_branch_prefix,
       branch: evidenceBranch,
       preparedEvidence,
+      evidenceClass: rc.dod.evidence_class,
+      dodReport: report,
       rawUrl: (args) => codeHost.evidenceUrl(args),
     }),
   });
   const result = publication.value as Record<string, any>;
+  let finalView;
+  try { finalView = codeHost.getChange({ project, number: Number(lock.change_number) }); }
+  catch { throw new CliError('could not recheck change request head after evidence publication; proof comment refused'); }
+  let finalLocalHead: string;
+  let finalLocalBranch: string;
+  let finalLocalDirty: string;
+  try {
+    finalLocalHead = git(['rev-parse', 'HEAD']);
+    finalLocalBranch = git(['branch', '--show-current']);
+    finalLocalDirty = git(['status', '--porcelain']);
+  } catch {
+    throw new CliError('could not recheck local worktree after evidence publication; proof comment refused');
+  }
+  if (finalView.state !== 'OPEN' || finalView.headRefOid !== view.headRefOid ||
+      finalView.headRefName !== lock.branch || finalView.baseRefName !== rc.base_branch ||
+      !closesIssue(finalView.body, lock.issue)) {
+    throw new CliError('change request head or linkage changed during evidence publication; proof comment refused');
+  }
+  if (finalLocalHead !== view.headRefOid || finalLocalBranch !== lock.branch || finalLocalDirty) {
+    throw new CliError('local worktree changed during evidence publication; proof comment refused');
+  }
   saveCheckpoint(lock, 'evidence-published', {
     head_sha: view.headRefOid,
     evidence_commit: result.commit,
@@ -1547,7 +1863,32 @@ function cmdEvidence(opts) {
   if (store.workflowStateForOwner(lock.owner_token) !== 'EVIDENCE_PUBLISHED') {
     store.transitionWorkflow(lock.owner_token, 'EVIDENCE_PUBLISHED', 'cli', 'evidence manifest verified on remote branch');
   }
-  console.log(JSON.stringify(result, null, 2));
+  const finalIssue = tracker.getWorkItem({ project, number: Number(issue) });
+  const finalAcceptanceText = issueAcceptance(rc, tracker, project, Number(issue), finalIssue);
+  if (finalAcceptanceText !== acceptanceText) {
+    throw new CliError('acceptance source changed during evidence publication; proof comment refused');
+  }
+  const proof = evidenceProofComment({
+    project,
+    issue: Number(issue),
+    change: Number(lock.change_number),
+    head: view.headRefOid,
+    evidence: result,
+    report,
+    view,
+  });
+  if (containsSecretLikeContent(proof)) throw new CliError('proof comment looks credential-like; refusing to publish it');
+  journalComment({
+    lock,
+    tracker,
+    codeHost,
+    project,
+    number: Number(issue),
+    kind: 'issue',
+    body: proof,
+    author: rc.tracker_account,
+  });
+  console.log(JSON.stringify({ ...result, proof_comment: true }, null, 2));
   return 0;
 }
 
@@ -1650,6 +1991,7 @@ const COMMANDS = {
   comment: cmdComment,
   'change-create': cmdChangeCreate,
   checks: cmdChecks,
+  dod: cmdDodVerify,
   merge: cmdMerge,
   evidence: cmdEvidence,
   'ensure-labels': cmdEnsureLabels,

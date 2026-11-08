@@ -6,6 +6,7 @@ import {
   type CodeHost,
   type MergeMethod,
   type ProviderComment,
+  type RequiredCheck,
 } from './ports.js';
 
 const MERGE_FLAGS: Record<MergeMethod, string> = { squash: '--squash', merge: '--merge', rebase: '--rebase' };
@@ -52,6 +53,8 @@ interface EvidenceManifest {
   issue: number;
   change: number;
   head: string;
+  evidence_class: string;
+  dod_report: Record<string, unknown>;
   files: EvidenceFile[];
 }
 
@@ -108,20 +111,26 @@ export const githubCodeHost: CodeHost = {
       // gh does not support --watch and --json together. Prove the required-check
       // set is nonempty, then let gh watch using its exit code.
       const snapshot = gh([...args, '--json', 'bucket,name'], { allowFail: true });
-      if (snapshot.status !== 0 && snapshot.status !== 8) return snapshot.status;
-      let checks;
-      try { checks = JSON.parse(snapshot.stdout); } catch { return 1; }
-      if (!Array.isArray(checks) || checks.length === 0) return 1;
-      return gh([...args, '--watch', '--interval', String(interval)], { allowFail: true }).status;
+      if (snapshot.status !== 0 && snapshot.status !== 8) return { status: snapshot.status, checks: [] };
+      const checks = parseChecks(snapshot.stdout);
+      if (!checks || checks.length === 0) return { status: 1, checks: [] };
+      const watched = gh([...args, '--watch', '--interval', String(interval)], { allowFail: true });
+      if (watched.status !== 0 && watched.status !== 8) return { status: watched.status, checks };
+      const finalSnapshot = gh([...args, '--json', 'bucket,name'], { allowFail: true });
+      if (finalSnapshot.status !== 0 && finalSnapshot.status !== 8) {
+        return { status: finalSnapshot.status, checks: [] };
+      }
+      const finalChecks = parseChecks(finalSnapshot.stdout);
+      if (!finalChecks || finalChecks.length === 0) return { status: 1, checks: [] };
+      return { status: finalSnapshot.status, checks: finalChecks };
     }
 
     const result = gh([...args, '--json', 'bucket,name'], { allowFail: true });
-    if (result.status !== 0 && result.status !== 8) return result.status;
-    let checks;
-    try { checks = JSON.parse(result.stdout); } catch { return 1; }
+    if (result.status !== 0 && result.status !== 8) return { status: result.status, checks: [] };
+    const checks = parseChecks(result.stdout);
     // An empty required-check set is not evidence of a green gate.
-    if (!Array.isArray(checks) || checks.length === 0) return 1;
-    return result.status;
+    if (!checks || checks.length === 0) return { status: 1, checks: [] };
+    return { status: result.status, checks };
   },
   merge({ project, number, method = 'squash', headSha }) {
     const flag = MERGE_FLAGS[method];
@@ -152,7 +161,7 @@ export const githubCodeHost: CodeHost = {
     gh(['pr', 'comment', String(number), '--repo', project, '--body', body]);
     return { skipped: false };
   },
-  verifyEvidence({ project, commit, issue, change, head }) {
+  verifyEvidence({ project, commit, issue, change, head, evidenceClass }) {
     if (!/^[a-f0-9]{40}$/i.test(commit ?? '')) throw new Error('evidence commit must be a full SHA');
     const tree = ghJson<GithubTreeResponse>(['api', `repos/${project}/git/trees/${commit}?recursive=1`]);
     if (tree.truncated || !Array.isArray(tree.tree)) throw new Error('evidence tree is unavailable or truncated');
@@ -165,8 +174,12 @@ export const githubCodeHost: CodeHost = {
     let manifest: EvidenceManifest;
     try { manifest = JSON.parse(Buffer.from(contents.content, 'base64').toString('utf8')) as EvidenceManifest; }
     catch { throw new Error('evidence manifest is invalid JSON'); }
-    if (manifestEntry.sha !== contents.sha || manifest.schema !== 1 || manifest.project !== project ||
-        Number(manifest.issue) !== Number(issue) || Number(manifest.change) !== Number(change) || manifest.head !== head) {
+    if (manifestEntry.sha !== contents.sha || manifest.schema !== 2 || manifest.project !== project ||
+        Number(manifest.issue) !== Number(issue) || Number(manifest.change) !== Number(change) || manifest.head !== head ||
+        manifest.evidence_class !== evidenceClass || !manifest.dod_report ||
+        manifest.dod_report.schema !== 1 || manifest.dod_report.project !== project ||
+        Number(manifest.dod_report.issue) !== Number(issue) || manifest.dod_report.head_sha !== head ||
+        manifest.dod_report.evidence_class !== evidenceClass || manifest.dod_report.overall !== 'passed') {
       throw new Error('evidence manifest does not match this project, issue, change request and exact head SHA');
     }
     if (!Array.isArray(manifest.files) || manifest.files.length === 0) throw new Error('evidence manifest has no artifacts');
@@ -188,3 +201,11 @@ export const githubCodeHost: CodeHost = {
     return `https://raw.githubusercontent.com/${project}/${ref}/${filePath.split('/').map(encodeURIComponent).join('/')}`;
   },
 };
+
+function parseChecks(text: string): RequiredCheck[] | null {
+  let value;
+  try { value = JSON.parse(text); } catch { return null; }
+  if (!Array.isArray(value) || value.some((check) => !check || typeof check.name !== 'string' ||
+      !check.name || typeof check.bucket !== 'string' || !check.bucket)) return null;
+  return value;
+}

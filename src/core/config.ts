@@ -8,6 +8,10 @@ import {
   quarantineCorruptLegacyLock as quarantineLegacyLock,
 } from './persistence.js';
 
+export const DOD_CATEGORIES = ['build', 'test', 'lint', 'typecheck', 'security'] as const;
+export const EVIDENCE_CLASSES = ['ui', 'cli', 'docs'] as const;
+export const ACCEPTANCE_SOURCES = ['issue_body', 'triage_comment'] as const;
+
 export function configDir() {
   const home = process.env.ISSUE_ORCHESTRATOR_HOME ?? process.env.GIT_ISSUE_AGENT_HOME;
   return home
@@ -201,6 +205,40 @@ function validateConfig(cfg, file) {
     if (repo.base_branch !== undefined && (typeof repo.base_branch !== 'string' || !repo.base_branch)) {
       throw new Error(`${file}: repos.${project}.base_branch must be a non-empty string`);
     }
+    const dod = repo.dod;
+    if (!dod || typeof dod !== 'object' || Array.isArray(dod)) {
+      throw new Error(`${file}: repos.${project}.dod must be an object`);
+    }
+    const commands = dod.commands;
+    if (!commands || typeof commands !== 'object' || Array.isArray(commands)) {
+      throw new Error(`${file}: repos.${project}.dod.commands must be an object`);
+    }
+    for (const category of DOD_CATEGORIES) {
+      if (!(category in commands)) {
+        throw new Error(`${file}: repos.${project}.dod.commands.${category} must be present (argv array or null)`);
+      }
+      const argv = commands[category];
+      if (argv !== null && (!Array.isArray(argv) || argv.length === 0 ||
+          argv.some((part) => typeof part !== 'string' || !part || part.includes('\0')))) {
+        throw new Error(`${file}: repos.${project}.dod.commands.${category} must be a non-empty argv array or null`);
+      }
+    }
+    if (!Array.isArray(dod.required_checks) || dod.required_checks.length === 0 ||
+        dod.required_checks.some((name) => typeof name !== 'string' || !name.trim())) {
+      throw new Error(`${file}: repos.${project}.dod.required_checks must be a non-empty array of check names`);
+    }
+    if (new Set(dod.required_checks).size !== dod.required_checks.length) {
+      throw new Error(`${file}: repos.${project}.dod.required_checks must contain unique names`);
+    }
+    if (!EVIDENCE_CLASSES.includes(dod.evidence_class)) {
+      throw new Error(`${file}: repos.${project}.dod.evidence_class must be ui, cli or docs`);
+    }
+    if (!ACCEPTANCE_SOURCES.includes(dod.acceptance_source)) {
+      throw new Error(`${file}: repos.${project}.dod.acceptance_source must be issue_body or triage_comment`);
+    }
+    if (dod.timeout_ms !== undefined && (!Number.isSafeInteger(dod.timeout_ms) || dod.timeout_ms < 1 || dod.timeout_ms > 3_600_000)) {
+      throw new Error(`${file}: repos.${project}.dod.timeout_ms must be an integer from 1 to 3600000`);
+    }
   }
 
   // Credentials belong in the host's credential store, never this config.
@@ -253,7 +291,7 @@ export function repoConfig(cfg, project) {
       ? own.trusted_authors
       : (cfg.trusted_authors ?? []),
     labels,
-    commands: own.commands ?? {},
+    dod: own.dod,
     evidence_branch_prefix: own.evidence?.branch_prefix ?? cfg.evidence?.branch_prefix ?? 'agent-evidence',
     merge_method: own.merge_method ?? cfg.merge?.method ?? 'squash',
     raw: own,

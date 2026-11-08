@@ -118,8 +118,10 @@ export function reconcileEvidenceBranch({ project, issue, change, head, branch, 
   } catch (error) {
     throw new Error(`existing evidence branch has no valid manifest: ${(error as Error).message}`);
   }
-  if (manifest.schema !== 1 || manifest.project !== project || Number(manifest.issue) !== Number(issue) ||
+  if (manifest.schema !== 2 || manifest.project !== project || Number(manifest.issue) !== Number(issue) ||
       Number(manifest.change) !== Number(change) || manifest.head !== head.toLowerCase() ||
+      !['ui', 'cli', 'docs'].includes(manifest.evidence_class) ||
+      !manifest.dod_report || manifest.dod_report.overall !== 'passed' ||
       !Array.isArray(manifest.files) || manifest.files.length === 0) {
     throw new Error('existing evidence branch manifest does not match this job; refusing to publish a duplicate');
   }
@@ -207,7 +209,7 @@ export function reconcileEvidenceBranch({ project, issue, change, head, branch, 
  * head. The configured GitHub project is checked against origin; the push URL
  * itself is canonical and never inferred from an arbitrary remote.
  */
-export function prepareEvidenceManifest({ project, issue, change, head, dir }) {
+export function prepareEvidenceManifest({ project, issue, change, head, dir, evidenceClass, dodReport }) {
   if (!project || !Number.isSafeInteger(Number(issue)) || Number(issue) <= 0) {
     throw new Error('a project and positive issue number are required');
   }
@@ -215,6 +217,12 @@ export function prepareEvidenceManifest({ project, issue, change, head, dir }) {
     throw new Error('--change must be a positive change-request number');
   }
   if (!/^[a-f0-9]{40}$/i.test(head ?? '')) throw new Error('--head must be a full 40-character commit SHA');
+  if (!['ui', 'cli', 'docs'].includes(evidenceClass)) throw new Error('evidence class must be ui, cli or docs');
+  if (!dodReport || dodReport.schema !== 1 || dodReport.project !== project ||
+      Number(dodReport.issue) !== Number(issue) || dodReport.head_sha !== head.toLowerCase() ||
+      dodReport.evidence_class !== evidenceClass || dodReport.overall !== 'passed') {
+    throw new Error('a successful DoD report bound to this project, issue, evidence class and head is required');
+  }
   if (!dir || !fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) {
     throw new Error(`Evidence directory not found: ${dir}`);
   }
@@ -244,11 +252,13 @@ export function prepareEvidenceManifest({ project, issue, change, head, dir }) {
     throw new Error('Evidence file names collide after safe-path normalization');
   }
   const manifest = {
-    schema: 1,
+    schema: 2,
     project,
     issue: Number(issue),
     change: Number(change),
     head: head.toLowerCase(),
+    evidence_class: evidenceClass,
+    dod_report: dodReport,
     files: entries,
   };
   return { root, entries, manifest };
@@ -263,6 +273,8 @@ export function publishEvidence({
   branchPrefix = 'agent-evidence',
   branch,
   preparedEvidence,
+  evidenceClass,
+  dodReport,
   rawUrl,
 }) {
   if (!project || !Number.isSafeInteger(Number(issue)) || Number(issue) <= 0) {
@@ -283,10 +295,13 @@ export function publishEvidence({
       !/^[A-Za-z0-9._/-]+$/.test(branch) || branch.includes('..')) {
     throw new Error('evidence branch is not bound to the configured job identity');
   }
-  const prepared = preparedEvidence ?? prepareEvidenceManifest({ project, issue, change, head, dir });
+  const prepared = preparedEvidence ?? prepareEvidenceManifest({
+    project, issue, change, head, dir, evidenceClass, dodReport,
+  });
   const { root, entries, manifest } = prepared;
   if (manifest.project !== project || Number(manifest.issue) !== Number(issue) ||
-      Number(manifest.change) !== Number(change) || manifest.head !== head.toLowerCase()) {
+      Number(manifest.change) !== Number(change) || manifest.head !== head.toLowerCase() ||
+      manifest.evidence_class !== evidenceClass || !isDeepStrictEqual(manifest.dod_report, dodReport)) {
     throw new Error('prepared evidence manifest does not match this job');
   }
   verifyOrigin(project, root);
