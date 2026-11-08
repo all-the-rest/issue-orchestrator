@@ -787,17 +787,29 @@ function processInfo(pid: number): ProcessInfo | null {
   throw new AgentRunnerError('AGENT_RECOVERY_UNSAFE', 'Safe process identity is supported only on Linux and macOS');
 }
 
+const PROC_EXIT_RECHECK_DELAY = new Int32Array(new SharedArrayBuffer(4));
+
 function linuxProcessHasExecutionId(pid: number, executionId: string) {
-  let environment: Buffer;
-  try { environment = fs.readFileSync(`/proc/${pid}/environ`); }
-  catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code === 'ENOENT' || code === 'ESRCH') return false;
-    // A process can exit between group enumeration and reading environ. Linux
-    // may report EACCES for that newly-zombified /proc entry; re-check its
-    // state before treating the inspection as unsafe.
-    if (code === 'EACCES' && processHasExited(linuxProcessInfo(pid))) return false;
-    throw new AgentRunnerError('AGENT_RECOVERY_UNSAFE', 'Could not verify process execution identity', undefined, error);
+  let environment: Buffer | undefined;
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    try {
+      environment = fs.readFileSync(`/proc/${pid}/environ`);
+      break;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT' || code === 'ESRCH') return false;
+      if (code !== 'EACCES') {
+        throw new AgentRunnerError('AGENT_RECOVERY_UNSAFE', 'Could not verify process execution identity', undefined, error);
+      }
+      // During shutdown, Linux may briefly deny access to a process's environ.
+      // Recheck its state, then retry the read while it remains live. A process
+      // that exits is gone; one that remains unreadable fails closed below.
+      if (processHasExited(linuxProcessInfo(pid))) return false;
+      if (attempt < 9) Atomics.wait(PROC_EXIT_RECHECK_DELAY, 0, 0, 2);
+    }
+  }
+  if (!environment) {
+    throw new AgentRunnerError('AGENT_RECOVERY_UNSAFE', 'Could not verify process execution identity after repeated EACCES');
   }
   const expected = Buffer.from(`ISSUE_ORCHESTRATOR_EXECUTION_ID=${executionId}`);
   return environment.toString('utf8').split('\0').some((entry) => entry === expected.toString('utf8'));
