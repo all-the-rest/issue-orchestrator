@@ -152,9 +152,9 @@ const report = {
   home: process.env.HOME,
   xdgConfigHome: process.env.XDG_CONFIG_HOME,
   xdgDataHome: process.env.XDG_DATA_HOME ?? null,
-  hostAuthReadable: process.env.XDG_DATA_HOME
-    ? fs.readFileSync(path.join(process.env.XDG_DATA_HOME, 'opencode', 'auth.json'), 'utf8') === 'test saved OpenCode auth'
-    : false,
+  providerAuth: process.env.XDG_DATA_HOME && fs.existsSync(path.join(process.env.XDG_DATA_HOME, 'opencode', 'auth.json'))
+    ? JSON.parse(fs.readFileSync(path.join(process.env.XDG_DATA_HOME, 'opencode', 'auth.json'), 'utf8'))
+    : null,
   gitConfigGlobal: process.env.GIT_CONFIG_GLOBAL ?? null,
   sshAuthSock: process.env.SSH_AUTH_SOCK ?? null,
   awsProfile: process.env.AWS_PROFILE ?? null,
@@ -178,6 +178,14 @@ if (mode === 'question') {
   fs.writeFileSync(process.env.FAKE_ORPHAN_PID, String(process.pid));
   setInterval(() => fs.appendFileSync(process.env.FAKE_HEARTBEAT, 'o'), 10);
 } else {
+  if (mode === 'secret-log') {
+    process.stdout.write(JSON.stringify({ type: 'diagnostic', token: 'opaque-unrecognizable-token-value' }) + String.fromCharCode(10));
+    process.stderr.write('provider token=opaque-unrecognizable-token-value' + String.fromCharCode(10));
+  }
+  if (mode === 'auth-log') {
+    process.stderr.write('provider auth: test saved ');
+    setTimeout(() => process.stderr.write('OpenCode auth' + String.fromCharCode(10)), 10);
+  }
   if (mode.startsWith('builder')) {
     const command = mode === 'builder-hang'
       ? 'sleep 300'
@@ -203,6 +211,7 @@ if (mode === 'question') {
             readonlyRoot,
             noSockets,
             '! command -v gh >/dev/null 2>&1 && ! command -v glab >/dev/null 2>&1',
+            '! gh pr merge 1 && ! gh issue comment 1 --body forbidden',
             attemptOutsideWrite,
             pushBlocked,
             protectGitMetadata,
@@ -328,7 +337,7 @@ try {
     const trustedData = path.join(TMP, 'trusted-opencode-data');
     fs.mkdirSync(providerBin);
     fs.mkdirSync(path.join(trustedData, 'opencode'), { recursive: true });
-    fs.writeFileSync(path.join(trustedData, 'opencode', 'auth.json'), 'test saved OpenCode auth');
+    fs.writeFileSync(path.join(trustedData, 'opencode', 'auth.json'), JSON.stringify({ openai: { type: 'api', key: 'test saved OpenCode auth' } }), { mode: 0o600 });
     fs.writeFileSync(path.join(providerBin, 'gh'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
     const runner = runnerFor(store, { environment: {
       FAKE_OPENCODE_REPORT: reportFile,
@@ -361,10 +370,10 @@ try {
     assert.equal(report.githubToken, null);
     assert.equal(report.ghToken, null);
     assert.equal(report.ownerToken, null);
-    assert.equal(report.home, os.homedir(), 'trusted OpenCode control plane must retain its host HOME');
     assert.notEqual(report.xdgConfigHome, path.join(os.homedir(), '.config'));
-    assert.equal(report.xdgDataHome, trustedData, 'saved OpenCode auth data must remain available to the control plane');
-    assert.equal(report.hostAuthReadable, true, 'subprocess must be able to read saved host-side OpenCode auth');
+    assert.notEqual(report.home, os.homedir(), 'agent process must not inherit the operator home');
+    assert.notEqual(report.xdgDataHome, trustedData, 'agent process must use private OpenCode data storage');
+    assert.deepEqual(report.providerAuth, { openai: { type: 'api', key: 'test saved OpenCode auth' } }, 'configured OpenCode auth is copied into private agent data');
     assert.equal(report.gitConfigGlobal, null);
     assert.equal(report.sshAuthSock, null);
     assert.equal(report.awsProfile, null);
@@ -380,6 +389,12 @@ try {
       rule.action === 'question' && rule.resource === '*' && rule.effect === 'deny'
     )));
     assert.ok(profile.permissions.some((rule) => (
+      rule.action === 'external_directory' && rule.resource === '*' && rule.effect === 'deny'
+    )), 'agent roles cannot read host credential paths');
+    assert.ok(profile.permissions.some((rule) => (
+      rule.action === '*' && rule.resource === '*' && rule.effect === 'deny'
+    )), 'webfetch and all ungranted tools remain denied');
+    assert.ok(profile.permissions.some((rule) => (
       rule.action === 'shell' && rule.resource === '*' && rule.effect === 'deny'
     )), 'verifier shell requests, including pnpm test/build, must be rejected');
     assert.ok(!profile.permissions.some((rule) => rule.action === 'shell' && rule.effect === 'allow'));
@@ -387,7 +402,48 @@ try {
     assert.equal(fs.statSync(path.dirname(record.ndjsonPath)).mode & 0o777, 0o700);
     assert.equal(fs.statSync(record.ndjsonPath).mode & 0o777, 0o600);
     store.close();
-    ok('OpenCode captures NDJSON privately, rejects verifier shell requests, and scrubs host credentials');
+    ok('OpenCode captures NDJSON privately, rejects verifier shell requests, and removes host credentials and home secrets');
+  }
+
+  // Persisted model stdout/stderr must redact recognizable token values.
+  {
+    const worktree = createWorktree('secret-log');
+    const store = new SQLiteStore(path.join(TMP, 'secret-log.sqlite3'));
+    const runner = runnerFor(store, { environment: { FAKE_OPENCODE_MODE: 'secret-log' } });
+    const session = await runner.createSession({
+      jobId: makeJob(store, 532), role: 'triage', model: 'test/model', worktree,
+    });
+    await runner.run({ sessionId: session.externalSessionId, prompt: 'Emit diagnostic fixture.' });
+    const record = store.getAgentSession(session.externalSessionId);
+    const logs = fs.readFileSync(record.ndjsonPath, 'utf8') + fs.readFileSync(record.stderrPath, 'utf8');
+    assert.doesNotMatch(logs, /opaque-unrecognizable-token-value/);
+    assert.match(logs, /\[REDACTED\]/);
+    store.close();
+    ok('persisted OpenCode stdout and stderr redact token-shaped values');
+  }
+
+  // Copied provider auth values are also redacted if they appear in diagnostics.
+  {
+    const worktree = createWorktree('provider-auth-log');
+    const store = new SQLiteStore(path.join(TMP, 'provider-auth-log.sqlite3'));
+    const providerData = path.join(TMP, 'provider-auth-log-data');
+    fs.mkdirSync(path.join(providerData, 'opencode'), { recursive: true });
+    fs.writeFileSync(path.join(providerData, 'opencode', 'auth.json'),
+      JSON.stringify({ openai: { type: 'api', key: 'test saved OpenCode auth' } }), { mode: 0o600 });
+    const runner = runnerFor(store, {
+      environment: {
+        FAKE_OPENCODE_MODE: 'auth-log',
+        XDG_DATA_HOME: providerData,
+      },
+    });
+    const session = await runner.createSession({
+      jobId: makeJob(store, 533), role: 'triage', model: 'test/model', worktree,
+    });
+    await runner.run({ sessionId: session.externalSessionId, prompt: 'Emit provider-auth fixture.' });
+    const record = store.getAgentSession(session.externalSessionId);
+    assert.doesNotMatch(fs.readFileSync(record.ndjsonPath, 'utf8') + fs.readFileSync(record.stderrPath, 'utf8'), /test saved OpenCode auth/);
+    store.close();
+    ok('persisted logs redact copied OpenCode provider-auth values');
   }
 
   // A worktree-controlled sessions symlink cannot redirect captured output.
@@ -1067,6 +1123,7 @@ setInterval(() => {}, 1000);
     assert.deepEqual(report.config.mcp, {});
     assert.ok(profile.permissions.some((rule) => rule.action === 'shell' && rule.resource === '*' && rule.effect === 'allow'));
     assert.ok(profile.permissions.some((rule) => rule.action === 'shell' && rule.resource === '*git push*' && rule.effect === 'deny'));
+    assert.ok(profile.permissions.some((rule) => rule.action === 'shell' && rule.resource === '*git merge*' && rule.effect === 'deny'));
     assert.ok(profile.permissions.some((rule) => rule.action === 'shell' && rule.resource === '*gh*' && rule.effect === 'deny'));
     assert.ok(profile.permissions.some((rule) => rule.action === 'shell' && rule.resource === '*glab*' && rule.effect === 'deny'));
     assert.ok(profile.permissions.some((rule) => rule.action === 'external_directory' && rule.resource === '*' && rule.effect === 'deny'));

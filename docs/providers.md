@@ -129,11 +129,15 @@ v2.2.6 CLI directly with `spawn` (no shell), `--standalone`,
 working directory, generated config, and captured NDJSON/stderr live in private
 per-session directories beside the orchestrator runtime database, outside the
 worktree. Those directories are forced to mode `0700`, log files to `0600`, and
-log opens reject symlinks. OpenCode's resumable session/auth state remains in
-the host `XDG_DATA_HOME`; the trusted control process retains `HOME` and that
-data directory for saved model authentication. User config is isolated with a
-private `XDG_CONFIG_HOME`, and the CLI starts outside the repository so project
-config/plugins are not discovered. The generated agent config disables
+log opens reject symlinks. The process gets private `HOME` and XDG directories.
+For configured default models, only the operator's OpenCode `auth.json` is
+copied into that session's private XDG data directory after checking that it is
+a private, regular, owned file; the host data path is not exposed. The copied
+provider credentials remain in the private session directory for crash resume,
+and their values are redacted from persisted logs. Use a dedicated/disposable
+operator account with least-privilege model-provider credentials. User config is
+isolated with a private `XDG_CONFIG_HOME`, and the CLI starts outside the
+repository so project config/plugins are not discovered. The generated agent config disables
 configured plugins and MCP, and agent file access is restricted to the
 worktree. Any machine-managed OpenCode configuration is administrator-owned and
 must be trusted. Verifier shell is denied; builder shell runs in the OCI

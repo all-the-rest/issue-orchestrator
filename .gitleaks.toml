@@ -1,0 +1,3 @@
+[allowlist]
+description = "Synthetic credential used only by the secret-scanning regression test"
+regexes = ['ghp_1234567890123456789012345678901234567890']

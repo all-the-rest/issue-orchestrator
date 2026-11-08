@@ -170,7 +170,7 @@ function validateConfig(cfg, file) {
     }
     const enabled = repo.enabled ?? defaults.enabled ?? true;
     const localOnly = repo.local_only ?? defaults.local_only ?? false;
-    const autoMerge = repo.auto_merge ?? defaults.auto_merge ?? true;
+    const autoMerge = repo.auto_merge ?? defaults.auto_merge ?? false;
     for (const [name, value] of [['enabled', enabled], ['local_only', localOnly], ['auto_merge', autoMerge]]) {
       requireType(value, 'boolean', `repos.${project}.${name}`, file);
     }
@@ -290,7 +290,7 @@ export function repoConfig(cfg, project) {
     code_host_account: own.code_host_account ?? account,
     enabled,
     local_only: own.local_only ?? defaults.local_only ?? false,
-    auto_merge: enabled && (own.auto_merge ?? defaults.auto_merge ?? true),
+    auto_merge: enabled && (own.auto_merge ?? defaults.auto_merge ?? false),
     base_branch: own.base_branch ?? defaults.base_branch ?? 'main',
     trusted_authors: Array.isArray(own.trusted_authors)
       ? own.trusted_authors
