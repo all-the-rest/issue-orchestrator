@@ -307,6 +307,10 @@ try {
     assert.deepEqual(twoDigit, {
       pid: 4242, pgid: 4242, state: 'S+', startIdentity: 'Sun Nov 08 14:15:08 2026',
     });
+    const transitional = parseMacProcessLine('4242 4242 Sun Nov 08 14:15:08 2026 ?<s');
+    assert.deepEqual(transitional, {
+      pid: 4242, pgid: 4242, state: '?<s', startIdentity: 'Sun Nov 08 14:15:08 2026',
+    });
     assert.throws(
       () => parseMacProcessLine('4242 4242 Sun Feb 30 14:15:08 2026 S'),
       (error) => error instanceof AgentRunnerError && error.code === 'AGENT_RECOVERY_UNSAFE',

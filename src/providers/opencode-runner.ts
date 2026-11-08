@@ -753,7 +753,7 @@ export function parseMacProcessLine(line: string): ProcessInfo {
       !/^(?:[0-9]|[01]\d|2[0-3]):[0-5]\d:[0-5]\d$/.test(clock) || !/^\d{4}$/.test(year) ||
       monthIndex < 0 || startDate.getUTCFullYear() !== Number(year) ||
       startDate.getUTCMonth() !== monthIndex || startDate.getUTCDate() !== Number(day) ||
-      !/^[A-Za-z][A-Za-z+<>*!?]*$/.test(state)) {
+       !/^[A-Za-z?][A-Za-z?+<>*!]*$/.test(state)) {
     throw new AgentRunnerError(
       'AGENT_RECOVERY_UNSAFE', `macOS ps returned an invalid process identity row: ${line.trim()}`,
     );
