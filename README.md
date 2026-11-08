@@ -10,8 +10,8 @@ OpenCode is the first intended agent backend, not a dependency of the core.
 > **Status:** early `v0.1`. The deterministic core has been extracted from the
 > `git-issue-agent` skill. SQLite persistence and the replaceable OpenCode
 > `AgentRunner` adapter are in place; the full orchestration `run` loop remains
-> a follow-up. Builder commands run only through the disposable OCI sandbox and
-> fail closed unless the fixed Node 24/pnpm image is already present locally.
+> a follow-up. Agent builder commands run only through the disposable OCI
+> sandbox and fail closed unless the fixed Node 24/pnpm image is already present.
 
 ## Requirements
 
@@ -41,6 +41,8 @@ issue-orchestrator status
 issue-orchestrator list
 issue-orchestrator claim <project> <issue>
 issue-orchestrator checkpoint <stage> --owner-token <token>
+issue-orchestrator dod verify <project> <issue> --owner-token <token> [--plan]
+issue-orchestrator evidence <project> <issue> --dir <dir> --owner-token <token>
 issue-orchestrator release --owner-token <token>
 ```
 
@@ -94,6 +96,55 @@ support matrix are documented in [`docs/providers.md`](docs/providers.md).
 Actor values guard internal transitions, but they are local process roles, not
 cryptographic identities; trusted human approval is established from the
 configured GitHub reviewer checks.
+
+## Project Definition of Done
+
+Every repository must explicitly configure all five command categories, its
+required CI check names, evidence class, and acceptance source:
+
+```jsonc
+{
+  "repos": {
+    "acme/service": {
+      "account": "acme-bot",
+      "dod": {
+        "commands": {
+          "build": ["pnpm", "build"],
+          "test": ["pnpm", "test"],
+          "lint": null,
+          "typecheck": ["pnpm", "typecheck"],
+          "security": null
+        },
+        "required_checks": ["CI", "Ratchet fast"],
+        "evidence_class": "cli",
+        "acceptance_source": "issue_body",
+        "timeout_ms": 300000
+      }
+    }
+  }
+}
+```
+
+Command values are argv arrays executed directly with `shell: false`; `null`
+explicitly skips a category. Omitted categories, empty/invalid argv, empty or
+duplicate required checks, and unsupported enum values fail closed. `timeout_ms`
+is optional (default 300000) and bounded to one hour. `dod verify` checks the
+active issue lock, branch, clean worktree, and exact full head SHA before running
+every configured command. It captures bounded stdout/stderr, exit code, signal,
+and timeout status. `--plan` executes nothing and marks configured commands as
+planned; skipped categories remain distinct. Reports are written privately to
+the runtime directory; optional `--report <path>` must be outside the worktree.
+
+For `acceptance_source: "triage_comment"`, exactly one issue comment must
+contain `<!-- issue-orchestrator:acceptance -->` and be authored by a configured
+trusted author. The text is recorded as data, never treated as instructions.
+Evidence publication requires a successful, current, exact-head execution
+report. The schema-2 manifest includes its evidence class and report; the issue
+receives a journaled proof comment with SHA-pinned before/after artifact links,
+commands/results, the evidence commit, exact source head, and change-request
+link. Merge separately requires the nonempty provider-required check set plus
+all configured required check names to be green. `auto_merge` remains true by
+default; set it false per repository to leave merge approval to a human.
 
 ## Architecture
 

@@ -32,7 +32,22 @@ may select them independently at the global, defaults, or repository level:
   "tracker": "jira",
   "code_host": "github",
   "repos": {
-    "reisi007/demo": { "account": "reisi007", "enabled": true }
+    "reisi007/demo": {
+      "account": "reisi007",
+      "enabled": true,
+      "dod": {
+        "commands": {
+          "build": ["pnpm", "build"],
+          "test": ["pnpm", "test"],
+          "lint": null,
+          "typecheck": ["pnpm", "typecheck"],
+          "security": null
+        },
+        "required_checks": ["CI"],
+        "evidence_class": "cli",
+        "acceptance_source": "issue_body"
+      }
+    }
   }
 }
 ```
@@ -42,6 +57,32 @@ legacy `provider` value fills either port that has no repository-level explicit
 selection. The legacy `account` remains the fallback for both `tracker_account` and
 `code_host_account`; those fields may be set independently when needed. Provider
 credentials stay in the provider CLI/credential store, never in config.
+
+Every project must provide `dod.commands.build`, `test`, `lint`, `typecheck`,
+and `security`. Each is either a nonempty argv array or explicit `null` to skip;
+commands run without a shell. `dod.required_checks` is a nonempty array of
+unique exact check names, and merge requires both the provider's nonempty
+required-check result and each configured name to be green. `evidence_class` is
+exactly `ui`, `cli`, or `docs`; `acceptance_source` is exactly `issue_body` or
+`triage_comment`. The optional `timeout_ms` is a positive integer no greater
+than 3600000 (default 300000).
+
+`issue-orchestrator dod verify <project> <issue> --owner-token <token>` checks
+the active issue worktree and exact checkpointed head before executing all
+configured argv commands. `--plan` performs the same binding checks but runs no
+commands. Reports distinguish executed, planned, and skipped gates and contain
+bounded stdout/stderr, exit status, timeout/signal, acceptance text, and the
+DoD-config digest. Triage acceptance must come from exactly one comment bearing
+`<!-- issue-orchestrator:acceptance -->` by a configured trusted author; its
+contents are data, not agent instructions.
+
+Evidence manifest schema 2 records the configured evidence class and successful
+DoD report in addition to project/issue/change/head and artifact hashes. Older
+schema-1 evidence is deliberately rejected for publication recovery and merge;
+an existing schema-1 intent is not silently adopted and needs explicit recovery.
+After publication the issue gets
+a journaled human-readable proof comment with before/after SHA-pinned artifact
+links and command results. Machine gate markers remain on the change request.
 
 The selected tracker/code-host pair is persisted with active work and checked
 during recovery. Changing the pair while a journaled write is pending therefore
