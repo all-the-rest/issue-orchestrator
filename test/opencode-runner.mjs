@@ -524,6 +524,37 @@ try {
     ok('unterminated final question event is denied before a clean result is accepted');
   }
 
+  // A transient EACCES while reading /proc/<pid>/environ must be retried for a
+  // still-live process rather than turning a recoverable race into failure.
+  if (process.platform === 'linux') {
+    const worktree = createWorktree('proc-environ-eacces-retry');
+    const store = new SQLiteStore(path.join(TMP, 'proc-environ-eacces-retry.sqlite3'));
+    const runner = runnerFor(store);
+    const session = await runner.createSession({
+      jobId: makeJob(store, 531), role: 'triage', model: 'test/model', worktree,
+    });
+    const originalReadFileSync = fs.readFileSync;
+    let deniedOnce = false;
+    fs.readFileSync = function (file, ...args) {
+      if (!deniedOnce && typeof file === 'string' && /^\/proc\/\d+\/environ$/.test(file)) {
+        deniedOnce = true;
+        const error = new Error('injected transient /proc environ denial');
+        error.code = 'EACCES';
+        throw error;
+      }
+      return originalReadFileSync.call(fs, file, ...args);
+    };
+    try {
+      const result = await runner.run({ sessionId: session.externalSessionId, prompt: 'Retry transient process inspection.' });
+      assert.equal(result.status, 'DONE');
+      assert.equal(deniedOnce, true, 'test must inject EACCES on the process-environment read');
+    } finally {
+      fs.readFileSync = originalReadFileSync;
+      store.close();
+    }
+    ok('transient Linux /proc environ EACCES retries for a live process');
+  }
+
   // Timeout must TERM and then KILL the entire detached process group.
   {
     const worktree = createWorktree('timeout');
