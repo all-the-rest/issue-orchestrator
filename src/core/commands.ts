@@ -38,6 +38,7 @@ import {
   prepareEvidenceManifest,
   reconcileEvidenceBranch,
 } from '../evidence/index.js';
+import { captureCommand } from '../evidence/capture.js';
 import { databasePath, getRuntimeStore } from './persistence.js';
 import { runJournaledSideEffect, sideEffectKey, type SideEffectObservation } from './side-effects.js';
 import { getAgentRunner, type AgentRole } from '../providers/index.js';
@@ -87,6 +88,8 @@ const HELP = `Usage: issue-orchestrator <command> [args] [--config <path>]
   merge <project> <number> --owner-token <token>
                                   SHA-bound evidence/review/tests + required checks
   evidence <project> <issue> --dir <dir> --owner-token <token>
+  capture --output <file> -- <command> [args...]
+                                   portable, shell-free stdout/stderr capture
   dod verify <project> <issue> --owner-token <token> [--plan] [--report <path>]
                                   execute or plan the configured project DoD
   ensure-labels [--project <p>]
@@ -159,7 +162,17 @@ function context(cfg, project) {
   } catch (error) {
     throw new CliError(error.message);
   }
-  return { rc, tracker: getTracker(rc.tracker), codeHost: getCodeHost(rc.code_host) };
+  const adapter = getCodeHost(rc.code_host);
+  const codeHost = new Proxy(adapter, {
+    get(target, key, receiver) {
+      const value = Reflect.get(target, key, receiver);
+      if (typeof value !== 'function') return value;
+      return (args) => args && typeof args === 'object' && 'project' in args && key !== 'verifyEvidence'
+        ? value.call(target, { ...args, project: rc.code_host_project })
+        : value.call(target, args);
+    },
+  });
+  return { rc, tracker: getTracker(rc.tracker), codeHost };
 }
 
 function verifyAccount(tracker, codeHost, rc) {
@@ -571,6 +584,7 @@ function inspectPendingSideEffect(effect, opts): SideEffectObservation {
         }
         const result = reconcileEvidenceBranch({
           project,
+          codeHostProject: rc.code_host_project,
           issue: intent.issue,
           change: intent.change,
           head: intent.head,
@@ -1416,6 +1430,7 @@ function cmdMerge(opts) {
   }
   const evidenceResult = codeHost.verifyEvidence({
     project,
+    codeHostProject: rc.code_host_project,
     commit: lock.evidence_commit,
     issue: lock.issue,
     change: changeNumber,
@@ -1763,6 +1778,7 @@ function evidenceProofComment({ project, issue, change, head, evidence, report, 
     `Exact head SHA: \`${head}\``,
     `Evidence commit: \`${evidence.commit}\``,
     `Evidence class: \`${report.evidence_class}\``,
+    '**Manual review required:** confirm binary artifacts contain no customer data before sharing.',
     `Acceptance source: \`${report.acceptance_source}\``,
     '',
     '### Before/after artifacts',
@@ -1773,7 +1789,7 @@ function evidenceProofComment({ project, issue, change, head, evidence, report, 
     '',
     `Manifest: [manifest.json](${evidence.manifest})`,
     '',
-    '### Configured commands',
+    '### Exact reproduction commands and outcomes',
     '',
     '| Gate | Command (argv) | Result |',
     '| --- | --- | --- |',
@@ -1852,6 +1868,7 @@ function cmdEvidence(opts) {
   };
   const preparedEvidence = prepareEvidenceManifest({
     ...evidenceIdentity,
+    codeHostProject: rc.code_host_project,
     dir: String(opts.dir),
     evidenceClass: rc.dod.evidence_class,
     dodReport: report,
@@ -1885,6 +1902,7 @@ function cmdEvidence(opts) {
     reconcile: () => {
       const result = reconcileEvidenceBranch({
         ...evidenceIdentity,
+        codeHostProject: rc.code_host_project,
         branch: evidenceBranch,
         expectedManifest: preparedEvidence.manifest,
         rawUrl: (args) => codeHost.evidenceUrl(args),
@@ -1893,6 +1911,7 @@ function cmdEvidence(opts) {
     },
     apply: () => publishEvidence({
       project,
+      codeHostProject: rc.code_host_project,
       issue,
       change: lock.change_number,
       head: view.headRefOid,
@@ -1961,6 +1980,11 @@ function cmdEvidence(opts) {
   });
   console.log(JSON.stringify({ ...result, proof_comment: true }, null, 2));
   return 0;
+}
+
+async function cmdCapture(opts) {
+  if (typeof opts.output !== 'string' || !opts.output) throw new CliError('capture requires --output <file>');
+  return await captureCommand(opts._, opts.output);
 }
 
 const RUN_TERMINAL_STATES = new Set(['DONE', 'REVIEW', 'BLOCKED', 'NEEDS_INFO']);
@@ -3080,6 +3104,7 @@ const COMMANDS = {
   dod: cmdDodVerify,
   merge: cmdMerge,
   evidence: cmdEvidence,
+  capture: cmdCapture,
   'ensure-labels': cmdEnsureLabels,
   'capture-model': cmdCaptureModel,
   'set-model': cmdSetModel,

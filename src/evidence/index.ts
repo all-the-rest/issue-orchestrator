@@ -1,7 +1,8 @@
 import fs from 'node:fs';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
-import { git, verifyOrigin } from '../git/index.js';
+import { git, gitBuffer, verifyOrigin } from '../git/index.js';
 
 export { verifyOrigin };
 
@@ -51,21 +52,31 @@ function assertArtifactFormat(name, contents) {
   if (contents.length === 0) throw new Error(`Refusing empty evidence artifact: ${name}`);
   const lower = name.toLowerCase();
   const starts = (hex) => contents.subarray(0, hex.length / 2).equals(Buffer.from(hex, 'hex'));
-  if (lower.endsWith('.png') && !starts('89504e470d0a1a0a')) throw new Error(`Invalid PNG evidence artifact: ${name}`);
-  if ((lower.endsWith('.jpg') || lower.endsWith('.jpeg')) && !starts('ffd8ff')) throw new Error(`Invalid JPEG evidence artifact: ${name}`);
-  if (lower.endsWith('.gif') && !['GIF87a', 'GIF89a'].includes(contents.subarray(0, 6).toString('ascii'))) {
+  if (lower.endsWith('.png') && (!starts('89504e470d0a1a0a') || contents.length < 45 ||
+      contents.readUInt32BE(8) !== 13 || contents.subarray(12, 16).toString('ascii') !== 'IHDR' ||
+      contents.subarray(-8, -4).toString('ascii') !== 'IEND')) {
+    throw new Error(`Invalid PNG evidence artifact: ${name}`);
+  }
+  if ((lower.endsWith('.jpg') || lower.endsWith('.jpeg')) &&
+      (!starts('ffd8ff') || contents.length < 4 || !contents.subarray(-2).equals(Buffer.from([0xff, 0xd9])))) {
+    throw new Error(`Invalid JPEG evidence artifact: ${name}`);
+  }
+  if (lower.endsWith('.gif') && (!['GIF87a', 'GIF89a'].includes(contents.subarray(0, 6).toString('ascii')) ||
+      contents.length < 14 || contents[contents.length - 1] !== 0x3b)) {
     throw new Error(`Invalid GIF evidence artifact: ${name}`);
   }
-  if (lower.endsWith('.webp') && (contents.subarray(0, 4).toString('ascii') !== 'RIFF' || contents.subarray(8, 12).toString('ascii') !== 'WEBP')) {
+  if (lower.endsWith('.webp') && (contents.length < 20 || contents.subarray(0, 4).toString('ascii') !== 'RIFF' ||
+      contents.readUInt32LE(4) !== contents.length - 8 || contents.subarray(8, 12).toString('ascii') !== 'WEBP')) {
     throw new Error(`Invalid WebP evidence artifact: ${name}`);
   }
   if (lower.endsWith('.svg') && !/<svg\b/i.test(contents.toString('utf8', 0, Math.min(contents.length, 8192)))) {
     throw new Error(`Invalid SVG evidence artifact: ${name}`);
   }
-  if (['.mp4', '.mov'].some((ext) => lower.endsWith(ext)) && contents.subarray(4, 8).toString('ascii') !== 'ftyp') {
+  if (['.mp4', '.mov'].some((ext) => lower.endsWith(ext)) && (contents.length < 16 || contents.subarray(4, 8).toString('ascii') !== 'ftyp' ||
+      contents.readUInt32BE(0) < 16 || contents.readUInt32BE(0) > contents.length)) {
     throw new Error(`Invalid MP4-family evidence artifact: ${name}`);
   }
-  if (['.webm', '.mkv'].some((ext) => lower.endsWith(ext)) && !starts('1a45dfa3')) {
+  if (['.webm', '.mkv'].some((ext) => lower.endsWith(ext)) && (contents.length < 12 || !starts('1a45dfa3'))) {
     throw new Error(`Invalid Matroska evidence artifact: ${name}`);
   }
 }
@@ -97,10 +108,10 @@ export function validateEvidenceDirectory(dir, issue) {
   if (targets.size !== files.length) throw new Error('Evidence file names collide after safe-path normalization');
 }
 
-export function reconcileEvidenceBranch({ project, issue, change, head, branch, expectedManifest, rawUrl }) {
+export function reconcileEvidenceBranch({ project, codeHostProject = project, issue, change, head, branch, expectedManifest, rawUrl }) {
   const root = git(['rev-parse', '--show-toplevel']);
-  verifyOrigin(project, root);
-  const url = `https://github.com/${project}.git`;
+  verifyOrigin(codeHostProject, root);
+  const url = `https://github.com/${codeHostProject}.git`;
   const ref = `refs/heads/${branch}`;
   const advertised = git(['ls-remote', '--heads', url, ref], { cwd: root });
   if (!advertised) return null;
@@ -179,8 +190,12 @@ export function reconcileEvidenceBranch({ project, issue, change, head, branch, 
     if (!entry || entry.mode !== '100644' || entry.sha !== file.sha ||
         !Number.isSafeInteger(file.bytes) || file.bytes <= 0 ||
         Number(git(['cat-file', '-s', entry.sha], { cwd: root })) !== file.bytes ||
-        !/^[a-f0-9]{40}$/i.test(file.sha ?? '')) {
+        !/^[a-f0-9]{40}$/i.test(file.sha ?? '') || !/^[a-f0-9]{64}$/i.test(file.sha256 ?? '')) {
       throw new Error(`evidence branch artifact does not match its manifest: ${file.name}`);
+    }
+    const artifactBytes = gitBuffer(['cat-file', 'blob', entry.sha], { cwd: root });
+    if (artifactBytes.length !== file.bytes || createHash('sha256').update(artifactBytes).digest('hex') !== file.sha256) {
+      throw new Error(`evidence branch artifact SHA-256 does not match fetched contents: ${file.name}`);
     }
     names.add(file.name);
     if (typeof file.source === 'string') sides.add(file.source.split('/')[0]);
@@ -193,13 +208,13 @@ export function reconcileEvidenceBranch({ project, issue, change, head, branch, 
     head: head.toLowerCase(),
     branch,
     commit: remoteSha,
-    manifest: rawUrl({ project, ref: remoteSha, path: 'manifest.json' }),
+    manifest: rawUrl({ project: codeHostProject, ref: remoteSha, path: 'manifest.json' }),
     files: manifest.files.map((file) => ({
       source: file.source,
       name: file.name,
       bytes: file.bytes,
       kind: file.kind,
-      url: rawUrl({ project, ref: remoteSha, path: file.name }),
+      url: rawUrl({ project: codeHostProject, ref: remoteSha, path: file.name }),
     })),
   };
 }
@@ -209,7 +224,7 @@ export function reconcileEvidenceBranch({ project, issue, change, head, branch, 
  * head. The configured GitHub project is checked against origin; the push URL
  * itself is canonical and never inferred from an arbitrary remote.
  */
-export function prepareEvidenceManifest({ project, issue, change, head, dir, evidenceClass, dodReport }) {
+export function prepareEvidenceManifest({ project, codeHostProject = project, issue, change, head, dir, evidenceClass, dodReport }) {
   if (!project || !Number.isSafeInteger(Number(issue)) || Number(issue) <= 0) {
     throw new Error('a project and positive issue number are required');
   }
@@ -228,7 +243,7 @@ export function prepareEvidenceManifest({ project, issue, change, head, dir, evi
   }
 
   const root = git(['rev-parse', '--show-toplevel']);
-  verifyOrigin(project, root);
+  verifyOrigin(codeHostProject, root);
   validateEvidenceDirectory(dir, Number(issue));
   const files = walk(dir).sort();
   let totalBytes = 0;
@@ -246,7 +261,8 @@ export function prepareEvidenceManifest({ project, issue, change, head, dir, evi
     const safePath = relative.replace(/[^A-Za-z0-9._/-]+/g, '-');
     const target = `issue-${issue}-${safePath.replaceAll('/', '-')}`;
     const sha = git(['hash-object', '-w', '--stdin'], { cwd: root, input: contents });
-    return { source: relative, name: target, sha, bytes, kind: kind(relative) };
+    const sha256 = createHash('sha256').update(contents).digest('hex');
+    return { source: relative, name: target, sha, sha256, bytes, kind: kind(relative) };
   });
   if (new Set(entries.map((entry) => entry.name)).size !== entries.length) {
     throw new Error('Evidence file names collide after safe-path normalization');
@@ -273,6 +289,7 @@ export function publishEvidence({
   branchPrefix = 'agent-evidence',
   branch,
   preparedEvidence,
+  codeHostProject = project,
   evidenceClass,
   dodReport,
   rawUrl,
@@ -304,8 +321,8 @@ export function publishEvidence({
       manifest.evidence_class !== evidenceClass || !isDeepStrictEqual(manifest.dod_report, dodReport)) {
     throw new Error('prepared evidence manifest does not match this job');
   }
-  verifyOrigin(project, root);
-  const reconciled = reconcileEvidenceBranch({ project, issue, change, head, branch, expectedManifest: manifest, rawUrl });
+  verifyOrigin(codeHostProject, root);
+  const reconciled = reconcileEvidenceBranch({ project, codeHostProject, issue, change, head, branch, expectedManifest: manifest, rawUrl });
   if (reconciled) return reconciled;
   const manifestBytes = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`);
   const manifestSha = git(['hash-object', '-w', '--stdin'], { cwd: root, input: manifestBytes });
@@ -326,7 +343,7 @@ export function publishEvidence({
     ['commit-tree', tree, '-m', `Evidence for ${project}#${issue}, PR #${change}, head ${head}`],
     { cwd: root, env },
   );
-  git(['push', `https://github.com/${project}.git`, `${commit}:refs/heads/${branch}`], { cwd: root });
+  git(['push', `https://github.com/${codeHostProject}.git`, `${commit}:refs/heads/${branch}`], { cwd: root });
 
   return {
     project,
@@ -335,13 +352,13 @@ export function publishEvidence({
     head: head.toLowerCase(),
     branch,
     commit,
-    manifest: rawUrl({ project, ref: commit, path: 'manifest.json' }),
+    manifest: rawUrl({ project: codeHostProject, ref: commit, path: 'manifest.json' }),
     files: entries.map((entry) => ({
       source: entry.source,
       name: entry.name,
       bytes: entry.bytes,
       kind: entry.kind,
-      url: rawUrl({ project, ref: commit, path: entry.name }),
+      url: rawUrl({ project: codeHostProject, ref: commit, path: entry.name }),
     })),
   };
 }

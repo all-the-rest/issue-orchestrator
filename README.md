@@ -45,12 +45,17 @@ issue-orchestrator run --once [--project <owner/repo>] [--dry-run]
 issue-orchestrator claim <project> <issue>
 issue-orchestrator checkpoint <stage> --owner-token <token>
 issue-orchestrator dod verify <project> <issue> --owner-token <token> [--plan]
-issue-orchestrator evidence <project> <issue> --dir <dir> --owner-token <token>
+  issue-orchestrator evidence <project> <issue> --dir <dir> --owner-token <token>
+  issue-orchestrator capture --output <file> -- <command> [args...]
 issue-orchestrator release --owner-token <token>
 ```
 
 Run `issue-orchestrator --help` for the full command list. All commands accept
 `--config <path>`; commands that print text by default accept `--json`.
+`capture` runs argv directly with `shell: false`, tees stdout/stderr to the
+terminal and a new output file, and writes a JSON sidecar with the exact argv and
+exit status; it uses Node streams and does not depend on platform-specific
+`script` flags.
 
 `run --once` resumes an active claim or selects one open issue from enabled
 repositories, ordered by configured severity and age, and skips issues without

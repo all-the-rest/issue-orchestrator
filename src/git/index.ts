@@ -73,6 +73,22 @@ export function git(
   return (result.stdout || '').trim();
 }
 
+export function gitBuffer(args: string[], { cwd }: { cwd?: string } = {}) {
+  if (args.some((argument) => /^-c(?:$|.+)|^--config-env(?:=|$)/.test(argument))) {
+    throw new Error('git helper does not permit caller-supplied command-scope configuration');
+  }
+  const env = { ...process.env };
+  for (const key of Object.keys(env)) {
+    if (/^GIT_CONFIG_(?:COUNT|PARAMETERS|KEY_\d+|VALUE_\d+)$/i.test(key)) delete env[key];
+  }
+  const result = spawnSync('git', [
+    '-c', `core.hooksPath=${trustedEmptyHooksDirectory()}`, '-c', 'core.fsmonitor=false', ...args,
+  ], { cwd, env, encoding: 'buffer' });
+  if (result.error) throw result.error;
+  if (result.status !== 0) throw new Error(`git ${args.join(' ')} failed: ${result.stderr.toString('utf8').trim()}`);
+  return result.stdout;
+}
+
 export function verifyOrigin(project: string, root = git(['rev-parse', '--show-toplevel'])) {
   let remote: string;
   try {
