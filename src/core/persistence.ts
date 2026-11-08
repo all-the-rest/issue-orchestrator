@@ -660,10 +660,18 @@ export class SQLiteStore {
       this.db.prepare('INSERT INTO mutation_guards(id, owner_token, pid, acquired_at) VALUES (1, ?, ?, ?)')
         .run(ownerToken, process.pid, nowIso());
     });
+    const release = () => this.transaction(() =>
+      this.db.prepare('DELETE FROM mutation_guards WHERE id=1 AND owner_token=?').run(ownerToken));
     try {
-      return fn();
-    } finally {
-      this.transaction(() => this.db.prepare('DELETE FROM mutation_guards WHERE id=1 AND owner_token=?').run(ownerToken));
+      const result = fn();
+      if (result && typeof (result as { then?: unknown }).then === 'function') {
+        return (result as Promise<unknown>).finally(release) as T;
+      }
+      release();
+      return result;
+    } catch (error) {
+      release();
+      throw error;
     }
   }
 
@@ -1016,6 +1024,40 @@ export class SQLiteStore {
     });
   }
 
+  checkpointImplementation(lock: Lock) {
+    if (!/^[a-f0-9]{40}$/i.test(lock.head_sha ?? '') || !lock.branch) {
+      throw new Error('implementation checkpoint requires a branch and full head SHA');
+    }
+    return this.transaction(() => {
+      const job = asSqlRow<SqlRow>(this.db.prepare(`
+        SELECT id, workflow_state, head_sha, branch FROM jobs
+        WHERE owner_token=? AND state IN ('CLAIMED', 'RUNNING')
+      `).get(lock.owner_token));
+      if (!job) throw new Error('Queue lock ownership changed; refusing implementation checkpoint');
+      const jobId = Number(job.id);
+      if (job.workflow_state === 'IMPLEMENTED') {
+        if (String(job.head_sha ?? '').toLowerCase() !== lock.head_sha.toLowerCase() || job.branch !== lock.branch) {
+          throw new Error('Existing implementation checkpoint differs from the committed head');
+        }
+        return lock;
+      }
+      if (job.workflow_state !== 'IMPLEMENTING') {
+        throw new Error(`Cannot checkpoint implementation from workflow state ${String(job.workflow_state)}`);
+      }
+      const stamp = lock.updated_at ?? nowIso();
+      this.db.prepare(`
+        UPDATE jobs SET stage=?, branch=?, head_sha=?, updated_at=?, heartbeat_at=?, lease_expires_at=?
+        WHERE id=? AND owner_token=?
+      `).run(
+        lock.stage ?? 'implemented', lock.branch, lock.head_sha.toLowerCase(), stamp, nowIso(),
+        new Date(Date.now() + DEFAULT_LEASE_MS).toISOString(), jobId, lock.owner_token,
+      );
+      this.db.prepare('UPDATE runtime_state SET last_run=? WHERE active_job_id=?').run(stamp, jobId);
+      this.transitionWorkflowInTransaction(jobId, 'IMPLEMENTED', 'agent', 'builder committed a clean issue-branch change');
+      return lock;
+    });
+  }
+
   transitionWorkflow(ownerToken: string, to: WorkflowState, actor: WorkflowActor, reason: string) {
     return this.transaction(() => {
       const active = asSqlRow<IdRow>(this.db.prepare(
@@ -1312,6 +1354,19 @@ export class SQLiteStore {
       createdAt: row.created_at,
       updatedAt: row.updated_at,
     };
+  }
+
+  agentSessionsForJobRole(jobId: number, role: string): PersistedAgentSession[] {
+    const rows = asSqlRows<AgentSessionRow>(this.db.prepare(`
+      SELECT * FROM agent_sessions WHERE job_id=? AND role=? ORDER BY id
+    `).all(jobId, role));
+    const sessions: PersistedAgentSession[] = [];
+    for (const row of rows) {
+      if (typeof row.external_session_id !== 'string') continue;
+      const session = this.getAgentSession(row.external_session_id);
+      if (session) sessions.push(session);
+    }
+    return sessions;
   }
 
   claimAgentSession(input: {

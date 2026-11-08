@@ -1,4 +1,3 @@
-import { spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -41,13 +40,19 @@ export interface DodReport {
   worktree_failure: string | null;
 }
 
-interface SpawnResult {
+export interface DodCommandExecution {
   error?: Error & { code?: string };
   status: number | null;
   signal: NodeJS.Signals | null;
   stdout: Buffer;
   stderr: Buffer;
 }
+
+export type DodCommandExecutor = (input: {
+  category: DodCategory;
+  argv: string[];
+  timeoutMs: number;
+}) => DodCommandExecution;
 
 export function stableJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
@@ -77,8 +82,8 @@ export function executeDodCommands({
   acceptanceSource,
   acceptanceText,
   dod,
-  cwd = process.cwd(),
   plan = false,
+  executeCommand,
 }: {
   project: string;
   issue: number;
@@ -87,10 +92,13 @@ export function executeDodCommands({
   acceptanceSource: string;
   acceptanceText: string;
   dod: { commands: DodCommands; timeout_ms?: number };
-  cwd?: string;
   plan?: boolean;
+  executeCommand?: DodCommandExecutor;
 }): DodReport {
   const timeoutMs = dod.timeout_ms ?? 300_000;
+  if (!plan && Object.values(dod.commands).some((argv) => argv !== null) && !executeCommand) {
+    throw new Error('DoD command execution requires an OCI-sandboxed executor');
+  }
   const commands: Partial<Record<DodCategory, DodCommandResult>> = {};
   let failed = false;
   for (const category of DOD_CATEGORIES) {
@@ -109,24 +117,9 @@ export function executeDodCommands({
       };
       continue;
     }
-    let result: SpawnResult;
+    let result: DodCommandExecution;
     try {
-      const spawned = spawnSync(argv[0], argv.slice(1), {
-        shell: false,
-        cwd,
-        encoding: 'buffer',
-        timeout: timeoutMs,
-        killSignal: 'SIGKILL',
-        maxBuffer: MAX_DOD_OUTPUT_BYTES,
-        windowsHide: true,
-      });
-      result = {
-        error: spawned.error,
-        status: spawned.status,
-        signal: spawned.signal,
-        stdout: Buffer.isBuffer(spawned.stdout) ? spawned.stdout : Buffer.alloc(0),
-        stderr: Buffer.isBuffer(spawned.stderr) ? spawned.stderr : Buffer.alloc(0),
-      };
+      result = executeCommand!({ category, argv: [...argv], timeoutMs });
     } catch (error) {
       result = {
         error: error instanceof Error ? error as Error & { code?: string } : new Error(String(error)),

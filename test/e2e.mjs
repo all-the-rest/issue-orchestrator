@@ -29,6 +29,9 @@ const GH_LOG = path.join(TMP, 'gh.log');
 const WORK = path.join(TMP, 'work');
 const ORIGIN = path.join(TMP, 'origin.git');
 const EVIDENCE = path.join(TMP, 'artifacts');
+const DOD_STORE = path.join(TMP, 'pnpm-store', 'store', 'v3');
+const UNRELATED_STORE_SENTINEL = path.join(DOD_STORE, 'unrelated-private-package.txt');
+const DOD_SCOPE_INSTALL_LOG = path.join(FIX, 'dod-scope-installs.ndjson');
 const HEAD_SHA = '1111111111111111111111111111111111111111';
 const EVIDENCE_COMMIT = '2222222222222222222222222222222222222222';
 const DOD_CONFIG = {
@@ -79,6 +82,65 @@ function dodReport({ project = 'reisi007/demo', issue = 1, head = HEAD_SHA, acce
 
 fs.mkdirSync(BIN, { recursive: true });
 fs.mkdirSync(FIX, { recursive: true });
+fs.mkdirSync(DOD_STORE, { recursive: true });
+write(UNRELATED_STORE_SENTINEL, 'unrelated private package contents');
+
+write(path.join(BIN, 'pnpm'), `#!/usr/bin/env node
+import fs from 'node:fs';
+import path from 'node:path';
+const args = process.argv.slice(2);
+if (args[0] === 'store' && args[1] === 'path') {
+  process.stdout.write(${JSON.stringify(DOD_STORE)} + String.fromCharCode(10));
+} else if (args[0] === 'install') {
+  const cacheStat = fs.statSync(process.env.XDG_CACHE_HOME);
+  fs.appendFileSync(${JSON.stringify(DOD_SCOPE_INSTALL_LOG)}, JSON.stringify({
+    args,
+    cwd: process.cwd(),
+    cacheMode: cacheStat.mode & 0o777,
+    env: {
+      HOME: process.env.HOME,
+      XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME,
+      XDG_CACHE_HOME: process.env.XDG_CACHE_HOME,
+      COREPACK_HOME: process.env.COREPACK_HOME,
+      NODE_OPTIONS: process.env.NODE_OPTIONS,
+      npm_config_userconfig: process.env.npm_config_userconfig,
+      npm_config_globalconfig: process.env.npm_config_globalconfig,
+      npm_config_cache: process.env.npm_config_cache,
+    },
+  }) + String.fromCharCode(10));
+  const dependency = path.join(process.cwd(), 'node_modules', '.pnpm', 'safe-fixture@1.0.0', 'node_modules', 'safe-fixture');
+  fs.mkdirSync(dependency, { recursive: true });
+  fs.writeFileSync(path.join(dependency, 'package.json'), JSON.stringify({ name: 'safe-fixture', version: '1.0.0' }));
+} else {
+  process.stderr.write('unsupported fake pnpm invocation' + String.fromCharCode(10));
+  process.exit(2);
+}
+`);
+fs.chmodSync(path.join(BIN, 'pnpm'), 0o755);
+
+write(path.join(BIN, 'docker'), `#!/usr/bin/env node
+import fs from 'node:fs';
+import path from 'node:path';
+const args = process.argv.slice(2);
+if (args[0] === 'image' && args[1] === 'inspect') process.stdout.write('sha256:' + 'a'.repeat(64) + String.fromCharCode(10));
+else if (args[0] === 'info') process.stdout.write('[]' + String.fromCharCode(10));
+else if (args[0] === 'container' && args[1] === 'ls') {
+  fs.appendFileSync(${JSON.stringify(path.join(FIX, 'oci-dod-cleanups.ndjson'))}, JSON.stringify(args) + String.fromCharCode(10));
+  process.stdout.write('');
+}
+else if (args[0] === 'run') {
+  const category = args.find((arg) => arg.startsWith('--label=issue-orchestrator.dod.category='))?.split('=').at(-1);
+  if (!category) process.exit(0);
+  fs.appendFileSync(${JSON.stringify(path.join(FIX, 'oci-dod.ndjson'))}, JSON.stringify({ args, category }) + String.fromCharCode(10));
+  const results = JSON.parse(fs.readFileSync(${JSON.stringify(path.join(FIX, 'dod-results.json'))}, 'utf8'));
+  const result = results[category] || {};
+  if (result.sleep_ms) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, result.sleep_ms);
+  if (result.stdout) process.stdout.write(result.stdout);
+  if (result.stderr) process.stderr.write(result.stderr);
+  process.exit(Number(result.exit_code || 0));
+}
+`);
+fs.chmodSync(path.join(BIN, 'docker'), 0o755);
 
 let passed = 0;
 function ok(name) {
@@ -87,6 +149,7 @@ function ok(name) {
 }
 
 function run(args, { env = {}, cwd = TMP } = {}) {
+  write(path.join(FIX, 'dod-results.json'), env.FAKE_DOD_RESULTS || '{}');
   const result = spawnSync(process.execPath, [CLI, ...args], {
     cwd,
     encoding: 'utf8',
@@ -104,6 +167,7 @@ function run(args, { env = {}, cwd = TMP } = {}) {
 }
 
 function runAsync(args, { env = {}, cwd = TMP } = {}) {
+  write(path.join(FIX, 'dod-results.json'), env.FAKE_DOD_RESULTS || '{}');
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [CLI, ...args], {
       cwd,
@@ -125,6 +189,15 @@ function runAsync(args, { env = {}, cwd = TMP } = {}) {
     child.on('error', reject);
     child.on('close', (code) => resolve({ code, out: out.trim(), err: err.trim() }));
   });
+}
+
+function waitFor(predicate, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+  }
+  throw new Error('timed out waiting for fixture condition');
 }
 
 function runOk(args, options) {
@@ -1298,7 +1371,34 @@ git(['init', '--bare', '-q', ORIGIN]);
 git(['init', '-q', WORK]);
 git(['config', 'user.name', 'Test'], { cwd: WORK });
 git(['config', 'user.email', 'test@example.test'], { cwd: WORK });
-git(['commit', '--allow-empty', '-m', 'fixture base'], { cwd: WORK });
+write(path.join(WORK, 'package.json'), {
+  name: 'dod-sandbox-fixture',
+  version: '1.0.0',
+  private: true,
+  devDependencies: { 'safe-fixture': '1.0.0' },
+});
+write(path.join(WORK, 'pnpm-lock.yaml'), `lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+  .:
+    devDependencies:
+      safe-fixture:
+        specifier: 1.0.0
+        version: 1.0.0
+
+packages:
+  safe-fixture@1.0.0:
+    resolution: {integrity: sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==}
+
+snapshots:
+  safe-fixture@1.0.0: {}
+`);
+git(['add', 'package.json', 'pnpm-lock.yaml'], { cwd: WORK });
+git(['commit', '-m', 'fixture base'], { cwd: WORK });
 git(['checkout', '-qb', 'fix/evidence'], { cwd: WORK });
 git(['remote', 'add', 'origin', 'git@github.com:reisi007/demo.git'], { cwd: WORK });
 const evidenceHead = git(['rev-parse', 'HEAD'], { cwd: WORK });
@@ -1460,7 +1560,10 @@ setProjectDod((dod) => {
   dod.commands.security = ['node', '-e', 'process.exit(0)'];
   dod.timeout_ms = 2000;
 });
-const successfulDod = json(runOk([...dodArgs, '--report', externalReport], { cwd: WORK, env: evidenceEnv }));
+const successfulDod = json(runOk([...dodArgs, '--report', externalReport], {
+  cwd: WORK,
+  env: { ...evidenceEnv, FAKE_DOD_RESULTS: JSON.stringify({ build: { stdout: 'build-output' }, test: { stderr: 'test-output' } }) },
+}));
 assert.equal(successfulDod.overall, 'passed');
 assert.equal(successfulDod.commands.build.status, 'executed');
 assert.equal(successfulDod.commands.build.stdout, 'build-output');
@@ -1468,11 +1571,128 @@ assert.equal(successfulDod.commands.test.stderr, 'test-output');
 assert.equal(successfulDod.commands.lint.status, 'skipped');
 assert.equal(successfulDod.commands.security.exit_code, 0);
 
+const hostSentinel = path.join(TMP, 'dod-host-sentinel');
+const hostSecret = path.join(TMP, 'host-secret.txt');
+const hostConfig = path.join(TMP, 'host-config.json');
+const hostHome = path.join(TMP, 'host-home');
+const hostXdgConfig = path.join(TMP, 'host-xdg-config');
+const hostXdgCache = path.join(TMP, 'host-xdg-cache');
+const unrelatedStoreCopy = path.join(WORK, 'unrelated-store-copy.txt');
+write(hostSentinel, 'unchanged');
+write(hostSecret, 'host-only-secret');
+write(hostConfig, { private: true });
+fs.mkdirSync(hostHome, { recursive: true });
+fs.mkdirSync(hostXdgConfig, { recursive: true });
+fs.mkdirSync(hostXdgCache, { recursive: true });
+setProjectDod((dod) => {
+  dod.commands.build = ['node', '-e', `const fs=require('node:fs');fs.writeFileSync(${JSON.stringify(hostSentinel)},'tampered');fs.copyFileSync('/pnpm-store/v11/unrelated-private-package.txt',${JSON.stringify(unrelatedStoreCopy)})`];
+});
+const secureTraceStart = fs.readFileSync(path.join(FIX, 'oci-dod.ndjson'), 'utf8').trim().split('\n').filter(Boolean).length;
+const cleanupTraceStart = fs.readFileSync(path.join(FIX, 'oci-dod-cleanups.ndjson'), 'utf8').trim().split('\n').filter(Boolean).length;
+const scopeInstallStart = fs.existsSync(DOD_SCOPE_INSTALL_LOG)
+  ? fs.readFileSync(DOD_SCOPE_INSTALL_LOG, 'utf8').trim().split('\n').filter(Boolean).length
+  : 0;
+runOk([...dodArgs, '--report', externalReport], {
+  cwd: WORK,
+  env: {
+    ...evidenceEnv,
+    HOME: hostHome,
+    XDG_CONFIG_HOME: hostXdgConfig,
+    XDG_CACHE_HOME: hostXdgCache,
+    AWS_SECRET_ACCESS_KEY: 'host-secret-value',
+    FAKE_HOST_SECRET_FILE: hostSecret,
+    FAKE_HOST_CONFIG_FILE: hostConfig,
+  },
+});
+assert.equal(fs.readFileSync(hostSentinel, 'utf8'), 'unchanged', 'DoD code must not run with host filesystem access');
+assert.equal(fs.existsSync(unrelatedStoreCopy), false, 'a DoD command cannot copy unrelated global-store contents into the worktree');
+const secureRuns = fs.readFileSync(path.join(FIX, 'oci-dod.ndjson'), 'utf8').trim().split('\n').filter(Boolean)
+  .slice(secureTraceStart).map((line) => JSON.parse(line));
+const secureBuild = secureRuns.find((entry) => entry.category === 'build');
+assert.ok(secureBuild, 'DoD build must run through the OCI runtime');
+const cleanupRuns = fs.readFileSync(path.join(FIX, 'oci-dod-cleanups.ndjson'), 'utf8').trim().split('\n').filter(Boolean)
+  .slice(cleanupTraceStart).map((line) => JSON.parse(line));
+assert.ok(cleanupRuns.some((args) => args.some((arg) => arg.startsWith('--filter=label=issue-orchestrator.session=')) &&
+  !args.some((arg) => arg.startsWith('--filter=label=issue-orchestrator.execution='))),
+  'a resumed DoD run must remove containers left by an earlier execution ID');
+assert.ok(secureBuild.args.includes('--network=none'));
+assert.ok(secureBuild.args.includes('--read-only'));
+const dodMounts = secureBuild.args.filter((arg) => arg.startsWith('--mount='));
+assert.equal(dodMounts.length, 2, 'only the worktree and this repository’s scoped dependencies may be mounted');
+assert.ok(dodMounts.some((mount) => mount.includes(`source=${fs.realpathSync(WORK)},target=/workspace`)));
+const scopedModulesMount = dodMounts.find((mount) => mount.includes(',target=/workspace/node_modules'));
+assert.ok(scopedModulesMount?.endsWith(',readonly'));
+assert.equal(dodMounts.some((mount) => mount.includes(`source=${fs.realpathSync(DOD_STORE)}`) ||
+  mount.includes('/pnpm-store/v11')), false, 'the global pnpm store and its contents are never mounted');
+assert.equal(dodMounts.some((mount) => mount.includes(hostSecret) || mount.includes(hostConfig) || mount.includes(hostHome)), false);
+assert.equal(dodMounts.find((mount) => mount.includes(',target=/workspace'))?.endsWith(',readonly'), false,
+  'the worktree is the only writable host bind mount');
+const stagedRoot = scopedModulesMount.slice('--mount=type=bind,source='.length).split(',target=')[0];
+assert.ok(stagedRoot.startsWith(path.join(fs.realpathSync(TMP), 'dod-dependencies-')));
+assert.equal(fs.existsSync(stagedRoot), false, 'run-scoped dependency files are removed after verification');
+const scopeInstalls = fs.readFileSync(DOD_SCOPE_INSTALL_LOG, 'utf8').trim().split('\n').filter(Boolean)
+  .slice(scopeInstallStart).map((line) => JSON.parse(line));
+const scopedInstall = scopeInstalls.at(-1);
+assert.ok(scopedInstall, 'locked dependencies were staged before container execution');
+for (const flag of ['--offline', '--frozen-lockfile', '--ignore-scripts', '--ignore-pnpmfile', '--package-import-method=copy']) {
+  assert.ok(scopedInstall.args.includes(flag), `scoped dependency prep requires ${flag}`);
+}
+assert.ok(scopedInstall.args.includes(`--store-dir=${fs.realpathSync(DOD_STORE)}`),
+  'the host-only installer may read the global cache to create the scoped copy');
+assert.equal(scopedInstall.cwd, path.dirname(stagedRoot), 'dependency installation occurs in a private run-scoped directory');
+assert.equal(scopedInstall.env.HOME, path.join(path.dirname(stagedRoot), 'home'));
+assert.equal(scopedInstall.env.XDG_CONFIG_HOME, path.join(path.dirname(stagedRoot), 'config'));
+assert.equal(scopedInstall.env.XDG_CACHE_HOME, path.join(path.dirname(stagedRoot), 'cache'));
+assert.notEqual(scopedInstall.env.XDG_CACHE_HOME, hostXdgCache, 'pnpm must not inherit the host XDG cache');
+assert.equal(scopedInstall.cacheMode, 0o700, 'the private pnpm cache directory must be mode 0700');
+assert.equal(scopedInstall.env.COREPACK_HOME, undefined);
+assert.equal(scopedInstall.env.NODE_OPTIONS, undefined);
+assert.equal(scopedInstall.env.npm_config_userconfig, '/dev/null');
+assert.equal(scopedInstall.env.npm_config_globalconfig, '/dev/null');
+assert.equal(scopedInstall.env.npm_config_cache, undefined);
+const entrypointIndex = secureBuild.args.indexOf('--entrypoint');
+assert.ok(entrypointIndex >= 0);
+assert.equal(secureBuild.args[entrypointIndex + 1], 'node', 'configured argv uses its executable directly, not /bin/sh -c');
+assert.equal(secureBuild.args.slice(entrypointIndex + 1).includes('/bin/sh'), false);
+assert.equal(secureBuild.args.some((arg) => arg.includes('AWS_SECRET_ACCESS_KEY') || arg.includes('host-secret-value') ||
+  arg.includes('FAKE_HOST_SECRET_FILE') || arg.includes('FAKE_HOST_CONFIG_FILE')), false,
+  'host secrets, test environment, and host config paths must not be forwarded into the command container');
+ok('DoD commands see only copied locked dependencies, never the global store or its unrelated sentinel');
+
+setProjectDod((dod) => {
+  dod.commands.build = ['node', '-e', 'process.exit(0)'];
+  dod.timeout_ms = 5000;
+});
+const delayedDodResults = JSON.stringify({ build: { sleep_ms: 2500 } });
+const concurrentRunStart = fs.readFileSync(path.join(FIX, 'oci-dod.ndjson'), 'utf8').trim().split('\n').filter(Boolean).length;
+const activeDod = runAsync([...dodArgs, '--report', externalReport], {
+  cwd: WORK,
+  env: { ...evidenceEnv, FAKE_DOD_RESULTS: delayedDodResults },
+});
+waitFor(() => fs.readFileSync(path.join(FIX, 'oci-dod.ndjson'), 'utf8').trim().split('\n').filter(Boolean)
+  .slice(concurrentRunStart).some((line) => JSON.parse(line).category === 'build'));
+const cleanupCountWhileActive = fs.readFileSync(path.join(FIX, 'oci-dod-cleanups.ndjson'), 'utf8')
+  .trim().split('\n').filter(Boolean).length;
+const refusedConcurrentDod = run([...dodArgs, '--report', externalReport], {
+  cwd: WORK,
+  env: { ...evidenceEnv, FAKE_DOD_RESULTS: delayedDodResults },
+});
+assert.notEqual(refusedConcurrentDod.code, 0);
+assert.match(refusedConcurrentDod.err, /another queue mutation is in progress/);
+assert.equal(fs.readFileSync(path.join(FIX, 'oci-dod-cleanups.ndjson'), 'utf8').trim().split('\n').filter(Boolean).length,
+  cleanupCountWhileActive, 'the refused invocation must not run session-wide OCI cleanup');
+const activeDodResult = await activeDod;
+assert.equal(activeDodResult.code, 0, activeDodResult.err || activeDodResult.out);
+ok('the global async mutation guard serializes standalone dod verify before OCI cleanup can touch a live run');
+
 const reportBeforeSecretOutput = fs.readFileSync(externalReport, 'utf8');
 setProjectDod((dod) => {
   dod.commands.build = ['node', '-e', 'process.stdout.write(String.fromCharCode(71,72,85,66,95,84,79,75,69,78,61,103,104,112,95,...Array.from({length:40},(_,i)=>49+i%9)))'];
 });
-const secretOutputRun = runRefused([...dodArgs, '--report', externalReport], { cwd: WORK, env: evidenceEnv });
+const secretOutputRun = runRefused([...dodArgs, '--report', externalReport], {
+  cwd: WORK,
+  env: { ...evidenceEnv, FAKE_DOD_RESULTS: JSON.stringify({ build: { stdout: 'GHUB_TOKEN=ghp_123456789012345678901234567890123456789' } }) },
+});
 assert.match(secretOutputRun.err, /credential-like output/);
 assert.equal(secretOutputRun.out, '', 'credential-like command output must not be printed to the terminal');
 assert.equal(fs.readFileSync(externalReport, 'utf8'), reportBeforeSecretOutput,
@@ -1485,7 +1705,13 @@ setProjectDod((dod) => {
   dod.commands.test = ['node', '-e', 'process.exit(7)'];
   dod.commands.security = ['node', '-e', `require('node:fs').writeFileSync(${JSON.stringify(afterFailureMarker)},'ran')`];
 });
-const failedDodRun = runRefused([...dodArgs, '--report', externalReport], { cwd: WORK, env: evidenceEnv });
+const failureTraceStart = fs.existsSync(path.join(FIX, 'oci-dod.ndjson'))
+  ? fs.readFileSync(path.join(FIX, 'oci-dod.ndjson'), 'utf8').trim().split('\n').filter(Boolean).length
+  : 0;
+const failedDodRun = runRefused([...dodArgs, '--report', externalReport], {
+  cwd: WORK,
+  env: { ...evidenceEnv, FAKE_DOD_RESULTS: JSON.stringify({ test: { exit_code: 7 } }) },
+});
 assert.match(failedDodRun.err, /DoD commands failed: test/);
 assert.equal(failedDodRun.err.split('\n').length, 1);
 const failedDodReport = json(failedDodRun);
@@ -1493,7 +1719,10 @@ assert.equal(failedDodReport.commands.test.exit_code, 7);
 assert.equal(failedDodReport.commands.test.status, 'executed');
 assert.equal(failedDodReport.commands.test.passed, false);
 assert.equal(failedDodReport.commands.security.status, 'executed');
-assert.equal(fs.readFileSync(afterFailureMarker, 'utf8'), 'ran', 'later categories must run after a failed gate');
+assert.equal(fs.existsSync(afterFailureMarker), false, 'configured test commands must never execute on the host');
+const failureTrace = fs.readFileSync(path.join(FIX, 'oci-dod.ndjson'), 'utf8').trim().split('\n').filter(Boolean)
+  .slice(failureTraceStart).map((line) => JSON.parse(line));
+assert.ok(failureTrace.some((entry) => entry.category === 'security'), 'later sandbox gates run after a failed gate');
 
 setProjectDod((dod) => {
   dod.commands.test = ['node', '-e', 'process.exit(0)'];
@@ -1501,7 +1730,10 @@ setProjectDod((dod) => {
   dod.commands.lint = ['node', '-e', 'setTimeout(() => {}, 10000)'];
   dod.timeout_ms = 1000;
 });
-const timeoutDodRun = runRefused([...dodArgs, '--report', externalReport], { cwd: WORK, env: evidenceEnv });
+const timeoutDodRun = runRefused([...dodArgs, '--report', externalReport], {
+  cwd: WORK,
+  env: { ...evidenceEnv, FAKE_DOD_RESULTS: JSON.stringify({ lint: { sleep_ms: 1500 } }) },
+});
 const timeoutReport = json(timeoutDodRun);
 assert.equal(timeoutReport.commands.lint.status, 'executed');
 assert.equal(timeoutReport.commands.lint.timed_out, true);
@@ -1511,7 +1743,10 @@ assert.match(timeoutDodRun.err, /DoD commands failed: lint/);
 setProjectDod((dod) => {
   dod.commands.lint = ['node', '-e', "process.stdout.write('x'.repeat(50000))"];
 });
-const oversizedOutputRun = runRefused([...dodArgs, '--report', externalReport], { cwd: WORK, env: evidenceEnv });
+const oversizedOutputRun = runRefused([...dodArgs, '--report', externalReport], {
+  cwd: WORK,
+  env: { ...evidenceEnv, FAKE_DOD_RESULTS: JSON.stringify({ lint: { stdout: 'x'.repeat(50000) } }) },
+});
 const oversizedOutputReport = json(oversizedOutputRun);
 assert.ok(Buffer.byteLength(oversizedOutputReport.commands.lint.stdout) <= 32 * 1024);
 assert.equal(oversizedOutputReport.commands.lint.output_limit_exceeded, true);
