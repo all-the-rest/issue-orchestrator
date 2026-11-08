@@ -8,10 +8,12 @@ work: triage, implementation, verification and review.
 OpenCode is the first intended agent backend, not a dependency of the core.
 
 > **Status:** early `v0.1`. The deterministic core has been extracted from the
-> `git-issue-agent` skill. SQLite persistence and the replaceable OpenCode
-> `AgentRunner` adapter are in place; the full orchestration `run` loop remains
-> a follow-up. Agent builder commands run only through the disposable OCI
-> sandbox and fail closed unless the fixed Node 24/pnpm image is already present.
+> `git-issue-agent` skill. SQLite persistence, the replaceable OpenCode
+> `AgentRunner`, and a first `run --once` orchestration slice are in place. The
+> run loop currently supports GitHub with OpenCode; other provider adapters
+> remain fail-closed stubs. Agent builder commands run only through the
+> disposable OCI sandbox and fail closed unless the fixed Node 24/pnpm image is
+> already present.
 
 ## Requirements
 
@@ -39,6 +41,7 @@ needed. It runs on macOS and Linux in CI.
 ```sh
 issue-orchestrator status
 issue-orchestrator list
+issue-orchestrator run --once [--project <owner/repo>] [--dry-run]
 issue-orchestrator claim <project> <issue>
 issue-orchestrator checkpoint <stage> --owner-token <token>
 issue-orchestrator dod verify <project> <issue> --owner-token <token> [--plan]
@@ -48,6 +51,25 @@ issue-orchestrator release --owner-token <token>
 
 Run `issue-orchestrator --help` for the full command list. All commands accept
 `--config <path>`; commands that print text by default accept `--json`.
+
+`run --once` resumes an active claim or selects one open issue from enabled
+repositories, ordered by configured severity and age, and skips issues without
+a configured trusted author. It isolates work in a private runtime Git
+worktree, runs triage, baseline and after verification, an OCI-isolated builder,
+the configured DoD commands, evidence publication, and an independent review.
+The issue body or the configured trusted triage comment is passed to agents as
+acceptance data, not executable instructions. Use `--project` to restrict issue
+discovery. `--dry-run` prints the selected issue and plan without opening or
+mutating SQLite, claiming work, creating a branch, or writing to GitHub.
+
+Possible JSON outcomes include `NO_ISSUE`, `DRY_RUN`, and `DONE`; `REVIEW`,
+`BLOCKED`, and `NEEDS_INFO` hand the issue back for human action. Handover
+preserves the branch/worktree and releases the queue claim. Unexpected failures
+or unavailable dependencies fail closed and retain the active claim and
+artifacts for recovery. Automatic merge is attempted only when enabled and
+after the existing exact-head native-approval, machine-marker, DoD, and required
+check gates pass. With `auto_merge: false`, the run always hands off for human
+review.
 
 Exit codes: `0` done/green, `1` refused/failed, `2` config missing or invalid,
 `8` checks pending.

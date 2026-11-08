@@ -88,6 +88,33 @@ The selected tracker/code-host pair is persisted with active work and checked
 during recovery. Changing the pair while a journaled write is pending therefore
 leaves the effect uncertain instead of replaying it against a different system.
 
+## `run --once`
+
+The first end-to-end orchestration path is `issue-orchestrator run --once`.
+It resumes an active claim or discovers one trusted open issue across enabled
+repositories (optionally restricted with `--project`), then uses the configured
+OpenCode `AgentRunner` in a private runtime worktree. The path runs triage,
+before/after read-only verification, an isolated builder, configured DoD argv
+gates, journaled branch push and change-request creation/reconciliation,
+evidence publication, and independent review. Acceptance text selected by
+`dod.acceptance_source` is supplied as serialized data, never as agent
+instructions; all issue/comment text remains explicitly untrusted.
+
+`--dry-run` reports the selected issue and intended gates without opening or
+mutating SQLite, acquiring a claim, creating a branch, or writing to the
+provider. Terminal outcomes are `DONE`, `REVIEW`, `BLOCKED`, and `NEEDS_INFO`;
+human handovers preserve the worktree and release the global claim. Unexpected
+errors, mismatched state, and unavailable builder/runtime dependencies fail
+closed and retain the claim and recovery artifacts. Merge is delegated to the
+existing gate only when `auto_merge` is enabled; it still requires trusted
+native approval on the exact head, exact-head machine markers, and every
+provider/configured required check to pass. With `auto_merge` disabled, a
+review handover is posted instead.
+
+This vertical slice currently has end-to-end support for GitHub and the
+OpenCode runner. GitLab and Jira remain fail-closed stubs; this does not imply
+that their adapters can run the workflow.
+
 ## OpenCode AgentRunner
 
 `AgentRunner` is an asynchronous port: `createSession`, `run`, `resume`,
@@ -207,4 +234,4 @@ attempts to modify the read-only shared and per-worktree Git configs, plants a
 shared-Git `pre-push` hook, then confirms a later host-side push leaves the hook
 inert. The default hermetic suite uses a fake runtime and needs no OCI daemon or
 network.
-This adapter does not add the orchestration loop tracked separately by issue #7.
+The adapter is used by the `run --once` orchestration path described above.

@@ -4,13 +4,14 @@ import { withMutationGuard } from './core/config.js';
 import { VERSION } from './version.js';
 
 const GUARDED = new Set([
+  'run', 'dod',
   'claim', 'resume-lock', 'checkpoint', 'release', 'label', 'comment',
   'change-create', 'merge', 'evidence', 'ensure-labels',
 ]);
 
 const [command = 'help', ...rest] = process.argv.slice(2);
 
-function main(): number {
+async function main(): Promise<number> {
   const opts = parseArgs(rest);
   if (opts['no-switch']) {
     throw new CliError('--no-switch was removed; the configured active CLI account is always verified');
@@ -28,22 +29,22 @@ function main(): number {
   const handler = COMMANDS[command];
   if (!handler) throw new CliError(`Unknown command "${command}"\n\n${HELP}`);
 
+  // run --dry-run is deliberately outside the guard and does not reconcile or
+  // open SQLite. The dod command stays guarded for its complete execution.
+  if (command === 'run' && opts['dry-run']) return await handler(opts) ?? 0;
   if (GUARDED.has(command)) {
-    return withMutationGuard(() => {
+    return await withMutationGuard(async () => {
       opts.reconciliation = reconcilePendingSideEffects(opts);
-      return handler(opts) ?? 0;
+      return await handler(opts) ?? 0;
     });
   }
   opts.reconciliation = withMutationGuard(() => reconcilePendingSideEffects(opts));
-  return handler(opts) ?? 0;
+  return await handler(opts) ?? 0;
 }
 
-let exitCode = 0;
-try {
-  exitCode = main();
-} catch (error) {
+main().then((exitCode) => {
+  process.exitCode = exitCode;
+}).catch((error) => {
   console.error((error as Error).message);
-  exitCode = (error as { exitCode?: number }).exitCode ?? 1;
-}
-
-process.exitCode = exitCode;
+  process.exitCode = (error as { exitCode?: number }).exitCode ?? 1;
+});
