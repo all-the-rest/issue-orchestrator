@@ -7,7 +7,9 @@ import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { SQLiteStore } from '../dist/core/persistence.js';
 import { git as hostGit } from '../dist/git/index.js';
-import { AgentResultContractError, AgentRunnerError, OpenCodeAgentRunner } from '../dist/providers/opencode-runner.js';
+import {
+  AgentResultContractError, AgentRunnerError, OpenCodeAgentRunner, parseMacProcessLine,
+} from '../dist/providers/opencode-runner.js';
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'issue-orchestrator-agent-runner-'));
 const FAKE_OPENCODE = path.join(TMP, 'fake-opencode');
@@ -50,7 +52,7 @@ function createWorktree(name, base = TMP) {
   return worktree;
 }
 
-function createBuilderWorktree(name) {
+function builderPnpmStorePath() {
   const pnpmEnv = {
     PATH: process.env.PATH ?? process.env.Path ?? '',
     HOME: process.env.HOME ?? os.homedir(),
@@ -66,7 +68,11 @@ function createBuilderWorktree(name) {
     cwd: process.cwd(), env: pnpmEnv, encoding: 'utf8',
   });
   assert.equal(storeResult.status, 0, `pnpm store lookup failed: ${storeResult.stderr}`);
-  const storePath = path.resolve(storeResult.stdout.trim());
+  return path.resolve(process.cwd(), storeResult.stdout.trim());
+}
+
+function createBuilderWorktree(name) {
+  const storePath = builderPnpmStorePath();
   // `pnpm store path` reports the configured location even when a cacheless
   // CI runner has not created the store directory yet. The sandbox requires
   // that trusted host path to exist before it can mount it read-only.
@@ -210,6 +216,17 @@ if (mode === 'question') {
     if (shell.error || shell.status !== 0) process.exit(shell.status || 1);
     if (mode === 'builder-hang') setInterval(() => {}, 1000);
   }
+  if (mode === 'question-unterminated') {
+    // A valid result plus a final question event without a trailing newline:
+    // the run must be denied even though the exit code and result are clean.
+    fs.writeFileSync(resultFile, JSON.stringify({
+      status: 'DONE', summary: 'Finished fixture task', changed_files: ['README.md'],
+      commands: ['pnpm test'], acceptance: ['fixture acceptance passed'],
+      blocked_reason: null, evidence_dir: null, verdict: 'PASS',
+    }));
+    fs.writeSync(1, JSON.stringify({ type: 'tool_use', part: { tool: 'question' } }));
+    process.exit(0);
+  }
   if (mode === 'invalid-json') fs.writeFileSync(resultFile, '{');
   else if (mode === 'invalid-schema') fs.writeFileSync(resultFile, JSON.stringify({ status: 'DONE' }));
   else if (mode !== 'missing') {
@@ -278,6 +295,24 @@ async function isRunning(pid) {
 
 try {
   writeFakeOpenCode();
+
+  // macOS `ps` rows use a platform-dependent lstart width; both a single-digit
+  // and a two-digit hour must normalize to the persisted identity format.
+  {
+    const oneDigit = parseMacProcessLine('4242 4242 Sun Nov 8 4:15:08 2026 S');
+    assert.deepEqual(oneDigit, {
+      pid: 4242, pgid: 4242, state: 'S', startIdentity: 'Sun Nov 08 04:15:08 2026',
+    });
+    const twoDigit = parseMacProcessLine('4242 4242 Sun Nov 08 14:15:08 2026 S+');
+    assert.deepEqual(twoDigit, {
+      pid: 4242, pgid: 4242, state: 'S+', startIdentity: 'Sun Nov 08 14:15:08 2026',
+    });
+    assert.throws(
+      () => parseMacProcessLine('4242 4242 Sun Feb 30 14:15:08 2026 S'),
+      (error) => error instanceof AgentRunnerError && error.code === 'AGENT_RECOVERY_UNSAFE',
+    );
+    ok('macOS process identity rows normalize one-digit hours and reject invalid dates');
+  }
 
   // Valid result, NDJSON capture, accounting and environment scrubbing.
   {
@@ -467,6 +502,26 @@ try {
     assert.equal(store.getAgentSession(session.externalSessionId).errorClass, 'AGENT_QUESTION_DENIED');
     store.close();
     ok('question-tool attempts terminate instead of blocking and persist FAILED');
+  }
+
+  // The last NDJSON line may arrive without a trailing newline; it must still
+  // decide the run before a clean result is accepted.
+  {
+    const worktree = createWorktree('question-unterminated');
+    const store = new SQLiteStore(path.join(TMP, 'question-unterminated.sqlite3'));
+    const runner = runnerFor(store, { environment: { FAKE_OPENCODE_MODE: 'question-unterminated' } });
+    const session = await runner.createSession({
+      jobId: makeJob(store, 530), role: 'triage', model: 'test/model', worktree,
+    });
+    await assert.rejects(
+      runner.run({ sessionId: session.externalSessionId, prompt: 'Ask a question without a trailing newline.' }),
+      (error) => error instanceof AgentRunnerError && error.code === 'AGENT_QUESTION_DENIED',
+    );
+    const record = store.getAgentSession(session.externalSessionId);
+    assert.equal(record.status, 'FAILED');
+    assert.equal(record.errorClass, 'AGENT_QUESTION_DENIED');
+    store.close();
+    ok('unterminated final question event is denied before a clean result is accepted');
   }
 
   // Timeout must TERM and then KILL the entire detached process group.
@@ -914,9 +969,7 @@ setInterval(() => {}, 1000);
   {
     fs.rmSync(OCI_TRACE, { force: true });
     const worktree = createBuilderWorktree('builder');
-    const expectedStore = fs.realpathSync(spawnSync('pnpm', ['store', 'path', '--silent'], {
-      cwd: process.cwd(), encoding: 'utf8',
-    }).stdout.trim());
+    const expectedStore = fs.realpathSync(builderPnpmStorePath());
     const untrustedStore = path.join(TMP, 'untrusted-project-store', 'v11');
     fs.mkdirSync(untrustedStore, { recursive: true });
     fs.writeFileSync(path.join(worktree, '.npmrc'), `store-dir=${untrustedStore}\n`);

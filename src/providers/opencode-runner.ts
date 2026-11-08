@@ -734,7 +734,7 @@ function runMacPs(args: string[], operation: string, allowNoMatch = false) {
   return output;
 }
 
-function parseMacProcessLine(line: string): ProcessInfo {
+export function parseMacProcessLine(line: string): ProcessInfo {
   const fields = line.trim().split(/\s+/);
   if (fields.length !== 8) {
     throw new AgentRunnerError('AGENT_RECOVERY_UNSAFE', 'macOS ps returned an ambiguous process identity row');
@@ -743,22 +743,25 @@ function parseMacProcessLine(line: string): ProcessInfo {
   const pgid = Number(fields[1]);
   const [weekday, month, day, clock, year] = fields.slice(2, 7);
   const state = fields[7];
-  const startIdentity = `${weekday} ${month} ${day.padStart(2, '0')} ${clock} ${year}`;
   const monthIndex = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'].indexOf(month);
   const [hour, minute, second] = clock.split(':').map(Number);
   const startDate = new Date(Date.UTC(Number(year), monthIndex, Number(day), hour, minute, second));
-  const weekdays = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
   if (!Number.isSafeInteger(pid) || pid <= 0 || !Number.isSafeInteger(pgid) || pgid <= 0 ||
       !/^(Sun|Mon|Tue|Wed|Thu|Fri|Sat)$/.test(weekday) ||
       !/^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)$/.test(month) ||
       !/^(0?[1-9]|[12][0-9]|3[01])$/.test(day) ||
-      !/^(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d$/.test(clock) || !/^\d{4}$/.test(year) ||
+      !/^(?:[0-9]|[01]\d|2[0-3]):[0-5]\d:[0-5]\d$/.test(clock) || !/^\d{4}$/.test(year) ||
       monthIndex < 0 || startDate.getUTCFullYear() !== Number(year) ||
       startDate.getUTCMonth() !== monthIndex || startDate.getUTCDate() !== Number(day) ||
-      weekdays[startDate.getUTCDay()] !== weekday ||
-      !/^[A-Za-z][A-Za-z+<>]*$/.test(state)) {
-    throw new AgentRunnerError('AGENT_RECOVERY_UNSAFE', 'macOS ps returned an invalid process identity row');
+      !/^[A-Za-z][A-Za-z+<>*!?]*$/.test(state)) {
+    throw new AgentRunnerError(
+      'AGENT_RECOVERY_UNSAFE', `macOS ps returned an invalid process identity row: ${line.trim()}`,
+    );
   }
+  // `ps` may print a single-digit hour. Normalize it so the persisted identity
+  // matches the strict format that recovery validation accepts later.
+  const startIdentity = `${weekday} ${month} ${day.padStart(2, '0')} ` +
+    `${clock.split(':')[0].padStart(2, '0')}:${clock.split(':')[1]}:${clock.split(':')[2]} ${year}`;
   return { pid, pgid, state, startIdentity };
 }
 
@@ -1531,6 +1534,9 @@ export class OpenCodeAgentRunner implements AgentRunner {
       }
       cleanupSandboxContainers(true);
       if (!renewOwnership()) throw leaseFailure;
+      // A final event without a trailing newline still decides the run: a
+      // question tool must fail closed before any result is accepted.
+      if (pendingLine.trim()) onLine(pendingLine);
 
       if (active.stopReason === 'timeout') {
         throw new AgentRunnerError('AGENT_TIMEOUT', `OpenCode exceeded the ${timeoutMs}ms wall-clock timeout`, record.externalSessionId);
@@ -1549,7 +1555,6 @@ export class OpenCodeAgentRunner implements AgentRunner {
       if (outcome.code !== 0) {
         throw new AgentRunnerError('AGENT_PROCESS_FAILED', `OpenCode exited with code ${String(outcome.code)}${outcome.signal ? ` (${outcome.signal})` : ''}`, record.externalSessionId);
       }
-      if (pendingLine.trim()) onLine(pendingLine);
 
       const result = readAgentResult(worktree, record.externalSessionId);
       this.store().completeAgentSession({
