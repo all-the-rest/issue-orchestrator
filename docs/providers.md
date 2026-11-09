@@ -111,10 +111,13 @@ provider. Terminal outcomes are `DONE`, `REVIEW`, `BLOCKED`, and `NEEDS_INFO`;
 human handovers preserve the worktree and release the job's queue claim. Unexpected
 errors, mismatched state, and unavailable builder/runtime dependencies fail
 closed and retain the claim and recovery artifacts. Merge is delegated to the
-existing gate only when `auto_merge` is enabled; it still requires trusted
+existing gate when `auto_merge` is enabled (the default for enabled projects); it still requires trusted
 native approval on the exact head, exact-head machine markers, and every
 provider/configured required check to pass. With `auto_merge` disabled, a
-review handover is posted instead.
+review handover is posted instead. Set `auto_merge: false` at the repo or
+defaults level to opt out. Server-side branch protection/rulesets with required
+checks and trusted approval rules remain strongly recommended operational
+controls; the CLI does not assume or prove that they are enabled.
 
 This vertical slice currently has end-to-end support for GitHub and the
 OpenCode runner. GitLab and Jira remain fail-closed stubs; this does not imply

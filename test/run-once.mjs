@@ -170,7 +170,7 @@ const DOD = {
   acceptance_source: 'issue_body',
 };
 
-function makeScenario(name, { autoMerge = true, author = 'owner', project = 'acme/demo' } = {}) {
+function makeScenario(name, { autoMerge, author = 'owner', project = 'acme/demo' } = {}) {
   const base = path.join(TMP, name);
   const repo = path.join(base, 'checkout');
   const source = path.join(base, 'source');
@@ -220,7 +220,7 @@ function makeScenario(name, { autoMerge = true, author = 'owner', project = 'acm
       base_branch: 'main',
       labels: { working: 'agent:working', review: 'agent:review', done: 'agent:done', blocked: 'agent:blocked', needs_info: 'agent:needs-info' },
     },
-    repos: { [project]: { account: 'acme-bot', auto_merge: autoMerge, dod: DOD } },
+    repos: { [project]: { account: 'acme-bot', ...(autoMerge === undefined ? {} : { auto_merge: autoMerge }), dod: DOD } },
   };
   const configFile = path.join(base, 'config.jsonc');
   write(configFile, config);
@@ -773,6 +773,15 @@ assert.equal(pendingRun.code, 0, pendingRun.err || pendingRun.out);
 assert.equal(parsed(pendingRun).outcome, 'REVIEW');
 assert.equal(state(pendingChecks).merges, 0, 'pending named checks cannot reach merge');
 ok('non-green required checks remain a handover gate after evidence publication');
+
+const failedChecks = makeScenario('failed-checks-gate');
+const failedRun = run(failedChecks, ['run', '--once', '--project', 'acme/demo'], {
+  FAKE_CHECKS_JSON: '[{"bucket":"fail","name":"CI"}]', FAKE_CHECKS_EXIT: '1',
+});
+assert.equal(failedRun.code, 0, failedRun.err || failedRun.out);
+assert.equal(parsed(failedRun).outcome, 'REVIEW');
+assert.equal(state(failedChecks).merges, 0, 'failed required checks cannot reach merge');
+ok('failed required checks remain a handover gate under the default-on setting');
 
 const concurrent = makeScenario('concurrent', { autoMerge: false });
 const firstPromise = runAsync(concurrent, ['run', '--once', '--project', 'acme/demo'], {

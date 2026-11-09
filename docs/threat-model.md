@@ -37,11 +37,12 @@ valuable host secrets.
 
 The builder may modify and locally commit in its job worktree. It must not push,
 call tracker write APIs, label, comment, create a PR, or merge. Those are CLI
-operations. Explicit `auto_merge: true` is an opt-in, not a safety boundary:
-configure server-side branch protection/rulesets with required CI and trusted
+operations. Auto-merge defaults to true for enabled projects; `auto_merge: false`
+is the explicit opt-out. This default is not a safety boundary: configure
+server-side branch protection/rulesets with required CI and trusted
 human approval. The CLI checks observed approvals/checks but cannot enforce or
 replace server-side protection, prevent administrator overrides, or guarantee
-branch protection is enabled. Auto-merge defaults to false. Binary evidence and
+branch protection is enabled, and the CLI does not assume that it is. Binary evidence and
 anything containing customer data must be inspected by a human before
 publication.
 
