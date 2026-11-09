@@ -1,0 +1,21 @@
+services:
+  worker:
+    build: .
+    restart: unless-stopped
+    working_dir: /workspace
+    environment:
+      ISSUE_ORCHESTRATOR_HOME: /var/lib/issue-orchestrator
+      ISSUE_ORCHESTRATOR_CONFIG: /home/node/.config/issue-orchestrator/config.jsonc
+      ISSUE_ORCHESTRATOR_REPO: /workspace
+      ISSUE_ORCHESTRATOR_INTERVAL_SECONDS: ${ISSUE_ORCHESTRATOR_INTERVAL_SECONDS:-300}
+      PATH: /opt/runtime/bin:/usr/local/bin:/usr/bin:/bin
+    volumes:
+      - orchestrator-home:/var/lib/issue-orchestrator
+      - ./:/workspace:rw
+      - ./config.jsonc:/home/node/.config/issue-orchestrator/config.jsonc:ro
+      - ${OPENCODE_CONFIG:?Set OPENCODE_CONFIG to a read-only OpenCode config path}:/home/node/.config/opencode/opencode.jsonc:ro
+      - ${OPENCODE_DATA_DIR:?Set OPENCODE_DATA_DIR to the OpenCode data/auth directory}:/home/node/.local/share/opencode:ro
+      - ${GH_CONFIG_DIR:?Set GH_CONFIG_DIR to a credential directory}:/home/node/.config/gh:ro
+      - ./runtime-bin:/opt/runtime/bin:ro
+volumes:
+  orchestrator-home:

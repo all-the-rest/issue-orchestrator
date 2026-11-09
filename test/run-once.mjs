@@ -347,11 +347,12 @@ function run(scenario, args, extra = {}) {
   return { code: result.status, signal: result.signal, out: result.stdout.trim(), err: result.stderr.trim() };
 }
 
-function runAsync(scenario, args, extra = {}) {
+function runAsync(scenario, args, extra = {}, onSpawn = () => {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [CLI, ...args], {
       cwd: scenario.repo, env: environment(scenario, extra), stdio: ['ignore', 'pipe', 'pipe'],
     });
+    onSpawn(child);
     let out = '';
     let err = '';
     child.stdout.on('data', (chunk) => { out += chunk; });
@@ -360,6 +361,37 @@ function runAsync(scenario, args, extra = {}) {
     child.on('close', (code, signal) => resolve({ code, signal, out: out.trim(), err: err.trim() }));
   });
 }
+
+const termRecovery = makeScenario('sigterm-builder-recovery');
+let termChild;
+const termRun = runAsync(termRecovery, ['run', '--once', '--project', 'acme/demo'], {
+  FAKE_AGENT_DELAY_ROLE: 'builder', FAKE_AGENT_DELAY_MS: '60000',
+}, (child) => { termChild = child; });
+const termDeadline = Date.now() + 20000;
+while (Date.now() < termDeadline) {
+  if (fs.existsSync(termRecovery.agentLog) && fs.readFileSync(termRecovery.agentLog, 'utf8').includes('"role":"builder"')) break;
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+}
+assert.ok(fs.existsSync(termRecovery.agentLog) && fs.readFileSync(termRecovery.agentLog, 'utf8').includes('"role":"builder"'), 'builder agent started');
+termChild.kill('SIGTERM');
+const termResult = await termRun;
+assert.equal(termResult.code, 143, termResult.err || termResult.out);
+const termStore = homeStore(termRecovery);
+assert.equal(termStore.rows("SELECT status FROM agent_sessions WHERE role='builder'")[0].status, 'ABORTED');
+assert.equal(termStore.rows("SELECT execution_owner FROM agent_sessions WHERE role='builder'")[0].execution_owner, null);
+assert.equal(termStore.rows("SELECT execution_lease_until FROM agent_sessions WHERE role='builder'")[0].execution_lease_until, null);
+assert.equal(termStore.rows('SELECT workflow_state FROM jobs')[0].workflow_state, 'IMPLEMENTING');
+assert.equal(termStore.rows("SELECT COUNT(*) AS count FROM agent_sessions WHERE role='builder'")[0].count, 1);
+termStore.close();
+const recoveredTerm = run(termRecovery, ['run', '--once', '--project', 'acme/demo']);
+assert.equal(recoveredTerm.code, 0, recoveredTerm.err || recoveredTerm.out);
+assert.equal(parsed(recoveredTerm).outcome, 'DONE');
+assert.equal(state(termRecovery).prCreates, 1);
+assert.equal(state(termRecovery).issueComments.filter((comment) => comment.body.includes('Verified Definition of Done')).length, 1);
+const recoveredTermStore = homeStore(termRecovery);
+assert.equal(recoveredTermStore.rows("SELECT COUNT(*) AS count FROM agent_sessions WHERE role='builder'")[0].count, 1);
+recoveredTermStore.close();
+ok('SIGTERM aborts and releases the active agent, preserves IMPLEMENTING, then resumes one session without duplicate PR/comment');
 
 function parsed(result) { return JSON.parse(result.out); }
 function state(scenario) { return JSON.parse(fs.readFileSync(path.join(scenario.fixtures, 'state.json'), 'utf8')); }

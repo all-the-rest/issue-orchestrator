@@ -9,6 +9,35 @@ permissions:
   contents: read
 
 jobs:
+  service-linux-container:
+    runs-on: ubuntu-latest
+    container: ubuntu:24.04
+    steps:
+      - run: apt-get update && apt-get install --yes git libatomic1 systemd
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build && node test/service.mjs
+  docker-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Build from source checkout (without host build artifacts)
+        run: docker build --tag issue-orchestrator-ci .
+      - name: Verify runtime is non-root
+        run: test "$(docker run --rm --entrypoint id issue-orchestrator-ci -u)" -ne 0
+      - name: Verify packaged CLI starts
+        run: docker run --rm --entrypoint node issue-orchestrator-ci /opt/issue-orchestrator/dist/cli.js --version
+      - name: Verify Compose restart policy
+        env:
+          OPENCODE_CONFIG: /tmp/opencode.jsonc
+          OPENCODE_DATA_DIR: /tmp/opencode-data
+          GH_CONFIG_DIR: /tmp/gh
+        run: |
+          docker compose config --format json | node -e 'let data=""; process.stdin.on("data", chunk => data += chunk).on("end", () => { const worker = JSON.parse(data).services.worker; if (worker.restart !== "unless-stopped" || worker.working_dir !== "/workspace") process.exit(1); console.log(`restart=${worker.restart} working_dir=${worker.working_dir}`); })'
   test:
     name: test (${{ matrix.os }})
     strategy:
@@ -27,6 +56,13 @@ jobs:
       - name: Audit production dependencies
         run: pnpm audit --prod
       - run: pnpm test
+      - name: Validate generated macOS launchd plist
+        if: runner.os == 'macOS'
+        run: |
+          set -o pipefail
+          plist="$RUNNER_TEMP/issue-orchestrator.plist"
+          node dist/cli.js service install --print | sed '/^$/,$d' > "$plist"
+          plutil -lint "$plist"
       - name: Install pinned Ratchet CLI
         env:
           GH_TOKEN: ${{ github.token }}
