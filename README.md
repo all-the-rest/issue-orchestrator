@@ -36,6 +36,9 @@ The end-to-end suite is hermetic: a fake `gh` prints fixture JSON and a local
 bare repository stands in for the remote, so no network or credentials are
 needed. It runs on macOS and Linux in CI.
 
+The required main-branch checks, local Ratchet command, and baseline review
+policy are documented in [`docs/quality-gates.md`](docs/quality-gates.md).
+
 ## Usage
 
 ```sh
@@ -189,7 +192,13 @@ required CI check names, evidence class, and acceptance source:
           "typecheck": ["pnpm", "typecheck"],
           "security": null
         },
-        "required_checks": ["CI", "Ratchet fast"],
+        "required_checks": [
+          "test (ubuntu-latest)",
+          "test (macos-latest)",
+          "docker-image",
+          "service-linux-container",
+          "gitleaks"
+        ],
         "evidence_class": "cli",
         "acceptance_source": "issue_body",
         "timeout_ms": 300000
