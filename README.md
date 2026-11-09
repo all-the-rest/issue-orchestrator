@@ -65,6 +65,8 @@ Run `issue-orchestrator --help` for the full command list. All commands accept
 `--config <path>`; read commands accept `--json`. The current operator CLI
 diagnostics and persisted-job read schemas are documented in
 [`docs/operator-cli.md`](docs/operator-cli.md).
+OpenCode V2 users can load the optional thin wrapper in
+`.opencode/skills/issue-orchestrator/SKILL.md`; the CLI remains the workflow implementation.
 `capture` runs argv directly with `shell: false`, tees stdout/stderr to the
 terminal and a new output file, and writes a JSON sidecar with the exact argv and
 exit status; it uses Node streams and does not depend on platform-specific
