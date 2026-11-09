@@ -29,6 +29,7 @@ jobs:
       - run: pnpm test
       - name: Install pinned Ratchet CLI
         env:
+          GH_TOKEN: ${{ github.token }}
           RATCHET_VERSION: v0.6.3
         run: bash .github/scripts/install-ratchet.sh
       - name: Validate gates

@@ -27,10 +27,18 @@ api_base="https://api.github.com/repos/all-the-rest/ratchet-cli/releases"
 work="$(mktemp -d)" || fail "cannot create a temporary directory"
 trap 'rm -rf "$work"' EXIT
 
-curl --fail --silent --show-error --location --retry 3 --retry-all-errors --retry-delay 2 \
-  --header 'Accept: application/vnd.github+json' \
-  --header 'X-GitHub-Api-Version: 2022-11-28' \
-  "$api_base/tags/$release_tag" --output "$work/release.json" ||
+gh_api() {
+  local attempt
+  for attempt in 1 2 3; do
+    if gh api --header 'X-GitHub-Api-Version: 2022-11-28' "$@"; then
+      return 0
+    fi
+    if [[ "$attempt" -lt 3 ]]; then sleep "$((attempt * 2))"; fi
+  done
+  return 1
+}
+
+gh_api "$api_base/tags/$release_tag" > "$work/release.json" ||
   fail "could not read Ratchet release metadata through the GitHub API"
 
 find_asset_id() {
@@ -48,13 +56,9 @@ checksum_id="$(find_asset_id checksums.txt)" || fail "Ratchet release has no uni
 asset_id="$(find_asset_id "$asset")" || fail "Ratchet release has no unique $asset asset"
 [[ -n "$checksum_id" && -n "$asset_id" ]] || fail "Ratchet release is missing the binary or checksum asset"
 
-curl --fail --silent --show-error --location --retry 3 --retry-all-errors --retry-delay 2 \
-  --header 'Accept: application/octet-stream' \
-  "$api_base/assets/$checksum_id" --output "$work/checksums.txt" ||
+gh_api --header 'Accept: application/octet-stream' "$api_base/assets/$checksum_id" > "$work/checksums.txt" ||
   fail "could not download Ratchet checksums through the GitHub API"
-curl --fail --silent --show-error --location --retry 3 --retry-all-errors --retry-delay 2 \
-  --header 'Accept: application/octet-stream' \
-  "$api_base/assets/$asset_id" --output "$work/$asset" ||
+gh_api --header 'Accept: application/octet-stream' "$api_base/assets/$asset_id" > "$work/$asset" ||
   fail "could not download Ratchet $asset through the GitHub API"
 
 expected="$(awk -v name="$asset" '
