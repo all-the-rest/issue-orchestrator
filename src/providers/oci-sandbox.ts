@@ -2,12 +2,14 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 
 export const BUILDER_IMAGE = 'issue-orchestrator-builder:node24-pnpm11.23.0';
 
 type RuntimeKind = 'docker' | 'podman';
 
 export interface OciSandbox {
+  identity: string;
   runtime: string;
   runtimeKind: RuntimeKind;
   imageId: string;
@@ -508,6 +510,44 @@ function candidateRuntimes(runtimeOverride: string | undefined, source: NodeJS.P
   return candidates;
 }
 
+function hashDirectoryContents(root: string) {
+  let rootStats: fs.Stats;
+  try { rootStats = fs.lstatSync(root); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
+  if (!rootStats.isDirectory() || rootStats.isSymbolicLink()) {
+    throw new OciSandboxUnavailable('OCI runtime context metadata is not a real directory');
+  }
+  const hash = createHash('sha256');
+  const pending = [root];
+  let files = 0;
+  while (pending.length > 0) {
+    const directory = pending.pop()!;
+    const entries = fs.readdirSync(directory, { withFileTypes: true })
+      .sort((left, right) => left.name.localeCompare(right.name));
+    for (const entry of entries) {
+      const file = path.join(directory, entry.name);
+      if (entry.isSymbolicLink()) {
+        throw new OciSandboxUnavailable('OCI runtime context metadata contains a symlink');
+      }
+      if (entry.isDirectory()) {
+        pending.push(file);
+      } else if (entry.isFile()) {
+        hash.update(path.relative(root, file));
+        hash.update('\0');
+        hash.update(fs.readFileSync(file));
+        hash.update('\0');
+        files += 1;
+      } else {
+        throw new OciSandboxUnavailable('OCI runtime context metadata contains a non-regular file');
+      }
+    }
+  }
+  return files > 0 ? hash.digest('hex') : null;
+}
+
 export function prepareOciSandbox(
   worktreeInput: string,
   runtimeOverride: string | undefined,
@@ -544,7 +584,41 @@ export function prepareOciSandbox(
       const match = /(?:sha256:)?([a-f0-9]{64})/i.exec(output.trim());
       if (!match) throw new OciSandboxUnavailable('Builder image inspection returned an invalid image ID');
       const user = containerUser(candidate.executable, candidate.kind, env);
+      const selectors = candidate.kind === 'docker'
+        ? ['DOCKER_HOST', 'DOCKER_CONTEXT', 'DOCKER_CONFIG', 'DOCKER_TLS_VERIFY', 'DOCKER_CERT_PATH']
+        : ['CONTAINER_HOST', 'CONTAINER_CONNECTION', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_RUNTIME_DIR'];
+      const selectorIdentity = Object.fromEntries(selectors
+        .filter((key) => env[key] !== undefined)
+        .sort()
+        .map((key) => [key, createHash('sha256').update(env[key]!).digest('hex')]));
+      selectorIdentity.home = createHash('sha256').update(env.HOME ?? os.homedir()).digest('hex');
+      if (candidate.kind === 'docker') {
+        const configDirectory = env.DOCKER_CONFIG ?? path.join(env.HOME ?? os.homedir(), '.docker');
+        const configFile = path.join(configDirectory, 'config.json');
+        try {
+          // Hash rather than persist Docker config: it can contain auth material,
+          // while its currentContext selection must participate in identity.
+          selectorIdentity.dockerConfig = createHash('sha256').update(fs.readFileSync(configFile)).digest('hex');
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        }
+        // Docker stores endpoint metadata outside config.json under contexts/meta.
+        // Hash the metadata tree too so a changed endpoint behind the same context
+        // name cannot make stale recovery target a different engine.
+        selectorIdentity.dockerContexts = hashDirectoryContents(path.join(configDirectory, 'contexts', 'meta')) ?? '';
+      } else {
+        const connectionFile = path.join(env.XDG_CONFIG_HOME ?? path.join(env.HOME ?? os.homedir(), '.config'), 'containers', 'podman-connections.json');
+        try {
+          selectorIdentity.podmanConnections = createHash('sha256').update(fs.readFileSync(connectionFile)).digest('hex');
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        }
+      }
+      const identity = createHash('sha256')
+        .update(JSON.stringify({ executable: candidate.executable, kind: candidate.kind, selectors: selectorIdentity }))
+        .digest('hex');
       return {
+        identity,
         runtime: candidate.executable,
         runtimeKind: candidate.kind,
         imageId: `sha256:${match[1].toLowerCase()}`,

@@ -998,6 +998,93 @@ setInterval(() => {}, 1000);
     ok('stale RUNNING sessions with no safe process identity fail closed without a replacement');
   }
 
+  // A stale builder's runtime identity is part of its durable ownership. A
+  // replacement runtime must not be used even for cleanup when selectors differ.
+  {
+    const worktree = createBuilderWorktree('builder-runtime-identity');
+    const database = path.join(TMP, 'builder-runtime-identity.sqlite3');
+    const traceA = path.join(TMP, 'builder-runtime-a.ndjson');
+    const traceB = path.join(TMP, 'builder-runtime-b.ndjson');
+    const runtimeA = path.join(TMP, 'fake-docker-runtime-a');
+    const runtimeB = path.join(TMP, 'fake-docker-runtime-b');
+    const fakeSource = fs.readFileSync(FAKE_OCI, 'utf8');
+    fs.writeFileSync(runtimeA, fakeSource.replace(JSON.stringify(OCI_TRACE), JSON.stringify(traceA)), { mode: 0o755 });
+    fs.writeFileSync(runtimeB, fakeSource.replace(JSON.stringify(OCI_TRACE), JSON.stringify(traceB)), { mode: 0o755 });
+    const store = new SQLiteStore(database);
+    const session = await runnerFor(store, { containerRuntime: runtimeA }).createSession({
+      jobId: makeJob(store, 531), role: 'builder', model: 'test/model', worktree,
+    });
+    const stale = store.claimAgentSession({
+      externalSessionId: session.externalSessionId, owner: 'crashed-builder',
+      leaseUntil: '2000-01-01T00:00:00.000Z', resume: false,
+    });
+    assert.equal(stale.acquired, true);
+    assert.ok(store.getAgentSession(session.externalSessionId).ociIdentity);
+    const recovery = runnerFor(store, { containerRuntime: runtimeB });
+    await assert.rejects(
+      recovery.resume({ sessionId: session.externalSessionId, prompt: 'Do not switch runtime while recovering.' }),
+      (error) => error instanceof AgentRunnerError && error.code === 'AGENT_RECOVERY_UNSAFE' && /runtime identity changed/.test(error.message),
+    );
+    const replacementTrace = fs.readFileSync(traceB, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+    assert.equal(replacementTrace.some((entry) => entry.args[0] === 'container' || entry.args[0] === 'run'), false,
+      'replacement runtime must receive no container cleanup or builder launch');
+    const preserved = store.getAgentSession(session.externalSessionId);
+    assert.equal(preserved.status, 'RUNNING');
+    assert.equal(preserved.executionOwner, 'crashed-builder');
+    store.close();
+    ok('stale builder recovery rejects a changed OCI runtime without touching its trace sink');
+  }
+
+  // Docker endpoint metadata is stored outside config.json. Changing that
+  // metadata while retaining the same context name must also fail closed.
+  {
+    const worktree = createBuilderWorktree('builder-docker-context-identity');
+    const database = path.join(TMP, 'builder-docker-context-identity.sqlite3');
+    const configDirectory = path.join(TMP, 'builder-docker-context-config');
+    const contextDirectory = path.join(configDirectory, 'contexts', 'meta', 'context-id');
+    const contextMetadata = path.join(contextDirectory, 'meta.json');
+    const trace = path.join(TMP, 'builder-docker-context-trace.ndjson');
+    const runtime = path.join(TMP, 'fake-docker-context-runtime');
+    fs.mkdirSync(contextDirectory, { recursive: true });
+    fs.writeFileSync(path.join(configDirectory, 'config.json'), JSON.stringify({ currentContext: 'remote-engine' }));
+    fs.writeFileSync(contextMetadata, JSON.stringify({
+      Name: 'remote-engine', Endpoints: { docker: { Host: 'tcp://engine-a.example:2376' } },
+    }));
+    fs.writeFileSync(runtime,
+      fs.readFileSync(FAKE_OCI, 'utf8').replace(JSON.stringify(OCI_TRACE), JSON.stringify(trace)), { mode: 0o755 });
+    const store = new SQLiteStore(database);
+    const environment = {
+      DOCKER_CONFIG: configDirectory,
+      DOCKER_HOST: undefined,
+      DOCKER_CONTEXT: undefined,
+    };
+    const session = await runnerFor(store, { containerRuntime: runtime, environment }).createSession({
+      jobId: makeJob(store, 532), role: 'builder', model: 'test/model', worktree,
+    });
+    const stale = store.claimAgentSession({
+      externalSessionId: session.externalSessionId, owner: 'crashed-docker-context',
+      leaseUntil: '2000-01-01T00:00:00.000Z', resume: false,
+    });
+    assert.equal(stale.acquired, true);
+    fs.writeFileSync(contextMetadata, JSON.stringify({
+      Name: 'remote-engine', Endpoints: { docker: { Host: 'tcp://engine-b.example:2376' } },
+    }));
+    await assert.rejects(
+      runnerFor(store, { containerRuntime: runtime, environment }).resume({
+        sessionId: session.externalSessionId, prompt: 'Do not switch Docker context while recovering.',
+      }),
+      (error) => error instanceof AgentRunnerError && error.code === 'AGENT_RECOVERY_UNSAFE' && /runtime identity changed/.test(error.message),
+    );
+    const traceEntries = fs.readFileSync(trace, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+    assert.equal(traceEntries.some((entry) => entry.args[0] === 'container' || entry.args[0] === 'run'), false,
+      'changed Docker context must receive no cleanup or builder launch');
+    const preserved = store.getAgentSession(session.externalSessionId);
+    assert.equal(preserved.status, 'RUNNING');
+    assert.equal(preserved.executionOwner, 'crashed-docker-context');
+    store.close();
+    ok('stale builder recovery rejects changed Docker endpoint metadata behind the same context');
+  }
+
   // If a process-group descendant cannot prove its execution token, stop the
   // supervisor group and refuse a concurrent resume while identity is unresolved.
   {

@@ -204,6 +204,7 @@ interface AgentSessionRow extends SqlRow {
   execution_pgid: number | bigint | null;
   execution_start_ticks: string | null;
   execution_token: string | null;
+  oci_identity: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -255,6 +256,7 @@ export interface PersistedAgentSession {
   executionPgid: number | null;
   executionStartTicks: string | null;
   executionToken: string | null;
+  ociIdentity: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -711,6 +713,9 @@ const MIGRATIONS = [
   `,
   `
     ALTER TABLE jobs ADD COLUMN lease_start_ticks TEXT;
+  `,
+  `
+    ALTER TABLE agent_sessions ADD COLUMN oci_identity TEXT;
   `,
 ];
 
@@ -1574,6 +1579,7 @@ export class SQLiteStore {
     worktree: string;
     ndjsonPath: string;
     stderrPath: string;
+    ociIdentity?: string | null;
   }): PersistedAgentSession {
     if (!Number.isSafeInteger(input.jobId) || input.jobId <= 0 || !input.externalSessionId || !input.role ||
         !input.model || !input.worktree) {
@@ -1582,11 +1588,11 @@ export class SQLiteStore {
     const stamp = nowIso();
     this.transaction(() => {
       this.db.prepare(`
-        INSERT INTO agent_sessions(job_id, session_id, external_session_id, role, model, worktree,
+        INSERT INTO agent_sessions(job_id, session_id, external_session_id, role, model, worktree, oci_identity,
           status, started_at, ndjson_path, stderr_path, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, 'CREATED', ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'CREATED', ?, ?, ?, ?, ?)
       `).run(input.jobId, input.externalSessionId, input.externalSessionId, input.role, input.model,
-        input.worktree, stamp, input.ndjsonPath, input.stderrPath, stamp, stamp);
+        input.worktree, input.ociIdentity ?? null, stamp, input.ndjsonPath, input.stderrPath, stamp, stamp);
     });
     const created = this.getAgentSession(input.externalSessionId);
     if (!created) throw new Error(`Could not read newly created agent session ${input.externalSessionId}`);
@@ -1630,6 +1636,7 @@ export class SQLiteStore {
       executionPgid: row.execution_pgid == null ? null : Number(row.execution_pgid),
       executionStartTicks: row.execution_start_ticks,
       executionToken: row.execution_token,
+      ociIdentity: row.oci_identity,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
     };
