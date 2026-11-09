@@ -1,0 +1,34 @@
+name: Bug report
+description: Report a reproducible problem
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: "Do not include credentials, private repository data, or customer information. Report security vulnerabilities privately as described in SECURITY.md."
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Include the observed result and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction steps
+      description: Provide the smallest safe, reproducible sequence.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version and environment
+      description: Include CLI version, Node version, OS, and provider where relevant.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized diagnostics
+      description: Remove tokens, secrets, private URLs, and personal data before sharing.
