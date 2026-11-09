@@ -33,6 +33,33 @@ valuable host secrets.
 | Evidence exfiltration | Builder container has `--network=none`; no host provider CLI or credential mounts; evidence is validated and published by the CLI. | OpenCode control plane may communicate with its configured model provider. Never send customer data/secrets without approval. |
 | Credential leakage | Environment scrubbing, private agent HOME/XDG paths, private logs with token redaction, gitleaks CI. | Redaction is pattern-based and cannot identify every secret format or prevent encoding/transforming data. Do not treat logs as a secret-safe sink. |
 
+## Adopted V1 bridge boundary (migration pending)
+
+The controls above describe the current full-workflow implementation. The
+adopted V1 target in [issue #53](https://github.com/all-the-rest/issue-orchestrator/issues/53)
+is narrower: the bridge reads structured GitHub issues/comments and sends them
+to a project-selected agent integration. It does not inspect CI, edit source,
+manage PRs, or call merge APIs. The selected agent/project integration owns
+those operations and their provider CLI.
+
+Ticket bodies, comments, updates, and final acceptance criteria remain untrusted
+data and are never executable authority. The bridge does not put credentials in
+those payloads. However, an agent integration that can use a project CLI may be
+able to access that CLI's credential store; this is a real authority boundary,
+not something a short prompt or the ticket bridge can sandbox. Run it under a
+disposable/dedicated OS identity and give it only the minimum project-scoped,
+short-lived permissions required.
+
+Every condition that must prevent an agent-side merge must be enforced outside
+prompt text: protected branches/rulesets, required CI checks that encode all
+merge hard-denies, and no agent bypass actors. Do not grant administrators or
+the agent a bypass path for those checks. The default permits agent merge only
+after provider-required checks pass; manual mode must be enforced by provider
+permissions or an equivalent rule that withholds merge authority, not merely by
+asking the agent not to merge. This differs from the current CLI-owned
+`auto_merge` and native-approval gates documented below. These target controls
+are not implemented by the current runtime yet.
+
 ## Effects, merge, and server controls
 
 The builder may modify and locally commit in its job worktree. It must not push,
