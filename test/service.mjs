@@ -11,8 +11,8 @@ const oddCwd = fs.mkdtempSync(path.join(os.tmpdir(), 'service path "quoted" '));
 const result = spawnSync(process.execPath, [cli, 'service', 'install', '--print'], { cwd: oddCwd, encoding: 'utf8' });
 assert.equal(result.status, 0, result.stderr);
 assert.match(result.stdout, new RegExp(process.execPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
-assert.match(result.stdout, /run --once/);
 if (process.platform === 'darwin') {
+  assert.match(result.stdout, /<string>run<\/string><string>--once<\/string>/);
   const file = path.join(os.tmpdir(), `issue-orchestrator-${process.pid}.plist`);
   fs.writeFileSync(file, result.stdout.slice(0, result.stdout.indexOf('\n\nSave as')));
   const lint = spawnSync('plutil', ['-lint', file], { encoding: 'utf8' });
@@ -20,6 +20,7 @@ if (process.platform === 'darwin') {
   assert.equal(lint.status, 0, lint.stderr || lint.stdout);
   assert.match(result.stdout, /launchctl bootstrap gui/);
 } else if (process.platform === 'linux') {
+  assert.match(result.stdout, /run --once/);
   assert.match(result.stdout, /systemctl --user enable --now issue-orchestrator.timer/);
   assert.match(result.stdout, /WorkingDirectory=.*\\s.*\\x22quoted\\x22/);
   assert.match(result.stdout, /Environment="PATH=/);
