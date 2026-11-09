@@ -1,36 +1,40 @@
 # Operator CLI surface
 
-`doctor --json` emits `{ "schema_version": 1, "checks": [...] }`. Each check
-has `name`, `status` (`ok`, `failed`, or `missing`), and a sanitized `message`;
-disk adds `available_bytes`, SQLite adds `path`. `jobs list --json` emits an
-array; `jobs show <id> --json` emits one job object with persisted queue/workflow
-state, attempts, branch, change number, head/evidence commits, error class,
-updated time, and artifact evidence (`kind`, hashes, creation time). Ownership
-tokens, process IDs, and credentials are never included. GitHub/GitLab checks
-only run when a configured project uses that provider and compare the active
-CLI identity with the accounts configured for those projects. `opencode` and
-`git` are version probes; model selection is compared with OpenCode's configured
-default model. SQLite is opened and migrated if needed. Disk reports available
-bytes for the runtime directory. Doctor does not contact model APIs or prove
-that provider credentials are accepted by a remote service.
+`doctor --json` emits `{ "schema_version": 1, "checks": [...] }`; checks have
+`name`, `status` (`ok`, `failed`, or `missing`), and sanitized `message`.
+`status --json` contains config, database path, zero-filled queue counts, active
+leases, `next_run: null`, last run, and reconciliation status. `jobs list --json`
+returns up to 100 sanitized job objects; `jobs show <id> --json` returns one.
+Neither includes ownership tokens, process identity, or credentials.
 
-`status --json` emits the existing status object with `database_path`,
-`queue_counts` (job-state names to counts), `active_leases` (job id, project,
-lease expiry and an `expired` boolean), and `next_run` (currently always `null`, because no scheduler is
-implemented), alongside config, active lock, last run, and reconciliation data.
-`jobs list --json` returns up to 100 jobs ordered by most recently updated;
-`jobs show <id> --json` returns one job. Both expose persisted workflow/queue
-state, attempts/max attempts, branch, change number, head and evidence commit,
-error class (`last_error`), update time, title/URL, pull-request number, and
-artifact hashes. Queue counts include every known job state with zero-filled
-counts. These commands never
-return owner tokens or agent process identity.
+`jobs cancel <id>` atomically cancels only a `READY` queued job; active and
+terminal jobs are refused. `jobs retry <id>` creates a new `READY` row and
+retains the failed row/history. It is permitted only for a `FAILED` job below
+`max_attempts`, without branch/change/head/evidence identifiers, artifacts, or
+side-effect journal entries, and while no job is active. It does not skip the
+normal claim and merge gates. Mutations take the queue mutation guard but do not
+reconcile providers.
 
-Exit statuses are 0 for all checks passing, 1 for a failed/refused command, 2
-for invalid configuration, and 8 for pending checks. `doctor` executes only
-local version/identity probes, performs no account switch, and suppresses raw
-provider output. The currently supported mutation surface does not include
-operator retry/cancel or project configuration editing: these require safe
-workflow transition and comment-preserving JSONC semantics not yet exposed by
-the persistence/config APIs. `logs` is likewise not exposed because arbitrary
-session paths cannot yet be safely constrained to a private operator log root.
+`logs [--job <id>] [--follow] [--json]` maps persisted sessions to the private
+`${dirname(databasePath())}/agent-sessions/<session-id>/` directory. Only fixed
+`events.ndjson` and `stderr.log` files are read; symlinks and non-regular files
+are rejected, each initial read is limited to the last 64 KiB, and follow chunks
+are limited to 16 KiB. Missing logs produce no entry. JSON snapshot shape is
+`{ "schema_version": 1, "logs": [{ "session_id", "kind", "content" }] }`.
+With `--follow --json`, the initial snapshot is followed by JSON Lines append
+events `{ "schema_version": 1, "event": "append", "session_id", "kind", "content" }`;
+Ctrl-C ends the stream. Logs never expose agent process credentials.
+
+`project add <id> --from <existing>` clones a validated project definition;
+`project remove <id>` refuses to remove the last project; `pause` and `resume`
+set the project's `enabled` flag. Updates preserve unrelated config text and
+comments, validate a same-directory temporary file, preserve mode, then atomically
+replace the original. Project commands use the global mutation guard, so
+orchestrator CLI writers are serialized; an inode/content check also rejects
+changes observed before replacement. The CLI cannot coordinate with arbitrary
+external editors, so do not edit the same config concurrently. Unsafe or
+unlocatable edits fail without changing the file.
+
+Exit statuses are 0 for success, 1 for refused/failed commands, 2 for invalid
+configuration, and 8 for pending checks. `doctor` performs local probes only;
+it never switches provider accounts or contacts model APIs.

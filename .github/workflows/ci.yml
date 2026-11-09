@@ -27,16 +27,20 @@ jobs:
       - name: Audit production dependencies
         run: pnpm audit --prod
       - run: pnpm test
+      - name: Install pinned Ratchet CLI
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RATCHET_VERSION: v0.6.3
+        run: bash .github/scripts/install-ratchet.sh
       - name: Validate gates
         id: ratchet
-        uses: all-the-rest/ratchet-cli@4cace52ac7731985130292ead6ae81d44b4d72d6 # v0.6.3
-        with:
-          version: v0.6.3
-          tier: fast
+        env:
+          RATCHET_NO_UPDATE_CHECK: '1'
+        run: ratchet check --config=ratchet.config.jsonc --tier=fast
       - name: Render the report
         if: always() && steps.ratchet.outcome == 'success'
         shell: bash
-        run: '"$RUNNER_TEMP/ratchet/ratchet" report --format md >> "$GITHUB_STEP_SUMMARY"'
+        run: 'ratchet report --format md >> "$GITHUB_STEP_SUMMARY"'
   secrets:
     name: gitleaks
     runs-on: ubuntu-latest

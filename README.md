@@ -43,6 +43,11 @@ issue-orchestrator status
 issue-orchestrator doctor --json
 issue-orchestrator jobs list --json
 issue-orchestrator jobs show <id> --json
+issue-orchestrator jobs retry <id>
+issue-orchestrator jobs cancel <id>
+issue-orchestrator logs [--job <id>] [--follow] [--json]
+issue-orchestrator project add <id> --from <existing>
+issue-orchestrator project pause|resume|remove <id>
 issue-orchestrator list
 issue-orchestrator run --once [--project <owner/repo>] [--dry-run]
 issue-orchestrator claim <project> <issue>

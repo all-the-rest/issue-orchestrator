@@ -7,6 +7,7 @@ const GUARDED = new Set([
   'run', 'dod',
   'claim', 'resume-lock', 'checkpoint', 'release', 'label', 'comment',
   'change-create', 'merge', 'evidence', 'ensure-labels',
+  'project',
 ]);
 
 const [command = 'help', ...rest] = process.argv.slice(2);
@@ -32,10 +33,13 @@ async function main(): Promise<number> {
   // run --dry-run is deliberately outside the guard and does not reconcile or
   // open SQLite. The dod command stays guarded for its complete execution.
   if (command === 'run' && opts['dry-run']) return await handler(opts) ?? 0;
-  if (command === 'doctor' || command === 'jobs') return await handler(opts) ?? 0;
+  if (command === 'doctor' || command === 'jobs' || command === 'logs') {
+    if (command === 'jobs' && ['retry', 'cancel'].includes(opts._[0])) return await withMutationGuard(() => handler(opts)) ?? 0;
+    return await handler(opts) ?? 0;
+  }
   if (GUARDED.has(command)) {
     return await withMutationGuard(async () => {
-      opts.reconciliation = reconcilePendingSideEffects(opts);
+      if (command !== 'project') opts.reconciliation = reconcilePendingSideEffects(opts);
       return await handler(opts) ?? 0;
     });
   }
