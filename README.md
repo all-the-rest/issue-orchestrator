@@ -119,8 +119,8 @@ preserves the branch/worktree and releases the queue claim. Unexpected failures
 or unavailable dependencies fail closed and retain the active claim and
 artifacts for recovery. Automatic merge is attempted only when enabled and
 after the existing exact-head native-approval, machine-marker, DoD, and required
-check gates pass. With `auto_merge: false`, the run always hands off for human
-review.
+check gates pass. Auto-merge defaults to true for enabled projects; set
+`auto_merge: false` to hand off for human review instead.
 
 For user-level launchd/systemd timers, Docker operation, persistence, and
 shutdown/recovery behavior, see [`docs/service.md`](docs/service.md).
@@ -228,9 +228,10 @@ report. The schema-2 manifest includes its evidence class and report; the issue
 receives a journaled proof comment with SHA-pinned before/after artifact links,
 commands/results, the evidence commit, exact source head, and change-request
 link. Merge separately requires the nonempty provider-required check set plus
-all configured required check names to be green. `auto_merge` defaults to false;
-explicitly set it true only with server-side branch protection and trusted
-approval rules. The CLI cannot replace those controls. Binary evidence and
+all configured required check names to be green. `auto_merge` defaults to true
+for enabled projects; set it to false to opt out. Because this enables automatic
+merge behavior, configure server-side branch protection/rulesets with required
+CI and trusted approval rules. The CLI cannot replace those controls. Binary evidence and
 customer-data evidence require manual inspection. See [`SECURITY.md`](SECURITY.md)
 and the [unattended-run threat model](docs/threat-model.md).
 
