@@ -1120,9 +1120,9 @@ export class OpenCodeAgentRunner implements AgentRunner {
     const externalSessionId = `ses_${randomUUID().replaceAll('-', '')}`;
     const safeId = safeSessionPart(externalSessionId);
     ensureResultDirectory(worktree);
-    if (args.role === 'builder') {
-      requireBuilderSandbox(worktree, this.containerRuntime, this.environment, externalSessionId);
-    }
+    const builderSandbox = args.role === 'builder'
+      ? requireBuilderSandbox(worktree, this.containerRuntime, this.environment, externalSessionId)
+      : undefined;
     const sessions = ensureAgentSessionDirectory(worktree);
     const sessionDirectory = ensurePrivateDirectory(path.join(sessions, safeId));
     ensurePrivateDirectory(path.join(sessionDirectory, 'cwd'));
@@ -1134,6 +1134,7 @@ export class OpenCodeAgentRunner implements AgentRunner {
       worktree,
       ndjsonPath: path.join(sessionDirectory, 'events.ndjson'),
       stderrPath: path.join(sessionDirectory, 'stderr.log'),
+      ociIdentity: builderSandbox?.identity ?? null,
     });
     return sessionValue(record);
   }
@@ -1231,6 +1232,15 @@ export class OpenCodeAgentRunner implements AgentRunner {
     const sandbox = role === 'builder'
       ? requireBuilderSandbox(worktree, this.containerRuntime, this.environment, record.externalSessionId)
       : undefined;
+    if (role === 'builder' && (!record.ociIdentity || record.ociIdentity !== sandbox?.identity)) {
+      throw new AgentRunnerError(
+        'AGENT_RECOVERY_UNSAFE',
+        !record.ociIdentity
+          ? 'Builder session has no persisted OCI runtime identity; refusing to recover or launch it'
+          : 'Builder OCI runtime identity changed; refusing to recover or launch through a different runtime',
+        record.externalSessionId,
+      );
+    }
     const agentName = `issue-orchestrator-${role}-${safeId}`;
     if (path.resolve(record.ndjsonPath) !== path.join(sessionDirectory, 'events.ndjson') ||
         path.resolve(record.stderrPath) !== path.join(sessionDirectory, 'stderr.log')) {
