@@ -58,7 +58,11 @@ jobs:
       - run: pnpm test
       - name: Validate generated macOS launchd plist
         if: runner.os == 'macOS'
-        run: plutil -lint <(node dist/cli.js service install --print | sed '/^$/,$d')
+        run: |
+          set -o pipefail
+          plist="$RUNNER_TEMP/issue-orchestrator.plist"
+          node dist/cli.js service install --print | sed '/^$/,$d' > "$plist"
+          plutil -lint "$plist"
       - name: Install pinned Ratchet CLI
         env:
           GH_TOKEN: ${{ github.token }}
