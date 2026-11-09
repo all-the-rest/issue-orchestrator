@@ -115,6 +115,10 @@ function requireType(value, type, name, file) {
 }
 
 function validateConfig(cfg, file) {
+  const positiveInteger = (value, name) => {
+    if (!Number.isSafeInteger(value) || value < 1) throw new Error(`${file}: "${name}" must be a positive integer`);
+  };
+  if (cfg.max_concurrency !== undefined) positiveInteger(cfg.max_concurrency, 'max_concurrency');
   if (!cfg.repos || typeof cfg.repos !== 'object' || Array.isArray(cfg.repos) ||
       Object.keys(cfg.repos).length === 0) {
     throw new Error(`${file}: "repos" must be a non-empty object keyed by project id`);
@@ -167,6 +171,15 @@ function validateConfig(cfg, file) {
     }
     if (!repo || typeof repo !== 'object' || Array.isArray(repo)) {
       throw new Error(`${file}: repo "${project}" must be an object`);
+    }
+    if (repo.max_concurrency !== undefined) {
+      positiveInteger(repo.max_concurrency, `repos.${project}.max_concurrency`);
+      if (repo.max_concurrency > (cfg.max_concurrency ?? 1)) throw new Error(`${file}: repos.${project}.max_concurrency cannot exceed max_concurrency`);
+    }
+    if (repo.resource_locks !== undefined && (!Array.isArray(repo.resource_locks) ||
+        repo.resource_locks.some((name) => typeof name !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name)) ||
+        new Set(repo.resource_locks).size !== repo.resource_locks.length)) {
+      throw new Error(`${file}: repos.${project}.resource_locks must be an array of unique safe names`);
     }
     const enabled = repo.enabled ?? defaults.enabled ?? true;
     const localOnly = repo.local_only ?? defaults.local_only ?? false;
@@ -313,6 +326,11 @@ export function readState(configFile) {
   return getRuntimeStore().readState(file);
 }
 
+export function readResumableLock(configFile: string, projectLimits?, requestedProject?: string) {
+  importLegacyState(configFile);
+  return getRuntimeStore().readResumableLock(configFile, projectLimits, requestedProject);
+}
+
 export function writeState(state, configFile) {
   getRuntimeStore().writeState(state, configFile ?? configPath());
 }
@@ -322,16 +340,36 @@ export function readLock(_file = lockPath(), configFile?: string) {
   return getRuntimeStore().readLock();
 }
 
-export function acquireLock(lock, { force = false, expectedOwnerToken }: { force?: boolean; expectedOwnerToken?: string } = {}) {
-  return getRuntimeStore().acquireLock(lock, force, expectedOwnerToken);
+export function readLockByOwner(ownerToken: string) {
+  return getRuntimeStore().readLockByOwner(ownerToken);
+}
+
+export function readLockForWorkItem(project: string, issue: string | number) {
+  return getRuntimeStore().readLockForWorkItem(project, issue);
+}
+
+export function activeJobCount() {
+  return getRuntimeStore().activeJobCount();
+}
+
+export function ownerProcessIdForOwner(ownerToken: string) {
+  return getRuntimeStore().ownerProcessIdForOwner(ownerToken);
+}
+
+export function hasReadyJob(project: string, issue: string | number, configFile: string) {
+  return getRuntimeStore().hasReadyJob(project, issue, configFile);
+}
+
+export function acquireLock(lock, { force = false, expectedOwnerToken, limits }: { force?: boolean; expectedOwnerToken?: string; limits?: { maxConcurrency?: number; projectConcurrency?: number; resourceLocks?: string[] } } = {}) {
+  return getRuntimeStore().acquireLock(lock, force, expectedOwnerToken, limits);
 }
 
 export function writeLock(lock, _file = lockPath()) {
   return getRuntimeStore().updateLock(lock);
 }
 
-export function resumeLock(previousToken, lock) {
-  return getRuntimeStore().resumeLock(previousToken, lock);
+export function resumeLock(previousToken, lock, limits?) {
+  return getRuntimeStore().resumeLock(previousToken, lock, limits);
 }
 
 export function clearLock(_file = lockPath(), ownerToken, result = 'none') {

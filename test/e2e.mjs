@@ -711,7 +711,51 @@ assert.equal(run(['status'], { env: { ISSUE_ORCHESTRATOR_CONFIG: invalidConfig }
 const credentialConfig = path.join(TMP, 'credential.jsonc');
 write(credentialConfig, fs.readFileSync(CONFIG, 'utf8').replace('"accounts": ["reisi007", "reisi008"],', '"accounts": ["reisi007", "reisi008"], "api_key": "should-never-be-configured",'));
 assert.equal(run(['status'], { env: { ISSUE_ORCHESTRATOR_CONFIG: credentialConfig } }).code, 2);
+for (const [name, mutate, reason] of [
+  ['global concurrency', (cfg) => { cfg.max_concurrency = 0; }, /max_concurrency.*positive integer/],
+  ['project concurrency', (cfg) => { cfg.max_concurrency = 2; cfg.repos['reisi007/demo'].max_concurrency = 3; }, /cannot exceed max_concurrency/],
+  ['resource names', (cfg) => { cfg.repos['reisi007/demo'].resource_locks = ['browser', 'browser']; }, /unique safe names/],
+]) {
+  const invalidScheduling = structuredClone(parseJsonc(fs.readFileSync(CONFIG, 'utf8')));
+  mutate(invalidScheduling);
+  const file = path.join(TMP, `invalid-${name.replaceAll(' ', '-')}.jsonc`);
+  write(file, invalidScheduling);
+  const result = run(['status'], { env: { ISSUE_ORCHESTRATOR_CONFIG: file } });
+  assert.equal(result.code, 2, `${name} should be rejected`);
+  assert.match(result.err, reason);
+}
 ok('config validation rejects missing decisions and credential fields');
+
+const manualSchedulingHome = path.join(TMP, 'manual-scheduling-home');
+const manualSchedulingConfig = structuredClone(parseJsonc(fs.readFileSync(CONFIG, 'utf8')));
+manualSchedulingConfig.max_concurrency = 2;
+manualSchedulingConfig.repos['reisi007/demo'].max_concurrency = 1;
+manualSchedulingConfig.repos['reisi007/demo'].resource_locks = ['browser'];
+const manualSchedulingFile = path.join(TMP, 'manual-scheduling.json');
+write(manualSchedulingFile, manualSchedulingConfig);
+const manualSchedulingEnv = { ISSUE_ORCHESTRATOR_HOME: manualSchedulingHome, ISSUE_ORCHESTRATOR_CONFIG: manualSchedulingFile };
+const manualScheduled = json(runOk(['claim', 'reisi007/demo', '1'], { env: manualSchedulingEnv }));
+const manualSchedulingStore = new SQLiteStore(path.join(manualSchedulingHome, 'orchestrator.sqlite3'));
+assert.equal(Number(manualSchedulingStore.rows('SELECT max_concurrency FROM scheduler_global_limit')[0].max_concurrency), 2);
+assert.equal(manualSchedulingStore.rows('SELECT owner_token FROM job_resource_locks WHERE resource=?', 'browser')[0].owner_token, manualScheduled.owner_token);
+assert.ok(manualSchedulingStore.claimWorkItem('another/project', 1, { configFile: manualSchedulingFile, maxConcurrency: 2, projectConcurrency: 1 }));
+manualSchedulingStore.close();
+ok('manual claim reserves configured capacity and resources without blocking an independent worker slot');
+
+const aliasRecoveryHome = path.join(TMP, 'alias-recovery-home');
+const aliasRecoveryConfig = structuredClone(parseJsonc(fs.readFileSync(CONFIG, 'utf8')));
+aliasRecoveryConfig.repos['REISI007/DEMO'] = structuredClone(aliasRecoveryConfig.repos['reisi007/demo']);
+const aliasRecoveryFile = path.join(TMP, 'alias-recovery.json');
+write(aliasRecoveryFile, aliasRecoveryConfig);
+const aliasRecoveryEnv = { ISSUE_ORCHESTRATOR_HOME: aliasRecoveryHome, ISSUE_ORCHESTRATOR_CONFIG: aliasRecoveryFile };
+const originalAliasClaim = json(runOk(['claim', 'reisi007/demo', '1'], { env: aliasRecoveryEnv }));
+const aliasRecoveryStore = new SQLiteStore(path.join(aliasRecoveryHome, 'orchestrator.sqlite3'));
+aliasRecoveryStore.db.prepare('UPDATE jobs SET lease_pid=?, lease_start_ticks=NULL WHERE owner_token=?').run(2147483647, originalAliasClaim.owner_token);
+aliasRecoveryStore.close();
+const aliasResumed = json(runOk(['resume-lock', 'REISI007/DEMO', '1', '--confirm-stale'], { env: aliasRecoveryEnv }));
+assert.notEqual(aliasResumed.owner_token, originalAliasClaim.owner_token);
+assert.equal(aliasResumed.repo, 'reisi007/demo', 'recovery preserves the original configured project spelling');
+ok('confirmed resume accepts a GitHub project case alias without changing the persisted identity');
 
 const dodConfigBase = parseJsonc(fs.readFileSync(CONFIG, 'utf8'));
 function expectInvalidDod(mutator, expectedReason) {
@@ -922,13 +966,13 @@ assert.ok(retryJob, 'the CLI claim should have a persisted job');
 retryStore.db.prepare('UPDATE jobs SET max_attempts=3 WHERE id=?').run(retryJob.id);
 const retriesBeforeExhaustion = Number(retryStore.rows('SELECT COUNT(*) AS count FROM jobs WHERE work_item_id=?', retryJob.work_item_id)[0].count);
 for (let attempt = 2; attempt <= 3; attempt += 1) {
-  retryStore.db.prepare('UPDATE jobs SET lease_expires_at=? WHERE id=?').run(new Date(0).toISOString(), retryJob.id);
+  retryStore.db.prepare('UPDATE jobs SET lease_expires_at=?,lease_pid=?,lease_start_ticks=NULL WHERE id=?').run(new Date(0).toISOString(), 2147483647, retryJob.id);
   retryClaim = json(runOk(
     ['claim', 'reisi007/demo', '1', '--force', '--confirm-stale'],
     { env: retryEnv },
   ));
 }
-retryStore.db.prepare('UPDATE jobs SET lease_expires_at=? WHERE id=?').run(new Date(0).toISOString(), retryJob.id);
+retryStore.db.prepare('UPDATE jobs SET lease_expires_at=?,lease_pid=?,lease_start_ticks=NULL WHERE id=?').run(new Date(0).toISOString(), 2147483647, retryJob.id);
 const exhaustedCliClaim = runRefused(
   ['claim', 'reisi007/demo', '1', '--force', '--confirm-stale'],
   { env: retryEnv },
@@ -1168,7 +1212,7 @@ assert.notEqual(boundaryCrash.code, 0, 'the test hook must kill the CLI immediat
   assert.equal(merged.stage, 'merged', 'workflow DONE and merged stage must commit together');
   assert.equal(merged.state, 'CLAIMED');
   assert.equal(store.rows("SELECT status FROM side_effect_journal WHERE kind='merge'")[0].status, 'COMPLETED');
-  store.db.prepare('UPDATE jobs SET lease_expires_at=? WHERE id=?').run(new Date(0).toISOString(), merged.id);
+  store.db.prepare('UPDATE jobs SET lease_expires_at=?,lease_pid=?,lease_start_ticks=NULL WHERE id=?').run(new Date(0).toISOString(), 2147483647, merged.id);
   store.close();
 }
 write(path.join(boundaryFixtures, 'issue-closed.json'), {
@@ -1226,7 +1270,7 @@ assert.equal((fs.readFileSync(GH_LOG, 'utf8').match(/pr merge/g) ?? []).length, 
     store.jobIdForOwner(mergeLock.owner_token))[0];
   assert.equal(job.workflow_state, 'MERGING');
   assert.equal(job.state, 'CLAIMED');
-  store.db.prepare('UPDATE jobs SET lease_expires_at=? WHERE id=?').run(new Date(0).toISOString(), job.id);
+  store.db.prepare('UPDATE jobs SET lease_expires_at=?,lease_pid=?,lease_start_ticks=NULL WHERE id=?').run(new Date(0).toISOString(), 2147483647, job.id);
   assert.equal(store.reapExpiredLeases().length, 1, 'the expired lease must be reaped before restart recovery');
   const reaped = store.rows('SELECT state, owner_token, workflow_state FROM jobs WHERE id=?', job.id)[0];
   assert.equal(reaped.state, 'READY');
@@ -1243,7 +1287,8 @@ assert.equal((fs.readFileSync(GH_LOG, 'utf8').match(/pr merge/g) ?? []).length, 
   store.close();
 }
 const blockedRecovery = json(runOk(['status'], { env: { FAKE_ISSUE_MODE: 'closed' } }));
-assert.equal(blockedRecovery.side_effect_reconciliation.uncertain, 1);
+assert.equal(blockedRecovery.side_effect_reconciliation.skipped_live_owner, 1,
+  'completed merge recovery owned by a live process must be skipped without provider inspection');
 {
   const store = new SQLiteStore(lockPath());
   const active = store.rows('SELECT id, state, owner_token, workflow_state FROM jobs WHERE project_id=? AND change_number=?',
@@ -1255,7 +1300,7 @@ assert.equal(blockedRecovery.side_effect_reconciliation.uncertain, 1);
   assert.ok(mergeEffect);
   // Model a crash after the journal commit but before the merge check and queue finalization.
   store.completeSideEffect(mergeEffect.idempotencyKey, { outcome: 'simulated crash after journal completion' });
-  store.db.prepare('UPDATE jobs SET lease_expires_at=? WHERE id=?').run(new Date(0).toISOString(), active.id);
+  store.db.prepare('UPDATE jobs SET lease_expires_at=?,lease_pid=?,lease_start_ticks=NULL WHERE id=?').run(new Date(0).toISOString(), 2147483647, active.id);
   assert.equal(store.reapExpiredLeases().length, 1);
   store.close();
 }

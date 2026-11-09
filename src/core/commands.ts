@@ -9,6 +9,12 @@ import {
   repoConfig,
   enabledRepos,
   readState,
+  readResumableLock,
+  readLockByOwner,
+  readLockForWorkItem,
+  hasReadyJob,
+  activeJobCount,
+  ownerProcessIdForOwner,
   writeState,
   readLock,
   acquireLock,
@@ -272,6 +278,15 @@ function assertOwner(lock, opts, operation) {
   }
 }
 
+function assertNotOwnedByAnotherLiveProcess(lock, operation: string) {
+  const store = getRuntimeStore();
+  const ownerPid = ownerProcessIdForOwner(lock.owner_token);
+  const jobId = store.jobIdForOwner(lock.owner_token);
+  if (ownerPid !== process.pid && store.isLiveJob(jobId)) {
+    throw new CliError(`${operation} refused: this job is still owned by live worker process ${ownerPid ?? '(unknown)'}`);
+  }
+}
+
 function assertProviderIdentity(lock, rc, operation) {
   let persistedProvider;
   try {
@@ -290,12 +305,15 @@ function assertProviderIdentity(lock, rc, operation) {
 function ownedLock(opts, { project, issue, change }: any = {}) {
   let lock;
   try {
-    lock = readLock(lockPath(configFile(opts)), configFile(opts));
+    const ownerToken = typeof opts['owner-token'] === 'string' ? opts['owner-token'] : null;
+    lock = ownerToken ? readLockByOwner(ownerToken) : readLock(lockPath(configFile(opts)), configFile(opts));
   } catch (error) {
     throw new CliError(`Lock is corrupt: ${error.message}; inspect it before recovery`);
   }
+  if (!lock && activeJobCount() > 1) throw new CliError('Multiple jobs are active; this operation requires the exact --owner-token');
   if (!lock) throw new CliError('No active queue lock; claim the issue before this operation');
   assertOwner(lock, opts, 'This operation');
+  assertNotOwnedByAnotherLiveProcess(lock, 'This operation');
   if (lock.config_file && path.resolve(lock.config_file) !== path.resolve(configFile(opts))) {
     throw new CliError(`active lock belongs to another config (${lock.config_file}); refusing cross-config access`);
   }
@@ -663,18 +681,31 @@ function inspectPendingSideEffect(effect, opts): SideEffectObservation {
   }
 }
 
+function recoverySchedulingLimits(effect, opts) {
+  const cfg = loadConfig(effect.configFile ?? configFile(opts));
+  const repo = repoConfig(cfg, effect.project);
+  return { maxConcurrency: cfg.max_concurrency ?? 1,
+    projectConcurrency: repo.raw.max_concurrency ?? cfg.max_concurrency ?? 1,
+    resourceLocks: repo.raw.resource_locks ?? [] };
+}
+
 function reconcilePendingSideEffects(opts) {
   // Preserve command-specific legacy-lock recovery (notably corrupt-lock quarantine).
   const store = getRuntimeStore({ importLegacy: false });
   const reapedLeases = store.reapExpiredLeases();
   const inspected = [];
   for (const effect of store.pendingSideEffects()) {
+    if (effect.jobId !== null && store.isLiveJob(effect.jobId)) {
+      inspected.push({ idempotency_key: effect.idempotencyKey, kind: effect.kind, project: effect.project,
+        observation: 'skipped-live-owner' });
+      continue;
+    }
     const observation = inspectPendingSideEffect(effect, opts);
     if (observation.state === 'applied') {
       if (effect.kind === 'merge') {
         const recoveryLock = store.prepareMergedSideEffectRecovery(effect.idempotencyKey, observation.result as {
           project: string; number: number; head_sha: string; issue: number; branch: string; base: string;
-        });
+        }, recoverySchedulingLimits(effect, opts));
         const recovered = recoveryLock ? finishRecoveredMergeLabels(store, effect, recoveryLock, opts) : false;
         if (!recovered) {
           store.markSideEffectUncertain(effect.idempotencyKey, 'verified merge belongs to a job with a different active owner; refusing recovery');
@@ -703,12 +734,17 @@ function reconcilePendingSideEffects(opts) {
     });
   }
   for (const effect of store.completedMergeRecoveries()) {
+    if (effect.jobId !== null && store.isLiveJob(effect.jobId)) {
+      inspected.push({ idempotency_key: effect.idempotencyKey, kind: effect.kind, project: effect.project,
+        observation: 'skipped-live-owner' });
+      continue;
+    }
     const observation = inspectPendingSideEffect(effect, opts);
     let recovered = false;
     if (observation.state === 'applied') {
       const recoveryLock = store.prepareMergedSideEffectRecovery(effect.idempotencyKey, observation.result as {
         project: string; number: number; head_sha: string; issue: number; branch: string; base: string;
-      });
+      }, recoverySchedulingLimits(effect, opts));
       recovered = recoveryLock ? finishRecoveredMergeLabels(store, effect, recoveryLock, opts) : false;
     }
     inspected.push({
@@ -727,6 +763,7 @@ function reconcilePendingSideEffects(opts) {
     completed: inspected.filter((item) => item.observation === 'applied').length,
     absent: inspected.filter((item) => item.observation === 'absent').length,
     uncertain: inspected.filter((item) => item.observation === 'unknown').length,
+    skipped_live_owner: inspected.filter((item) => item.observation === 'skipped-live-owner').length,
     entries: inspected,
   };
 }
@@ -1347,7 +1384,10 @@ function cmdClaim(opts) {
   if (!Number.isInteger(number) || number <= 0) throw new CliError(`Invalid issue number: ${issue}`);
 
   const lockFile = lockPath(configFile(opts));
-  const previous = readLock(lockFile, configFile(opts));
+  const previous = typeof opts['owner-token'] === 'string'
+    ? readLockByOwner(opts['owner-token'])
+    : readLock(lockFile, configFile(opts));
+  if (!previous && activeJobCount() > 1 && (opts.force || opts['owner-token'])) throw new CliError('Multiple jobs are active; use an exact --owner-token for owner-scoped operations');
   if (previous?.repo === project) assertProviderIdentity(previous, rc, 'claim');
   verifyAccount(tracker, codeHost, rc);
   const issueData = tracker.getWorkItem({ project, number });
@@ -1356,6 +1396,7 @@ function cmdClaim(opts) {
   const sameClaim = previous && previous.repo === project && Number(previous.issue) === number;
   if (sameClaim && !opts.force && previous.config_file === path.resolve(configFile(opts)) &&
       opts['owner-token'] === previous.owner_token) {
+    assertNotOwnedByAnotherLiveProcess(previous, 'claim re-entry');
     const updated = {
       ...previous,
       branch: opts.branch ?? previous.branch ?? null,
@@ -1374,7 +1415,7 @@ function cmdClaim(opts) {
     return 0;
   }
 
-  if (previous && !opts.force) {
+  if (previous && !opts.force && (sameClaim || (cfg.max_concurrency ?? 1) === 1)) {
     throw new CliError(
       `Queue is locked by ${previous.repo}#${previous.issue} since ${previous.claimed_at}; ` +
       'a same-issue claim also requires the exact --owner-token. Use resume-lock only after verifying the old run stopped.'
@@ -1396,7 +1437,11 @@ function cmdClaim(opts) {
     local_only: rc.local_only,
   };
   try {
-    acquireLock(lock, { force: !!opts.force, expectedOwnerToken: previous?.owner_token });
+    acquireLock(lock, { force: !!opts.force, expectedOwnerToken: previous?.owner_token, limits: {
+      maxConcurrency: cfg.max_concurrency ?? 1,
+      projectConcurrency: rc.raw.max_concurrency ?? cfg.max_concurrency ?? 1,
+      resourceLocks: rc.raw.resource_locks ?? [],
+    } });
   } catch (error) {
     throw new CliError(error.message);
   }
@@ -1423,8 +1468,9 @@ function cmdResumeLock(opts) {
   const number = Number(issue);
   if (!Number.isSafeInteger(number) || number <= 0) throw new CliError(`Invalid issue number: ${issue}`);
   const lockFile = lockPath(configFile(opts));
-  const lock = readLock(lockFile, configFile(opts));
-  if (!lock || lock.repo !== project || Number(lock.issue) !== number) {
+  readState(configFile(opts)); // Import config-specific legacy state before looking up its job.
+  const lock = readLockForWorkItem(project, number);
+  if (!lock || Number(lock.issue) !== number) {
     throw new CliError(`No matching active lock for ${project}#${number}`);
   }
   if (lock.config_file && path.resolve(lock.config_file) !== path.resolve(configFile(opts))) {
@@ -1441,7 +1487,11 @@ function cmdResumeLock(opts) {
     resumed_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
   };
-  resumeLock(lock.owner_token, resumed);
+  resumeLock(lock.owner_token, resumed, {
+    maxConcurrency: cfg.max_concurrency ?? 1,
+    projectConcurrency: rc.raw.max_concurrency ?? cfg.max_concurrency ?? 1,
+    resourceLocks: rc.raw.resource_locks ?? [],
+  });
   const state = readState(configFile(opts));
   state.active = resumed;
   state.last_run = resumed.updated_at;
@@ -1486,7 +1536,9 @@ function cmdRelease(opts) {
   const lockFile = lockPath(configFile(opts));
   let lock;
   try {
-    lock = readLock(lockFile, configFile(opts));
+    lock = typeof opts['owner-token'] === 'string'
+      ? readLockByOwner(opts['owner-token'])
+      : readLock(lockFile, configFile(opts));
   } catch (error) {
     if (!String(error.message).startsWith('Legacy lock is corrupt:')) {
       throw new CliError(error.message);
@@ -1514,9 +1566,12 @@ function cmdRelease(opts) {
   }
 
   if (!lock) {
+    if (opts['owner-token']) throw new CliError('Queue lock ownership changed; refusing to release another run\'s lock');
+    if (activeJobCount() > 1) throw new CliError('Multiple jobs are active; release requires the exact --owner-token');
     console.log(JSON.stringify({ released: false, reason: 'no active lock' }, null, 2));
     return 0;
   }
+  assertNotOwnedByAnotherLiveProcess(lock, 'release');
   if (opts.force && !opts['confirm-stale']) {
     throw new CliError('release --force requires --confirm-stale after verifying the owner has stopped');
   }
@@ -2556,7 +2611,7 @@ function writeEvidenceSnapshot(directory: string, side: 'before' | 'after', text
   fs.writeFileSync(file, text, { mode: 0o600, flag: 'wx' });
 }
 
-function discoverRunCandidate(cfg: RunConfig, onlyProject?: string): RunIssueCandidate | null {
+function discoverRunCandidates(cfg: RunConfig, onlyProject?: string, recoveryConfigFile?: string): RunIssueCandidate[] {
   const projects = onlyProject ? [onlyProject] : enabledRepos(cfg);
   const candidates: RunIssueCandidate[] = [];
   for (const project of projects) {
@@ -2568,7 +2623,13 @@ function discoverRunCandidate(cfg: RunConfig, onlyProject?: string): RunIssueCan
     const blocked = new Set([...RUN_BLOCKED_LABELS].map((key) => rc.labels[key]).filter(Boolean));
     for (const item of items) {
       const labels = labelNames(item) ?? [];
-      if (labels.some((label) => blocked.has(label))) continue;
+      const blockedLabels = labels.filter((label) => blocked.has(label));
+      const readyWorkflow = recoveryConfigFile ? hasReadyJob(project, item.number, recoveryConfigFile) : null;
+      const recoverableJob = !!readyWorkflow && blockedLabels.length > 0 && (
+        (RUN_TERMINAL_STATES.has(readyWorkflow)) ||
+        (!!rc.labels.working && blockedLabels.every((label) => label === rc.labels.working))
+      );
+      if (blockedLabels.length && !recoverableJob) continue;
       if (!rc.trusted_authors.includes(authorLogin(item.author))) continue;
       if (containsSecretLikeContent(item.title ?? '')) {
         throw new CliError(`Issue #${item.number} title looks credential-like; discovery refused`);
@@ -2582,7 +2643,7 @@ function discoverRunCandidate(cfg: RunConfig, onlyProject?: string): RunIssueCan
       Date.parse(b.item.createdAt ?? (0 as unknown as string))) ||
     a.project.localeCompare(b.project) || Number(a.item.number) - Number(b.item.number)
   ));
-  return candidates[0] ?? null;
+  return candidates;
 }
 
 function runIssueContext(cfg: RunConfig, project: string, issueNumber: number, allowClosed = false): RunVerifiedIssueContext {
@@ -3070,10 +3131,21 @@ async function cmdRun(opts: RunCliOptions) {
   const cfg = requireConfig(opts) as RunConfig;
   const dryRun = !!opts['dry-run'];
   let active: RunLock | null = null;
+  let claimBlocked = false;
   if (!dryRun) {
-    try { active = readLock(lockPath(configFile(opts)), configFile(opts)); }
+    const globalCap = Number((cfg as RunConfig & { max_concurrency?: number }).max_concurrency ?? 1);
+    const resumeLimits = Object.fromEntries(Object.entries(cfg.repos).map(([project, raw]) => [project, {
+      maxConcurrency: globalCap,
+      projectConcurrency: Number((raw as Record<string, unknown>).max_concurrency ?? globalCap),
+      resourceLocks: Array.isArray((raw as Record<string, unknown>).resource_locks)
+        ? (raw as Record<string, unknown>).resource_locks as string[] : [],
+    }]));
+    try { active = readResumableLock(configFile(opts), resumeLimits, opts.project ? String(opts.project) : undefined); }
     catch (error) { throw new CliError(`Active run state is corrupt: ${error.message}`); }
-    if (active && opts.project && active.repo !== opts.project) {
+    const activeUsesGitHubTracker = active?.provider === 'github' || active?.provider.startsWith('github+');
+    const requestedProjectMatches = active && opts.project && (active.repo === opts.project ||
+      (activeUsesGitHubTracker && active.repo.toLowerCase() === String(opts.project).toLowerCase()));
+    if (active && opts.project && !requestedProjectMatches) {
       throw new CliError(`Queue is already claimed by ${active.repo}#${active.issue}; this run requested ${opts.project}`);
     }
   }
@@ -3088,16 +3160,64 @@ async function cmdRun(opts: RunCliOptions) {
     assertProviderIdentity(active, rc, 'run --once');
     selected = { project, rc, tracker, codeHost, issue, acceptanceText, item: issue };
   } else {
-    const candidate = discoverRunCandidate(cfg, opts.project ? String(opts.project) : undefined);
-    if (!candidate) {
+    const candidates = discoverRunCandidates(cfg, opts.project ? String(opts.project) : undefined,
+      dryRun ? undefined : configFile(opts));
+    selected = undefined as unknown as RunSelection;
+    for (const candidate of candidates) {
+      const issueNumber = Number(candidate.item.number);
+      if (!Number.isSafeInteger(issueNumber) || issueNumber <= 0) throw new CliError('tracker returned an invalid issue number');
+      const verified = runIssueContext(cfg, candidate.project, issueNumber);
+      const selection = { ...candidate, ...verified, issue: verified.issue };
+      if (dryRun) { selected = selection; break; }
+
+      checkRunShutdown();
+      try {
+        candidate.codeHost.verifyRepository({ project: candidate.project });
+      } catch (error) {
+        // A shared checkout may belong to a different configured project. That
+        // candidate cannot run here, but must not starve later candidates that
+        // match this checkout. Keep all other verification failures fail-closed.
+        if (!opts.project && /^origin does not identify configured GitHub project .+; evidence was not published$/.test(error.message)) {
+          continue;
+        }
+        throw new CliError(error.message);
+      }
+      const rawRepo = cfg.repos[candidate.project] as Record<string, unknown>;
+      const globalCap = Number((cfg as RunConfig & { max_concurrency?: number }).max_concurrency ?? 1);
+      const now = new Date().toISOString();
+      const proposed = {
+        provider: candidate.rc.provider, repo: candidate.project, issue: issueNumber,
+        branch: null, account: candidate.rc.code_host_account ?? candidate.rc.account,
+        config_file: path.resolve(configFile(opts)), owner_token: randomUUID(), stage: 'claimed',
+        claimed_at: now, updated_at: now, local_only: candidate.rc.local_only,
+      };
+      try {
+        active = acquireLock(proposed, { limits: {
+          maxConcurrency: globalCap,
+          projectConcurrency: Number(rawRepo.max_concurrency ?? globalCap),
+          resourceLocks: Array.isArray(rawRepo.resource_locks) ? rawRepo.resource_locks as string[] : [],
+        } });
+      } catch (error) {
+        if (/capacity is full|Resource lock is busy|already has an active owner|not ready to claim|exhausted max_attempts|existing history under a different project spelling/i.test(error.message)) {
+          claimBlocked = true;
+          continue;
+        }
+        throw new CliError(error.message);
+      }
+      selected = selection;
+      if (candidate.rc.labels.working) journalIssueLabel({
+        lock: active, tracker: candidate.tracker, project: candidate.project, issue: issueNumber,
+        label: candidate.rc.labels.working, action: 'add',
+      });
+      break;
+    }
+    if (!selected) {
+      if (!dryRun && claimBlocked) throw new CliError('All trusted candidates are currently blocked by active capacity, resource or work-item reservations');
       console.log(JSON.stringify({ outcome: dryRun ? 'DRY_RUN' : 'NO_ISSUE', project: opts.project ?? null, issue: null,
+        capacity_blocked: claimBlocked || undefined,
         plan: dryRun ? ['discover one trusted open issue', 'claim it', 'run the guarded issue workflow'] : undefined }, null, 2));
       return 0;
     }
-    const issueNumber = Number(candidate.item.number);
-    if (!Number.isSafeInteger(issueNumber) || issueNumber <= 0) throw new CliError('tracker returned an invalid issue number');
-    const verified = runIssueContext(cfg, candidate.project, issueNumber);
-    selected = { ...candidate, ...verified, issue: verified.issue };
   }
 
   checkRunShutdown();
@@ -3131,31 +3251,7 @@ async function cmdRun(opts: RunCliOptions) {
   checkRunShutdown();
   codeHost.verifyRepository({ project });
   let lock = active;
-  if (!lock) {
-    checkRunShutdown();
-    const now = new Date().toISOString();
-    const proposed = {
-      provider: rc.provider,
-      repo: project,
-      issue: issueNumber,
-      branch: null,
-      account: rc.code_host_account ?? rc.account,
-      config_file: path.resolve(configFile(opts)),
-      owner_token: randomUUID(),
-      stage: 'claimed',
-      claimed_at: now,
-      updated_at: now,
-      local_only: rc.local_only,
-    };
-    try { lock = acquireLock(proposed); }
-    catch (error) { throw new CliError(error.message); }
-    if (rc.labels.working) {
-      checkRunShutdown();
-      journalIssueLabel({
-      lock, tracker, project, issue: issueNumber, label: rc.labels.working, action: 'add',
-      });
-    }
-  }
+  if (!lock) throw new CliError('candidate was selected without a successful SQLite reservation');
 
   const store = getRuntimeStore();
   let workflow = store.workflowStateForOwner(lock.owner_token);
@@ -3177,6 +3273,14 @@ async function cmdRun(opts: RunCliOptions) {
   } catch (error) {
     throw new CliError(`${error.message}; active claim and artifacts were preserved`);
   }
+  const heartbeatTimer = setInterval(() => {
+    try {
+      if (!getRuntimeStore().heartbeatJob(lock!.owner_token)) void requestRunShutdown('SIGTERM');
+    } catch {
+      void requestRunShutdown('SIGTERM');
+    }
+  }, 30_000);
+  heartbeatTimer.unref();
   const originalCwd = process.cwd();
   let succeeded = false;
   let final: Record<string, unknown>;
@@ -3360,7 +3464,7 @@ async function cmdRun(opts: RunCliOptions) {
         title,
         'body-file': pullBody,
       }));
-      lock = readLock(lockPath(configFile(opts)), configFile(opts));
+       lock = readLockByOwner(lock.owner_token);
       if (!lock?.change_number) throw new CliError('change request creation did not persist its number; active claim retained');
       if (process.env.NODE_ENV === 'test' && process.env.ISSUE_ORCHESTRATOR_TEST_CRASH_AFTER_PR_CREATE === '1') {
         process.kill(process.pid, 'SIGKILL');
@@ -3400,7 +3504,7 @@ async function cmdRun(opts: RunCliOptions) {
       } else if (beforeEvidenceRecovery !== 'REVIEWING') {
         throw new CliError(`cannot recover evidence publication from workflow state ${beforeEvidenceRecovery}; preserving claim`);
       }
-      lock = readLock(lockPath(configFile(opts)), configFile(opts));
+      lock = readLockByOwner(lock.owner_token);
       checkRunShutdown();
       crashAfterWorkflowStateForTest('EVIDENCE_PUBLISHED');
       publishRunMarker(lock, tracker, codeHost, rc, 'tests');
@@ -3446,6 +3550,7 @@ async function cmdRun(opts: RunCliOptions) {
 
     throw new CliError(`active run is at unsupported workflow state ${workflow}; preserving claim and artifacts`);
   } finally {
+    clearInterval(heartbeatTimer);
     try { process.chdir(originalCwd); } catch { /* retain recovery artifacts if the base cwd disappeared */ }
     if (succeeded) {
       try { git(['worktree', 'remove', workspace.worktree], { cwd: workspace.baseRoot }); }

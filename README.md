@@ -67,15 +67,46 @@ terminal and a new output file, and writes a JSON sidecar with the exact argv an
 exit status; it uses Node streams and does not depend on platform-specific
 `script` flags.
 
-`run --once` resumes an active claim or selects one open issue from enabled
-repositories, ordered by configured severity and age, and skips issues without
-a configured trusted author. It isolates work in a private runtime Git
-worktree, runs triage, baseline and after verification, an OCI-isolated builder,
+`run --once` atomically resumes a claim only after its recorded owner process is
+no longer live, or selects one open issue from enabled repositories, ordered by
+configured severity and age, and skips issues without a configured trusted
+author. It isolates work in a private runtime Git worktree, runs triage,
+baseline and after verification, an OCI-isolated builder,
 the configured DoD commands, evidence publication, and an independent review.
 The issue body or the configured trusted triage comment is passed to agents as
 acceptance data, not executable instructions. Use `--project` to restrict issue
 discovery. `--dry-run` prints the selected issue and plan without opening or
 mutating SQLite, claiming work, creating a branch, or writing to GitHub.
+Each worker must run from a checkout whose `origin` matches its selected code
+host project; run workers from separate matching checkouts for distinct projects.
+
+Scheduling is database-global across every config sharing
+`ISSUE_ORCHESTRATOR_HOME`:
+`max_concurrency` defaults to `1`. Set it to a positive integer to allow up to
+that many runs, and optionally set `repos.<project>.max_concurrency` as an
+additional per-project cap no greater than the global cap. A project can reserve
+named `resource_locks` (for example `["browser"]`, `["build"]`, or `["encode"]`)
+so jobs requiring the same scarce resource queue transactionally. Concurrent
+Configurations using one runtime home must agree on the global cap. Configurations
+with active jobs for the same project must also agree on its project cap. More agents
+increase model/API spend and provider rate-limit use approximately with active agent count: at `N`
+concurrent runs, expect up to roughly `N` times the per-run model/API demand and
+more simultaneous provider calls. Configure caps according to provider quotas and
+budget; concurrency does not increase any provider's rate limit.
+
+For GitHub trackers, use a consistent repository spelling across configurations.
+Case variants identify the same repository for active-claim checks; if an older
+work item exists under another spelling, a new claim is refused rather than
+silently creating a second workflow or resetting its retry history.
+
+```jsonc
+{
+  "max_concurrency": 2,
+  "repos": {
+    "owner/repo-a": { "max_concurrency": 1, "resource_locks": ["browser"] }
+  }
+}
+```
 
 Possible JSON outcomes include `NO_ISSUE`, `DRY_RUN`, and `DONE`; `REVIEW`,
 `BLOCKED`, and `NEEDS_INFO` hand the issue back for human action. Handover
