@@ -110,6 +110,8 @@ interface JobTransitionRow extends IdRow {
 
 interface FinishingJobRow extends IdRow {
   work_item_id: number | bigint;
+  project_id: string;
+  provider: string;
   state: string;
   config_file: string | null;
 }
@@ -145,6 +147,11 @@ interface ExpiredJobRow extends IdRow {
   state: string;
   attempts: number | bigint;
   max_attempts: number | bigint;
+  claimed_by: string | null;
+  project_id: string;
+  provider: string;
+  lease_pid: number | bigint | null;
+  lease_start_ticks: string | null;
 }
 
 interface CountRow extends SqlRow {
@@ -273,6 +280,58 @@ export function databasePath() {
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+function isGitHubTracker(provider: string): boolean {
+  return provider.split('+', 1)[0] === 'github';
+}
+
+function githubProjectPredicate(column: string, provider: string): string {
+  return isGitHubTracker(provider) ? `lower(${column})=lower(?)` : `${column}=?`;
+}
+
+function trackerProviderPredicate(alias: string, provider: string): string {
+  const tracker = provider.split('+', 1)[0].replaceAll("'", "''");
+  return `substr(${alias}.provider,1,instr(${alias}.provider||'+','+')-1)='${tracker}'`;
+}
+
+function sameTrackerProject(left: string, leftProvider: string, right: string, rightProvider: string): boolean {
+  const leftTracker = leftProvider.split('+', 1)[0];
+  const rightTracker = rightProvider.split('+', 1)[0];
+  return leftTracker !== rightTracker ? false : isGitHubTracker(leftProvider)
+    ? left.toLowerCase() === right.toLowerCase() : left === right;
+}
+
+function processStartTicks(pid: number): string | null {
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const closingParen = stat.lastIndexOf(')');
+    if (closingParen < 0) return null;
+    // The remainder begins at proc stat field 3; starttime is field 22.
+    return stat.slice(closingParen + 1).trim().split(/\s+/)[19] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function processOwnerAlive(pid: number, startTicks: unknown): boolean | null {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return null;
+  try { process.kill(pid, 0); }
+  catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'ESRCH' ? false : true;
+  }
+  const currentStart = processStartTicks(pid);
+  if (typeof startTicks === 'string' && currentStart !== null) return startTicks === currentStart;
+  // On platforms without a process-start identity, a live PID is ambiguous;
+  // fail closed instead of risking a lease theft after PID reuse.
+  return true;
+}
+
+function assertResourceLocks(resources: string[] = []) {
+  if (!Array.isArray(resources) || resources.some((name) => typeof name !== 'string' ||
+      !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name)) || new Set(resources).size !== resources.length) {
+    throw new Error('resource_locks must contain unique safe resource names');
+  }
 }
 
 function isSqliteBusy(error: unknown) {
@@ -616,6 +675,43 @@ const MIGRATIONS = [
     ALTER TABLE agent_sessions ADD COLUMN execution_token TEXT;
     CREATE INDEX agent_sessions_execution_owner ON agent_sessions(execution_owner, execution_lease_until);
   `,
+  `
+    DROP INDEX IF EXISTS jobs_single_active_claim;
+    CREATE TABLE IF NOT EXISTS job_resource_locks (
+      resource TEXT PRIMARY KEY,
+      job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+      owner_token TEXT NOT NULL,
+      lease_expires_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS scheduler_config (
+      config_file TEXT PRIMARY KEY,
+      max_concurrency INTEGER NOT NULL CHECK(max_concurrency > 0)
+    );
+    CREATE TABLE IF NOT EXISTS scheduler_project_caps (
+      config_file TEXT NOT NULL,
+      project_id TEXT NOT NULL,
+      max_concurrency INTEGER NOT NULL CHECK(max_concurrency > 0),
+      PRIMARY KEY(config_file, project_id)
+    );
+    CREATE TABLE IF NOT EXISTS scheduler_global_limit (
+      singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+      max_concurrency INTEGER NOT NULL CHECK(max_concurrency > 0)
+    );
+    CREATE TABLE IF NOT EXISTS scheduler_project_limit (
+      project_id TEXT PRIMARY KEY,
+      max_concurrency INTEGER NOT NULL CHECK(max_concurrency > 0)
+    );
+    INSERT OR IGNORE INTO scheduler_config(config_file,max_concurrency)
+      SELECT DISTINCT config_file,1 FROM jobs WHERE config_file IS NOT NULL AND state IN ('CLAIMED','RUNNING');
+    ALTER TABLE jobs ADD COLUMN lease_pid INTEGER;
+    UPDATE jobs SET lease_pid=CAST(claimed_by AS INTEGER)
+      WHERE state IN ('CLAIMED','RUNNING') AND claimed_by GLOB '[0-9]*';
+    CREATE UNIQUE INDEX IF NOT EXISTS jobs_one_active_owner_per_work_item
+      ON jobs(work_item_id) WHERE state IN ('CLAIMED','RUNNING');
+  `,
+  `
+    ALTER TABLE jobs ADD COLUMN lease_start_ticks TEXT;
+  `,
 ];
 
 export class SQLiteStore {
@@ -878,13 +974,60 @@ export class SQLiteStore {
     `).run(project, provider, configFile ?? null, localOnly ? 1 : 0, stamp, stamp);
   }
 
+  private clearProjectCapacityIfIdle(project: string, provider: string) {
+    const projectPredicate = githubProjectPredicate('project_id', provider);
+    const jobPredicate = githubProjectPredicate('j.project_id', provider);
+    const trackerPredicate = trackerProviderPredicate('j', provider);
+    const active = this.db.prepare(`SELECT 1 FROM jobs j WHERE ${jobPredicate} AND ${trackerPredicate} AND j.state IN ('CLAIMED','RUNNING') LIMIT 1`).get(project);
+    if (!active) {
+      // These summary rows have no tracker identity and are never authoritative.
+      // Do not delete another tracker/config's persisted cap data here.
+    }
+  }
+
+  private clearInactiveProjectConfigCap(configFile: string, project: string, provider: string) {
+    // Do not delete case aliases: the legacy cap table has no tracker key, so
+    // a row may represent an active project on a different tracker. Enforcement
+    // uses exact persisted project spelling and ignores these stale aliases.
+    void configFile;
+    void project;
+    void provider;
+  }
+
   readLock(): Lock | null {
-    const row = asSqlRow<LockRow>(this.db.prepare(`
+    const rows = asSqlRows<LockRow>(this.db.prepare(`
       SELECT j.*, w.external_id, j.project_id
       FROM jobs j JOIN work_items w ON w.id=j.work_item_id
-      WHERE j.state IN ('CLAIMED', 'RUNNING') LIMIT 1
-    `).get());
-    return fromRow(row);
+      WHERE j.state IN ('CLAIMED', 'RUNNING') ORDER BY j.claimed_at, j.id LIMIT 2
+    `).all());
+    // The legacy diagnostic API has a singular result. Never misattribute an
+    // arbitrary job once concurrent claims are enabled.
+    return rows.length === 1 ? fromRow(rows[0]) : null;
+  }
+
+  activeJobCount(): number {
+    return Number(asSqlRow<CountRow>(this.db.prepare("SELECT COUNT(*) AS count FROM jobs WHERE state IN ('CLAIMED','RUNNING')").get())?.count ?? 0);
+  }
+
+  readLockByOwner(ownerToken: string): Lock | null {
+    return fromRow(asSqlRow<LockRow>(this.db.prepare(`SELECT j.*, w.external_id FROM jobs j
+      JOIN work_items w ON w.id=j.work_item_id WHERE j.owner_token=? AND j.state IN ('CLAIMED','RUNNING')`).get(ownerToken)));
+  }
+
+  readLockForWorkItem(project: string, issue: string | number): Lock | null {
+    const rows = asSqlRows<LockRow>(this.db.prepare(`SELECT j.*, w.external_id FROM jobs j
+      JOIN work_items w ON w.id=j.work_item_id WHERE (j.project_id=? OR
+        (lower(j.project_id)=lower(?) AND ${trackerProviderPredicate('j', 'github')}))
+        AND w.external_id=? AND j.state IN ('CLAIMED','RUNNING') LIMIT 2`).all(project, project, String(issue)));
+    return rows.length === 1 ? fromRow(rows[0]) : null;
+  }
+
+  hasReadyJob(project: string, issue: string | number, configFile: string): string | null {
+    const row = asSqlRow<SqlRow>(this.db.prepare(`SELECT j.workflow_state FROM jobs j JOIN work_items w ON w.id=j.work_item_id
+      WHERE (j.project_id=? OR (lower(j.project_id)=lower(?) AND ${trackerProviderPredicate('j', 'github')}))
+        AND w.external_id=? AND j.config_file=? AND j.state='READY' LIMIT 1`)
+      .get(project, project, String(issue), path.resolve(configFile)));
+    return typeof row?.workflow_state === 'string' ? row.workflow_state : null;
   }
 
   readState(configFile: string) {
@@ -900,6 +1043,68 @@ export class SQLiteStore {
     return { active: fromRow(row), last_run: state.last_run ?? null };
   }
 
+  readResumableLock(configFile: string, projectLimits: Record<string, { maxConcurrency?: number; projectConcurrency?: number; resourceLocks?: string[] }> = {}, requestedProject?: string): Lock | null {
+    return this.transaction(() => {
+      const rows = asSqlRows<LockRow & { lease_pid?: number | bigint | null; lease_start_ticks?: string | null }>(this.db.prepare(`
+        SELECT j.*, w.external_id FROM jobs j JOIN work_items w ON w.id=j.work_item_id
+        WHERE j.config_file=? AND j.state IN ('CLAIMED','RUNNING') ORDER BY j.claimed_at, j.id
+      `).all(path.resolve(configFile)));
+      for (const row of rows) {
+        if (requestedProject !== undefined && String(row.project_id) !== requestedProject &&
+            !(isGitHubTracker(String(row.provider)) && String(row.project_id).toLowerCase() === requestedProject.toLowerCase())) continue;
+         let limits = projectLimits[String(row.project_id)] ?? (isGitHubTracker(String(row.provider))
+           ? Object.entries(projectLimits).find(([project]) => project.toLowerCase() === String(row.project_id).toLowerCase())?.[1]
+           : undefined);
+         if (Object.keys(projectLimits).length === 0) limits = {};
+         else if (!limits) continue;
+        const pid = Number(row.lease_pid);
+        if (!Number.isSafeInteger(pid) || pid <= 0) continue;
+        if (processOwnerAlive(pid, row.lease_start_ticks) !== false) continue;
+        const globalCap = limits.maxConcurrency ?? 1;
+        const projectCap = limits.projectConcurrency ?? globalCap;
+        if (!Number.isSafeInteger(globalCap) || globalCap < 1 || !Number.isSafeInteger(projectCap) || projectCap < 1 || projectCap > globalCap) continue;
+        const active = this.activeJobCount();
+        if (active > globalCap) continue;
+        const provider = String(row.provider);
+        const projectPredicate = githubProjectPredicate('j.project_id', provider);
+        const projectActive = Number(asSqlRow<CountRow>(this.db.prepare(`SELECT COUNT(*) AS count FROM jobs j WHERE ${projectPredicate} AND ${trackerProviderPredicate('j', provider)} AND j.state IN ('CLAIMED','RUNNING')`).get(row.project_id))?.count ?? 0);
+        if (projectActive > projectCap) continue;
+        const storedGlobal = asSqlRow<SqlRow>(this.db.prepare('SELECT max_concurrency FROM scheduler_global_limit WHERE singleton=1').get());
+        if (storedGlobal && Number(storedGlobal.max_concurrency) !== globalCap) continue;
+         const storedProject = asSqlRow<SqlRow>(this.db.prepare(`SELECT max_concurrency FROM scheduler_project_caps WHERE config_file=? AND project_id=?`).get(String(row.config_file), String(row.project_id)));
+         if ((storedProject ? Number(storedProject.max_concurrency) : 1) !== projectCap) continue;
+        const held = new Set(this.db.prepare('SELECT resource FROM job_resource_locks WHERE job_id=? AND owner_token=?').all(row.id, row.owner_token).map((lock) => String((lock as SqlRow).resource)));
+        const missing = [...new Set(limits.resourceLocks ?? [])].filter((resource) => !held.has(resource));
+        if (missing.some((resource) => this.db.prepare('SELECT 1 FROM job_resource_locks WHERE resource=?').get(resource))) continue;
+        const stamp = nowIso();
+        const leaseUntil = new Date(Date.now() + DEFAULT_LEASE_MS).toISOString();
+        // Reserve newly required resources before renewing ownership; all writes
+        // are within this transaction, so a failed reservation leaves the job untouched.
+        for (const resource of missing) this.db.prepare('INSERT INTO job_resource_locks(resource,job_id,owner_token,lease_expires_at) VALUES (?,?,?,?)')
+          .run(resource, row.id, row.owner_token, leaseUntil);
+        const updated = this.db.prepare(`UPDATE jobs SET claimed_by=?, lease_pid=?, lease_start_ticks=?, heartbeat_at=?, lease_expires_at=?, updated_at=?
+          WHERE id=? AND lease_pid IS ? AND lease_start_ticks IS ? AND state IN ('CLAIMED','RUNNING')`)
+          .run(String(process.pid), process.pid, processStartTicks(process.pid), stamp, leaseUntil, stamp,
+            row.id, row.lease_pid ?? null, row.lease_start_ticks ?? null);
+        if (Number(updated.changes) !== 1) continue;
+        this.db.prepare('UPDATE job_resource_locks SET lease_expires_at=? WHERE job_id=? AND owner_token=?').run(leaseUntil, row.id, row.owner_token);
+        this.db.prepare('INSERT INTO scheduler_global_limit(singleton,max_concurrency) VALUES (1,?) ON CONFLICT(singleton) DO UPDATE SET max_concurrency=excluded.max_concurrency').run(globalCap);
+        this.db.prepare('INSERT INTO scheduler_config(config_file,max_concurrency) VALUES (?,?) ON CONFLICT(config_file) DO UPDATE SET max_concurrency=excluded.max_concurrency').run(path.resolve(configFile), globalCap);
+        this.db.prepare('INSERT INTO scheduler_project_caps(config_file,project_id,max_concurrency) VALUES (?,?,?) ON CONFLICT(config_file,project_id) DO UPDATE SET max_concurrency=excluded.max_concurrency').run(path.resolve(configFile), row.project_id, projectCap);
+        return fromRow(asSqlRow<LockRow>(this.db.prepare(`SELECT j.*, w.external_id FROM jobs j
+          JOIN work_items w ON w.id=j.work_item_id WHERE j.id=?`).get(row.id)));
+      }
+      return null;
+    });
+  }
+
+  isLiveJob(jobId: number): boolean {
+    const row = asSqlRow<SqlRow>(this.db.prepare("SELECT lease_pid,lease_start_ticks FROM jobs WHERE id=? AND state IN ('CLAIMED','RUNNING')").get(jobId));
+    if (!row) return false;
+    const pid = Number(row?.lease_pid);
+    return processOwnerAlive(pid, row?.lease_start_ticks) !== false;
+  }
+
   writeState(state: RuntimeStateInput, configFile: string) {
     const absolute = path.resolve(configFile);
     const job = state.active?.owner_token
@@ -907,30 +1112,70 @@ export class SQLiteStore {
       : null;
     this.db.prepare(`
       INSERT INTO runtime_state(config_file, active_job_id, last_run) VALUES (?, ?, ?)
-      ON CONFLICT(config_file) DO UPDATE SET active_job_id=excluded.active_job_id, last_run=excluded.last_run
+      ON CONFLICT(config_file) DO UPDATE SET active_job_id=CASE
+        WHEN runtime_state.active_job_id IS NOT NULL AND EXISTS (
+          SELECT 1 FROM jobs WHERE id=runtime_state.active_job_id AND state IN ('CLAIMED','RUNNING')
+        ) THEN runtime_state.active_job_id ELSE excluded.active_job_id END,
+        last_run=excluded.last_run
     `).run(absolute, job?.id ?? null, state.last_run ?? null);
   }
 
-  acquireLock(lock: Lock, force = false, expectedOwnerToken?: string) {
+  acquireLock(lock: Lock, force = false, expectedOwnerToken?: string, limits: { maxConcurrency?: number; projectConcurrency?: number; resourceLocks?: string[] } = {}) {
+    assertResourceLocks(limits.resourceLocks);
+    const projectPredicate = githubProjectPredicate('j.project_id', lock.provider);
     let retryExhausted = false;
     const claimed = this.transaction(() => {
       this.reapExpiredInTransaction(Date.now());
+      const current = this.readLock();
+      const maxConcurrency = limits.maxConcurrency ?? 1;
+      if (!Number.isSafeInteger(maxConcurrency) || maxConcurrency < 1) throw new Error('max_concurrency must be a positive integer');
+      const requestedProjectCap = limits.projectConcurrency ?? maxConcurrency;
+      if (!Number.isSafeInteger(requestedProjectCap) || requestedProjectCap < 1 || requestedProjectCap > maxConcurrency) {
+        throw new Error('project max_concurrency must be a positive integer not exceeding global max_concurrency');
+      }
+      const activeCount = Number(asSqlRow<CountRow>(this.db.prepare("SELECT COUNT(*) AS count FROM jobs WHERE state IN ('CLAIMED','RUNNING')").get())?.count ?? 0);
+      const dbGlobalLimit = asSqlRow<SqlRow>(this.db.prepare('SELECT max_concurrency FROM scheduler_global_limit WHERE singleton=1').get());
+      if (activeCount > 0 && !dbGlobalLimit && maxConcurrency !== 1) throw new Error('Legacy active jobs use the default max_concurrency=1 until released');
+      if (activeCount > 0 && dbGlobalLimit && Number(dbGlobalLimit.max_concurrency) !== maxConcurrency) throw new Error('Active configurations sharing ISSUE_ORCHESTRATOR_HOME must use the same max_concurrency');
+      const activeConfigs = asSqlRows<SqlRow>(this.db.prepare("SELECT DISTINCT config_file FROM jobs WHERE state IN ('CLAIMED','RUNNING') AND config_file IS NOT NULL").all());
+      for (const activeConfig of activeConfigs) {
+        const configured = asSqlRow<SqlRow>(this.db.prepare('SELECT max_concurrency FROM scheduler_config WHERE config_file=?').get(activeConfig.config_file));
+        if (configured && Number(configured.max_concurrency) !== maxConcurrency) throw new Error('Active configurations sharing ISSUE_ORCHESTRATOR_HOME must use the same max_concurrency');
+      }
+      if (activeCount - (force && current ? 1 : 0) >= maxConcurrency) throw new Error(`Global run capacity is full (${activeCount}/${maxConcurrency})`);
+      const duplicateOwner = this.db.prepare(`SELECT 1 FROM jobs j JOIN work_items w ON w.id=j.work_item_id
+        WHERE ${projectPredicate} AND ${trackerProviderPredicate('j', lock.provider)} AND w.external_id=? AND j.state IN ('CLAIMED','RUNNING') LIMIT 1`).get(lock.repo, String(lock.issue));
+      if (duplicateOwner && !(force && current && sameTrackerProject(current.repo, current.provider, lock.repo, lock.provider) && Number(current.issue) === Number(lock.issue))) throw new Error(`Work item ${lock.repo}#${lock.issue} already has an active owner`);
+      const projectActive = Number(asSqlRow<CountRow>(this.db.prepare(`SELECT COUNT(*) AS count FROM jobs j WHERE ${projectPredicate} AND ${trackerProviderPredicate('j', lock.provider)} AND state IN ('CLAIMED','RUNNING')`).get(lock.repo))?.count ?? 0);
+      const projectCap = requestedProjectCap;
+      this.clearInactiveProjectConfigCap(path.resolve(lock.config_file), lock.repo, lock.provider);
+       const activeProjectRows = asSqlRows<SqlRow>(this.db.prepare(`SELECT j.config_file,j.project_id FROM jobs j
+         WHERE ${projectPredicate} AND ${trackerProviderPredicate('j', lock.provider)} AND j.state IN ('CLAIMED','RUNNING')`).all(lock.repo));
+       for (const active of activeProjectRows) {
+         const configured = asSqlRow<SqlRow>(this.db.prepare('SELECT max_concurrency FROM scheduler_project_caps WHERE config_file=? AND project_id=?').get(active.config_file, active.project_id));
+         if ((configured ? Number(configured.max_concurrency) : 1) !== projectCap) throw new Error(`Active configurations sharing project ${lock.repo} must use the same project concurrency cap`);
+       }
+      if (projectActive - (force && current && sameTrackerProject(current.repo, current.provider, lock.repo, lock.provider) ? 1 : 0) >= projectCap) throw new Error(`Project run capacity is full for ${lock.repo}`);
       const exhausted = this.db.prepare(`
         SELECT j.id FROM jobs j JOIN work_items w ON w.id=j.work_item_id
-        WHERE j.project_id=? AND w.external_id=? AND j.state='FAILED' AND j.attempts >= j.max_attempts
+        WHERE ${projectPredicate} AND ${trackerProviderPredicate('j', lock.provider)} AND w.external_id=? AND j.state='FAILED' AND j.attempts >= j.max_attempts
         LIMIT 1
       `).get(lock.repo, String(lock.issue));
       if (exhausted) {
         retryExhausted = true;
         return null;
       }
+      if (isGitHubTracker(lock.provider)) {
+        const legacyIdentity = this.db.prepare(`SELECT 1 FROM work_items w JOIN jobs j ON j.work_item_id=w.id
+          WHERE lower(w.project_id)=lower(?) AND w.external_id=? AND w.project_id<>?
+            AND ${trackerProviderPredicate('j', lock.provider)} LIMIT 1`)
+          .get(lock.repo, String(lock.issue), lock.repo);
+        // Preserve retry/workflow history rather than creating a second row under new casing.
+        if (legacyIdentity) throw new Error(`Work item ${lock.repo}#${lock.issue} has existing history under a different project spelling; refusing a new CLI claim`);
+      }
 
-      const current = this.readLock();
-      if (current && !force) {
-        throw new Error(
-          `Queue is locked by ${current.repo}#${current.issue} since ${current.claimed_at}; ` +
-          'release --force only for a stale run',
-        );
+      if (current && !force && sameTrackerProject(current.repo, current.provider, lock.repo, lock.provider) && Number(current.issue) === Number(lock.issue)) {
+        throw new Error(`Work item ${lock.repo}#${lock.issue} already has an active owner`);
       }
       if (current && force) {
         if (!expectedOwnerToken || current.owner_token !== expectedOwnerToken) {
@@ -964,17 +1209,28 @@ export class SQLiteStore {
       }
       const leaseMs = Number(lock.lease_ms ?? DEFAULT_LEASE_MS);
       const updated = asSqlRow<IdRow>(this.db.prepare(`
-        UPDATE jobs SET owner_token=?, config_file=?, provider=?, state='CLAIMED', stage=?, branch=?, account=?,
-          local_only=?, claimed_by=?, claimed_at=?, heartbeat_at=?, lease_expires_at=?, attempts=attempts+1,
-          change_number=?, head_sha=?, evidence_commit=?, updated_at=?
+        UPDATE jobs SET owner_token=?, config_file=?, provider=?, state='CLAIMED', stage=COALESCE(stage,?), branch=COALESCE(?,branch), account=?,
+          local_only=?, claimed_by=?, lease_pid=?, lease_start_ticks=?, claimed_at=?, heartbeat_at=?, lease_expires_at=?, attempts=attempts+1,
+          change_number=COALESCE(?,change_number), head_sha=COALESCE(?,head_sha),
+          evidence_commit=COALESCE(?,evidence_commit), updated_at=?
         WHERE id=? AND state='READY' RETURNING id
       `).get(
         lock.owner_token, path.resolve(lock.config_file), lock.provider, lock.stage ?? 'claimed', lock.branch ?? null,
-        lock.account ?? null, lock.local_only ? 1 : 0, String(process.pid), lock.claimed_at, lock.updated_at,
+        lock.account ?? null, lock.local_only ? 1 : 0, String(process.pid), process.pid, processStartTicks(process.pid), lock.claimed_at, lock.updated_at,
         new Date(Date.parse(lock.updated_at) + leaseMs).toISOString(), lock.change_number ?? null,
         lock.head_sha ?? null, lock.evidence_commit ?? null, lock.updated_at, queued.id,
       ));
       if (!updated) throw new Error(`Job for ${lock.repo}#${lock.issue} is not ready to claim`);
+      for (const resource of [...new Set(limits.resourceLocks ?? [])]) {
+        const reserved = this.db.prepare('INSERT OR IGNORE INTO job_resource_locks(resource, job_id, owner_token, lease_expires_at) VALUES (?, ?, ?, ?)')
+          .run(resource, updated.id, lock.owner_token, new Date(Date.parse(lock.updated_at) + leaseMs).toISOString());
+        if (Number(reserved.changes) !== 1) throw new Error(`Resource lock is busy: ${resource}`);
+      }
+      this.db.prepare('INSERT INTO scheduler_config(config_file,max_concurrency) VALUES (?,?) ON CONFLICT(config_file) DO UPDATE SET max_concurrency=excluded.max_concurrency')
+        .run(path.resolve(lock.config_file), maxConcurrency);
+      this.db.prepare('INSERT INTO scheduler_project_caps(config_file,project_id,max_concurrency) VALUES (?,?,?) ON CONFLICT(config_file,project_id) DO UPDATE SET max_concurrency=excluded.max_concurrency')
+        .run(path.resolve(lock.config_file), lock.repo, projectCap);
+      this.db.prepare('INSERT INTO scheduler_global_limit(singleton,max_concurrency) VALUES (1,?) ON CONFLICT(singleton) DO UPDATE SET max_concurrency=excluded.max_concurrency').run(maxConcurrency);
       this.recordTransition(Number(updated.id), 'READY', 'CLAIMED', 'claimed from CLI', lock.owner_token, lock.claimed_at);
       const workflow = asSqlRow<SqlRow>(this.db.prepare('SELECT workflow_state FROM jobs WHERE id=?').get(updated.id));
       if (workflow?.workflow_state === 'READY') {
@@ -982,7 +1238,11 @@ export class SQLiteStore {
       }
       this.db.prepare(`
         INSERT INTO runtime_state(config_file, active_job_id, last_run) VALUES (?, ?, ?)
-        ON CONFLICT(config_file) DO UPDATE SET active_job_id=excluded.active_job_id, last_run=excluded.last_run
+        ON CONFLICT(config_file) DO UPDATE SET active_job_id=CASE
+          WHEN runtime_state.active_job_id IS NOT NULL AND EXISTS (
+            SELECT 1 FROM jobs WHERE id=runtime_state.active_job_id AND state IN ('CLAIMED','RUNNING')
+          ) THEN runtime_state.active_job_id ELSE excluded.active_job_id END,
+          last_run=excluded.last_run
       `).run(path.resolve(lock.config_file), updated.id, lock.updated_at);
       return fromRow(asSqlRow<LockRow>(
         this.db.prepare('SELECT j.*, w.external_id FROM jobs j JOIN work_items w ON w.id=j.work_item_id WHERE j.id=?').get(updated.id),
@@ -1001,16 +1261,20 @@ export class SQLiteStore {
           .get(lock.owner_token),
       );
       if (!before) throw new Error('Queue lock ownership changed; refusing to update another run\'s lock');
+      const heartbeatAt = nowIso();
+      const leaseUntil = new Date(Date.now() + DEFAULT_LEASE_MS).toISOString();
       this.db.prepare(`
         UPDATE jobs SET config_file=?, stage=?, branch=?, account=?, local_only=?, change_number=?, head_sha=?,
           evidence_commit=?, release_result=?, resumed_at=?, heartbeat_at=?,
-          lease_expires_at=?, updated_at=? WHERE id=?
+          lease_expires_at=?, lease_pid=?, lease_start_ticks=?, updated_at=? WHERE id=?
       `).run(
         path.resolve(lock.config_file), lock.stage ?? null, lock.branch ?? null, lock.account ?? null,
         lock.local_only ? 1 : 0, lock.change_number ?? null, lock.head_sha ?? null, lock.evidence_commit ?? null,
-        lock.release_result ?? null, lock.resumed_at ?? null, nowIso(),
-        new Date(Date.now() + DEFAULT_LEASE_MS).toISOString(), lock.updated_at ?? nowIso(), before.id,
+        lock.release_result ?? null, lock.resumed_at ?? null, heartbeatAt,
+        leaseUntil, process.pid, processStartTicks(process.pid), lock.updated_at ?? heartbeatAt, before.id,
       );
+      this.db.prepare('UPDATE job_resource_locks SET lease_expires_at=? WHERE job_id=? AND owner_token=?')
+        .run(leaseUntil, before.id, lock.owner_token);
       if (before.stage !== lock.stage) {
         this.recordTransition(Number(before.id), before.state, before.state,
           `workflow checkpoint: ${before.stage ?? '(unset)'} -> ${lock.stage ?? '(unset)'}`,
@@ -1018,7 +1282,11 @@ export class SQLiteStore {
       }
       this.db.prepare(`
         INSERT INTO runtime_state(config_file, active_job_id, last_run) VALUES (?, ?, ?)
-        ON CONFLICT(config_file) DO UPDATE SET active_job_id=excluded.active_job_id, last_run=excluded.last_run
+        ON CONFLICT(config_file) DO UPDATE SET active_job_id=CASE
+          WHEN runtime_state.active_job_id IS NOT NULL AND EXISTS (
+            SELECT 1 FROM jobs WHERE id=runtime_state.active_job_id AND state IN ('CLAIMED','RUNNING')
+          ) THEN runtime_state.active_job_id ELSE excluded.active_job_id END,
+          last_run=excluded.last_run
       `).run(path.resolve(lock.config_file), before.id, lock.updated_at ?? nowIso());
       return lock;
     });
@@ -1045,13 +1313,17 @@ export class SQLiteStore {
         throw new Error(`Cannot checkpoint implementation from workflow state ${String(job.workflow_state)}`);
       }
       const stamp = lock.updated_at ?? nowIso();
+      const leaseUntil = new Date(Date.now() + DEFAULT_LEASE_MS).toISOString();
       this.db.prepare(`
-        UPDATE jobs SET stage=?, branch=?, head_sha=?, updated_at=?, heartbeat_at=?, lease_expires_at=?
+        UPDATE jobs SET stage=?, branch=?, head_sha=?, updated_at=?, heartbeat_at=?, lease_expires_at=?,
+          lease_pid=?, lease_start_ticks=?
         WHERE id=? AND owner_token=?
       `).run(
         lock.stage ?? 'implemented', lock.branch, lock.head_sha.toLowerCase(), stamp, nowIso(),
-        new Date(Date.now() + DEFAULT_LEASE_MS).toISOString(), jobId, lock.owner_token,
+        leaseUntil, process.pid, processStartTicks(process.pid), jobId, lock.owner_token,
       );
+      this.db.prepare('UPDATE job_resource_locks SET lease_expires_at=? WHERE job_id=? AND owner_token=?')
+        .run(leaseUntil, jobId, lock.owner_token);
       this.db.prepare('UPDATE runtime_state SET last_run=? WHERE active_job_id=?').run(stamp, jobId);
       this.transitionWorkflowInTransaction(jobId, 'IMPLEMENTED', 'agent', 'builder committed a clean issue-branch change');
       return lock;
@@ -1182,6 +1454,13 @@ export class SQLiteStore {
     const row = asSqlRow<IdRow>(this.db.prepare('SELECT id FROM jobs WHERE owner_token=?').get(ownerToken));
     if (!row) throw new Error('Queue lock ownership changed; no matching job for side effect');
     return Number(row.id);
+  }
+
+  ownerProcessIdForOwner(ownerToken: string): number | null {
+    const row = asSqlRow<SqlRow>(this.db.prepare("SELECT lease_pid FROM jobs WHERE owner_token=? AND state IN ('CLAIMED','RUNNING')").get(ownerToken));
+    if (!row) return null;
+    const pid = Number(row.lease_pid);
+    return Number.isSafeInteger(pid) && pid > 0 ? pid : null;
   }
 
   providerForOwner(ownerToken: string) {
@@ -1578,13 +1857,14 @@ export class SQLiteStore {
     issue: number;
     branch: string;
     base: string;
-  }) {
+  }, limits: { maxConcurrency?: number; projectConcurrency?: number; resourceLocks?: string[] } = {}) {
+    assertResourceLocks(limits.resourceLocks);
     return this.transaction(() => {
       const row = asSqlRow<SqlRow>(this.db.prepare(`
         SELECT e.job_id, e.kind, e.status, e.intent_json,
           j.state AS job_state, j.owner_token, j.workflow_state, j.error_class, j.work_item_id,
           j.project_id, j.branch, j.head_sha, j.change_number, j.stage, j.config_file,
-          j.provider, j.account, j.local_only, j.claimed_by, j.claimed_at,
+          j.provider, j.account, j.local_only, j.claimed_by, j.claimed_at, j.lease_pid, j.lease_start_ticks,
           w.external_id, w.state AS item_state
         FROM side_effect_journal e JOIN jobs j ON j.id=e.job_id
         JOIN work_items w ON w.id=j.work_item_id
@@ -1621,13 +1901,9 @@ export class SQLiteStore {
       if (!['CLAIMED', 'RUNNING', 'READY', 'FAILED'].includes(jobState)) return null;
       if (jobState === 'FAILED' && row.error_class !== 'LeaseExpiredMaxAttempts') return null;
 
-      const otherActiveJob = this.db.prepare(`
-        SELECT 1 FROM jobs WHERE id<>? AND state IN ('CLAIMED', 'RUNNING') LIMIT 1
-      `).get(jobId);
-      if (otherActiveJob) return null;
-
       let ownerToken: string;
       if (jobState === 'CLAIMED' || jobState === 'RUNNING') {
+        if (processOwnerAlive(Number(row.lease_pid), row.lease_start_ticks) !== false) return null;
         if (!recoveryStage && row.owner_token !== intent.owner_token) return null;
         if (typeof row.owner_token !== 'string' || !row.owner_token) return null;
         ownerToken = row.owner_token;
@@ -1638,23 +1914,62 @@ export class SQLiteStore {
 
       const stamp = nowIso();
       const leaseExpiresAt = new Date(Date.parse(stamp) + DEFAULT_LEASE_MS).toISOString();
+      const globalCap = limits.maxConcurrency ?? 1;
+      const projectCap = limits.projectConcurrency ?? globalCap;
+      if (!Number.isSafeInteger(globalCap) || globalCap < 1 || !Number.isSafeInteger(projectCap) || projectCap < 1 || projectCap > globalCap) {
+        throw new Error('recovery capacity limits must be positive integers and project capacity cannot exceed global capacity');
+      }
+      const active = Number(asSqlRow<CountRow>(this.db.prepare("SELECT COUNT(*) AS count FROM jobs WHERE state IN ('CLAIMED','RUNNING')").get())?.count ?? 0);
+      const provider = String(row.provider);
+      const projectPredicate = githubProjectPredicate('j.project_id', provider);
+      const projectActive = Number(asSqlRow<CountRow>(this.db.prepare(`SELECT COUNT(*) AS count FROM jobs j WHERE ${projectPredicate} AND ${trackerProviderPredicate('j', provider)} AND j.state IN ('CLAIMED','RUNNING')`).get(row.project_id))?.count ?? 0);
+      const globalLimit = asSqlRow<SqlRow>(this.db.prepare('SELECT max_concurrency FROM scheduler_global_limit WHERE singleton=1').get());
+       const activeProjectRows = asSqlRows<SqlRow>(this.db.prepare(`SELECT config_file,project_id FROM jobs j WHERE ${projectPredicate} AND ${trackerProviderPredicate('j', provider)} AND j.state IN ('CLAIMED','RUNNING')`).all(row.project_id));
+       const projectLimitMismatch = activeProjectRows.some((activeRow) => {
+         const cap = asSqlRow<SqlRow>(this.db.prepare('SELECT max_concurrency FROM scheduler_project_caps WHERE config_file=? AND project_id=?').get(activeRow.config_file, activeRow.project_id));
+         return (cap ? Number(cap.max_concurrency) : 1) !== projectCap;
+       });
+       if (active > globalCap || projectActive > projectCap ||
+           (active > 0 && Number(globalLimit?.max_concurrency ?? 1) !== globalCap) || projectLimitMismatch) return null;
+      const heldResources = new Set(this.db.prepare('SELECT resource FROM job_resource_locks WHERE job_id=? AND owner_token=?').all(jobId, String(row.owner_token))
+        .map((lock) => String((lock as SqlRow).resource)));
+      const missingResources = (limits.resourceLocks ?? []).filter((resource) => !heldResources.has(resource));
+      for (const resource of missingResources) {
+        if (this.db.prepare('SELECT 1 FROM job_resource_locks WHERE resource=?').get(resource)) return null;
+      }
       if (jobState === 'READY' || jobState === 'FAILED') {
+        if (active >= globalCap || projectActive >= projectCap ||
+            (active > 0 && Number(globalLimit?.max_concurrency ?? 1) !== globalCap) ||
+            projectLimitMismatch) return null;
         const claimed = this.db.prepare(`
-          UPDATE jobs SET state='CLAIMED', owner_token=?, stage='merge-recovery', claimed_by=?,
+          UPDATE jobs SET state='CLAIMED', owner_token=?, stage='merge-recovery', claimed_by=?, lease_pid=?, lease_start_ticks=?,
             claimed_at=?, heartbeat_at=?, lease_expires_at=?, error_class=NULL, updated_at=?
           WHERE id=? AND state=?
-        `).run(ownerToken, String(process.pid), stamp, stamp, leaseExpiresAt, stamp, jobId, jobState);
+        `).run(ownerToken, String(process.pid), process.pid, processStartTicks(process.pid), stamp, stamp, leaseExpiresAt, stamp, jobId, jobState);
         if (Number(claimed.changes) !== 1) return null;
+        for (const resource of missingResources) {
+          this.db.prepare('INSERT INTO job_resource_locks(resource,job_id,owner_token,lease_expires_at) VALUES (?,?,?,?)')
+            .run(resource, jobId, ownerToken, leaseExpiresAt);
+        }
+        this.db.prepare('INSERT INTO scheduler_global_limit(singleton,max_concurrency) VALUES (1,?) ON CONFLICT(singleton) DO UPDATE SET max_concurrency=excluded.max_concurrency').run(globalCap);
+        this.db.prepare('INSERT INTO scheduler_config(config_file,max_concurrency) VALUES (?,?) ON CONFLICT(config_file) DO UPDATE SET max_concurrency=excluded.max_concurrency').run(path.resolve(row.config_file), globalCap);
+        this.db.prepare('INSERT INTO scheduler_project_caps(config_file,project_id,max_concurrency) VALUES (?,?,?) ON CONFLICT(config_file,project_id) DO UPDATE SET max_concurrency=excluded.max_concurrency').run(path.resolve(row.config_file), row.project_id, projectCap);
         this.db.prepare("UPDATE work_items SET state='CLAIMED', updated_at=? WHERE id=?")
           .run(stamp, workItemId);
         this.recordTransition(jobId, jobState, 'CLAIMED', 'verified merge recovery claimed for journaled label finalization', 'merge-reconciler', stamp);
       } else {
+        for (const resource of missingResources) {
+          this.db.prepare('INSERT INTO job_resource_locks(resource,job_id,owner_token,lease_expires_at) VALUES (?,?,?,?)')
+            .run(resource, jobId, ownerToken, leaseExpiresAt);
+        }
         const refreshed = this.db.prepare(`
-          UPDATE jobs SET stage='merge-recovery', heartbeat_at=?, lease_expires_at=?, updated_at=?
+          UPDATE jobs SET stage='merge-recovery', claimed_by=?, lease_pid=?, lease_start_ticks=?, heartbeat_at=?, lease_expires_at=?, updated_at=?
           WHERE id=? AND owner_token=? AND state IN ('CLAIMED', 'RUNNING')
-        `).run(stamp, leaseExpiresAt, stamp, jobId, ownerToken);
+        `).run(String(process.pid), process.pid, processStartTicks(process.pid), stamp, leaseExpiresAt, stamp, jobId, ownerToken);
         if (Number(refreshed.changes) !== 1) return null;
       }
+      this.db.prepare('UPDATE job_resource_locks SET lease_expires_at=? WHERE job_id=? AND owner_token=?')
+        .run(leaseExpiresAt, jobId, ownerToken);
 
       if (!this.hasWorkflowCheck(jobId, 'merge', 'merged', headSha)) {
         this.db.prepare(`
@@ -1675,7 +1990,11 @@ export class SQLiteStore {
 
       this.db.prepare(`
         INSERT INTO runtime_state(config_file, active_job_id, last_run) VALUES (?, ?, ?)
-        ON CONFLICT(config_file) DO UPDATE SET active_job_id=excluded.active_job_id, last_run=excluded.last_run
+        ON CONFLICT(config_file) DO UPDATE SET active_job_id=CASE
+          WHEN runtime_state.active_job_id IS NOT NULL AND EXISTS (
+            SELECT 1 FROM jobs WHERE id=runtime_state.active_job_id AND state IN ('CLAIMED','RUNNING')
+          ) THEN runtime_state.active_job_id ELSE excluded.active_job_id END,
+          last_run=excluded.last_run
       `).run(path.resolve(String(row.config_file)), jobId, stamp);
       this.db.prepare(`
         UPDATE side_effect_journal SET status='COMPLETED', result_json=?, updated_at=?
@@ -1690,7 +2009,7 @@ export class SQLiteStore {
   finalizeMergedRecovery(ownerToken: string, mergeKey: string, requiredLabelKeys: string[]) {
     return this.transaction(() => {
       const row = asSqlRow<SqlRow>(this.db.prepare(`
-        SELECT j.id, j.state, j.workflow_state, j.stage, j.owner_token, j.work_item_id,
+        SELECT j.id, j.state, j.workflow_state, j.stage, j.owner_token, j.work_item_id, j.project_id,
           j.head_sha, j.config_file
         FROM jobs j WHERE j.owner_token=? AND j.state IN ('CLAIMED', 'RUNNING')
       `).get(ownerToken));
@@ -1708,11 +2027,6 @@ export class SQLiteStore {
         if (!effect || Number(effect.job_id) !== jobId || effect.status !== 'COMPLETED' ||
             !['issue-label-add', 'issue-label-remove'].includes(String(effect.kind))) return false;
       }
-      const otherActiveJob = this.db.prepare(
-        "SELECT 1 FROM jobs WHERE id<>? AND state IN ('CLAIMED', 'RUNNING') LIMIT 1",
-      ).get(jobId);
-      if (otherActiveJob) return false;
-
       const stamp = nowIso();
       this.db.prepare(`
         UPDATE jobs SET state='RELEASED', owner_token=NULL, lease_expires_at=NULL,
@@ -1722,8 +2036,10 @@ export class SQLiteStore {
         'verified merge recovery completed after journaled labels', 'merge-reconciler', stamp);
       this.db.prepare("UPDATE work_items SET state='DONE', updated_at=? WHERE id=?")
         .run(stamp, row.work_item_id);
+      this.db.prepare('DELETE FROM job_resource_locks WHERE job_id=? AND owner_token=?').run(jobId, ownerToken);
       this.db.prepare('UPDATE runtime_state SET active_job_id=NULL, last_run=? WHERE active_job_id=?')
         .run(stamp, jobId);
+      this.db.prepare("DELETE FROM scheduler_global_limit WHERE singleton=1 AND NOT EXISTS (SELECT 1 FROM jobs WHERE state IN ('CLAIMED','RUNNING'))").run();
       return true;
     });
   }
@@ -1739,21 +2055,71 @@ export class SQLiteStore {
     };
   }
 
-  resumeLock(previousToken: string, lock: Lock) {
+  resumeLock(previousToken: string, lock: Lock, limits: { maxConcurrency?: number; projectConcurrency?: number; resourceLocks?: string[] } = {}) {
+    assertResourceLocks(limits.resourceLocks);
     return this.transaction(() => {
-      const before = asSqlRow<IdRow>(
-        this.db.prepare("SELECT id FROM jobs WHERE owner_token=? AND state IN ('CLAIMED', 'RUNNING')").get(previousToken),
+      const before = asSqlRow<IdRow & { lease_pid?: unknown; lease_start_ticks?: unknown; project_id: string; config_file?: string | null }>(
+        this.db.prepare("SELECT id, lease_pid, lease_start_ticks, project_id, config_file FROM jobs WHERE owner_token=? AND state IN ('CLAIMED', 'RUNNING')").get(previousToken),
       );
       if (!before) throw new Error('Queue lock ownership changed; refusing to resume another run');
-      this.db.prepare(`
-        UPDATE jobs SET owner_token=?, config_file=?, account=?, resumed_at=?, heartbeat_at=?, lease_expires_at=?, updated_at=?
-        WHERE id=?
+      const pid = Number(before.lease_pid);
+      // Explicit stale confirmation permits recovery of legacy rows without a PID;
+      // a known live or ambiguous PID must still never be stolen.
+      if (Number.isSafeInteger(pid) && pid > 0 && processOwnerAlive(pid, before.lease_start_ticks) !== false) {
+        throw new Error('Prior run process is still live or cannot be safely identified; refusing stale recovery');
+      }
+      const globalCap = limits.maxConcurrency ?? 1;
+      const projectCap = limits.projectConcurrency ?? globalCap;
+      if (!Number.isSafeInteger(globalCap) || globalCap < 1 || !Number.isSafeInteger(projectCap) || projectCap < 1 || projectCap > globalCap)
+        throw new Error('resume capacity limits must be positive integers and project capacity cannot exceed global capacity');
+      const activeCount = Number(asSqlRow<CountRow>(this.db.prepare("SELECT COUNT(*) AS count FROM jobs WHERE state IN ('CLAIMED','RUNNING')").get())?.count ?? 0);
+      const storedGlobal = asSqlRow<SqlRow>(this.db.prepare('SELECT max_concurrency FROM scheduler_global_limit WHERE singleton=1').get());
+      if (storedGlobal && Number(storedGlobal.max_concurrency) !== globalCap) throw new Error('Active configurations sharing ISSUE_ORCHESTRATOR_HOME must use the same max_concurrency');
+      const activeConfigs = asSqlRows<SqlRow>(this.db.prepare("SELECT DISTINCT config_file FROM jobs WHERE state IN ('CLAIMED','RUNNING') AND config_file IS NOT NULL").all());
+      for (const activeConfig of activeConfigs) {
+        const configured = asSqlRow<SqlRow>(this.db.prepare('SELECT max_concurrency FROM scheduler_config WHERE config_file=?').get(activeConfig.config_file));
+        if (configured && Number(configured.max_concurrency) !== globalCap) throw new Error('Active configurations sharing ISSUE_ORCHESTRATOR_HOME must use the same max_concurrency');
+      }
+      if (activeCount > globalCap) throw new Error(`Global run capacity is full (${activeCount}/${globalCap})`);
+      const projectPredicate = githubProjectPredicate('j.project_id', lock.provider);
+      const projectCount = Number(asSqlRow<CountRow>(this.db.prepare(`SELECT COUNT(*) AS count FROM jobs j WHERE ${projectPredicate} AND ${trackerProviderPredicate('j', lock.provider)} AND state IN ('CLAIMED','RUNNING')`).get(lock.repo))?.count ?? 0);
+       const activeProjectRows = asSqlRows<SqlRow>(this.db.prepare(`SELECT config_file,project_id FROM jobs j WHERE ${projectPredicate} AND ${trackerProviderPredicate('j', lock.provider)} AND state IN ('CLAIMED','RUNNING')`).all(lock.repo));
+       for (const activeRow of activeProjectRows) {
+         const configured = asSqlRow<SqlRow>(this.db.prepare('SELECT max_concurrency FROM scheduler_project_caps WHERE config_file=? AND project_id=?').get(activeRow.config_file, activeRow.project_id));
+         if ((configured ? Number(configured.max_concurrency) : 1) !== projectCap)
+           throw new Error(`Active configurations sharing project ${lock.repo} must use the same project concurrency cap`);
+       }
+      if (projectCount > projectCap) throw new Error(`Project run capacity is full for ${lock.repo}`);
+      const leaseUntil = new Date(Date.now() + DEFAULT_LEASE_MS).toISOString();
+      for (const resource of [...new Set(limits.resourceLocks ?? [])]) {
+        const owned = this.db.prepare('SELECT 1 FROM job_resource_locks WHERE resource=? AND job_id=? AND owner_token=?').get(resource, before.id, previousToken);
+        if (!owned) {
+          const reserved = this.db.prepare('INSERT OR IGNORE INTO job_resource_locks(resource,job_id,owner_token,lease_expires_at) VALUES (?,?,?,?)').run(resource, before.id, lock.owner_token, leaseUntil);
+          if (Number(reserved.changes) !== 1) throw new Error(`Resource lock is busy: ${resource}`);
+        }
+      }
+      if (lock.config_file) {
+        const configPath = path.resolve(lock.config_file);
+        this.db.prepare('INSERT INTO scheduler_config(config_file,max_concurrency) VALUES (?,?) ON CONFLICT(config_file) DO UPDATE SET max_concurrency=excluded.max_concurrency').run(configPath, globalCap);
+        this.db.prepare('INSERT INTO scheduler_project_caps(config_file,project_id,max_concurrency) VALUES (?,?,?) ON CONFLICT(config_file,project_id) DO UPDATE SET max_concurrency=excluded.max_concurrency').run(configPath, lock.repo, projectCap);
+      }
+      this.db.prepare('INSERT INTO scheduler_global_limit(singleton,max_concurrency) VALUES (1,?) ON CONFLICT(singleton) DO UPDATE SET max_concurrency=excluded.max_concurrency').run(globalCap);
+      const resumed = this.db.prepare(`
+        UPDATE jobs SET owner_token=?, config_file=?, account=?, resumed_at=?, heartbeat_at=?, lease_expires_at=?, lease_pid=?, lease_start_ticks=?, claimed_by=?, updated_at=?
+        WHERE id=? AND owner_token=? AND state IN ('CLAIMED','RUNNING')
       `).run(lock.owner_token, path.resolve(lock.config_file), lock.account ?? null, lock.resumed_at,
-        nowIso(), new Date(Date.now() + DEFAULT_LEASE_MS).toISOString(), lock.updated_at, before.id);
+        nowIso(), leaseUntil, process.pid, processStartTicks(process.pid), String(process.pid), lock.updated_at, before.id, previousToken);
+      if (Number(resumed.changes) !== 1) throw new Error('Queue lock ownership changed; refusing to resume another run');
+      this.db.prepare('UPDATE job_resource_locks SET owner_token=?, lease_expires_at=? WHERE job_id=? AND owner_token=?')
+        .run(lock.owner_token, leaseUntil, before.id, previousToken);
       this.recordTransition(Number(before.id), 'CLAIMED', 'CLAIMED', 'ownership resumed', lock.owner_token, lock.updated_at);
       this.db.prepare(`
         INSERT INTO runtime_state(config_file, active_job_id, last_run) VALUES (?, ?, ?)
-        ON CONFLICT(config_file) DO UPDATE SET active_job_id=excluded.active_job_id, last_run=excluded.last_run
+        ON CONFLICT(config_file) DO UPDATE SET active_job_id=CASE
+          WHEN runtime_state.active_job_id IS NOT NULL AND EXISTS (
+            SELECT 1 FROM jobs WHERE id=runtime_state.active_job_id AND state IN ('CLAIMED','RUNNING')
+          ) THEN runtime_state.active_job_id ELSE excluded.active_job_id END,
+          last_run=excluded.last_run
       `).run(path.resolve(lock.config_file), before.id, lock.updated_at);
       return lock;
     });
@@ -1761,7 +2127,10 @@ export class SQLiteStore {
 
   clearLock(ownerToken?: string, result = 'none') {
     return this.transaction(() => {
-      const current = this.readLock();
+      const current = ownerToken
+        ? fromRow(asSqlRow<LockRow>(this.db.prepare(`SELECT j.*, w.external_id FROM jobs j JOIN work_items w ON w.id=j.work_item_id
+            WHERE j.owner_token=? AND j.state IN ('CLAIMED','RUNNING')`).get(ownerToken)))
+        : this.readLock();
       if (!current) {
         if (ownerToken) throw new Error('Queue lock ownership changed; refusing to clear another run\'s lock');
         return false;
@@ -1784,19 +2153,22 @@ export class SQLiteStore {
 
   private finishActiveJob(ownerToken: string, finalState: string, reason: string, itemState = 'READY') {
     const row = asSqlRow<FinishingJobRow>(
-      this.db.prepare("SELECT id, work_item_id, state, config_file FROM jobs WHERE owner_token=? AND state IN ('CLAIMED', 'RUNNING')")
+      this.db.prepare("SELECT id, work_item_id, project_id, provider, state, config_file FROM jobs WHERE owner_token=? AND state IN ('CLAIMED', 'RUNNING')")
         .get(ownerToken),
     );
     if (!row) return false;
     const stamp = nowIso();
-    this.db.prepare("UPDATE jobs SET state=?, lease_expires_at=NULL, updated_at=? WHERE id=? AND state IN ('CLAIMED', 'RUNNING')")
-      .run(finalState, stamp, row.id);
+      this.db.prepare("UPDATE jobs SET state=?, lease_expires_at=NULL, updated_at=? WHERE id=? AND state IN ('CLAIMED', 'RUNNING')")
+        .run(finalState, stamp, row.id);
+      this.db.prepare('DELETE FROM job_resource_locks WHERE job_id=? AND owner_token=?').run(row.id, ownerToken);
     this.db.prepare('UPDATE work_items SET state=?, updated_at=? WHERE id=?').run(itemState, stamp, row.work_item_id);
     this.recordTransition(Number(row.id), row.state, finalState, reason, ownerToken, stamp);
     if (row.config_file) {
       this.db.prepare('UPDATE runtime_state SET active_job_id=NULL, last_run=? WHERE config_file=? AND active_job_id=?')
         .run(stamp, row.config_file, row.id);
     }
+    this.db.prepare("DELETE FROM scheduler_global_limit WHERE singleton=1 AND NOT EXISTS (SELECT 1 FROM jobs WHERE state IN ('CLAIMED','RUNNING'))").run();
+      this.clearProjectCapacityIfIdle(row.project_id, row.provider);
     return true;
   }
 
@@ -1822,10 +2194,29 @@ export class SQLiteStore {
     return this.transaction(() => {
       const stamp = nowIso();
       const payloadHash = hashPayload(event.payload);
+      let project = event.project;
+      if (isGitHubTracker(event.provider)) {
+        const existing = asSqlRows<SqlRow>(this.db.prepare(`
+          SELECT project_id AS id FROM (
+            SELECT j.project_id FROM jobs j WHERE lower(j.project_id)=lower(?)
+              AND substr(j.provider,1,instr(j.provider||'+','+')-1)='github'
+            UNION SELECT e.project_id FROM events e WHERE lower(e.project_id)=lower(?)
+              AND substr(e.provider,1,instr(e.provider||'+','+')-1)='github'
+            UNION SELECT p.id FROM projects p WHERE lower(p.id)=lower(?)
+              AND substr(p.provider,1,instr(p.provider||'+','+')-1)='github'
+              AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.project_id=p.id)
+              AND NOT EXISTS (SELECT 1 FROM events e WHERE e.project_id=p.id)
+          ) ORDER BY project_id
+        `).all(event.project, event.project, event.project));
+        if (existing.length > 1) {
+          throw new Error(`Ambiguous GitHub project identity for ${event.project}: ${existing.map((row) => String(row.id)).join(', ')}`);
+        }
+        if (existing.length === 1) project = String(existing[0].id);
+      }
       const dedupeKey = event.deliveryId
         ? `${event.provider}:delivery:${event.deliveryId}`
-        : `${event.project}:${event.workItemId}:${event.kind}:${payloadHash}`;
-      this.upsertProject(event.project, event.provider);
+        : `${project}:${event.workItemId}:${event.kind}:${payloadHash}`;
+      this.upsertProject(project, event.provider);
       const item = asSqlRow<EventWorkItemRow>(this.db.prepare(`
         INSERT INTO work_items(project_id, external_id, title, author, url, state, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, 'READY', ?, ?)
@@ -1833,14 +2224,14 @@ export class SQLiteStore {
           title=COALESCE(excluded.title, work_items.title), author=COALESCE(excluded.author, work_items.author),
           url=COALESCE(excluded.url, work_items.url), updated_at=excluded.updated_at
         RETURNING id, state
-      `).get(event.project, String(event.workItemId), event.title ?? null, event.author ?? null, event.url ?? null, stamp, stamp));
-      if (!item) throw new Error(`Could not persist event work item ${event.project}#${event.workItemId}`);
+      `).get(project, String(event.workItemId), event.title ?? null, event.author ?? null, event.url ?? null, stamp, stamp));
+      if (!item) throw new Error(`Could not persist event work item ${project}#${event.workItemId}`);
       const payloadJson = JSON.stringify(event.payload);
       if (payloadJson === undefined) throw new Error('event payload must be JSON serializable');
       const inserted = this.db.prepare(`
         INSERT OR IGNORE INTO events(project_id, work_item_id, provider, delivery_id, dedupe_key, kind,
           payload_hash, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(event.project, item.id, event.provider, event.deliveryId ?? null, dedupeKey, event.kind,
+      `).run(project, item.id, event.provider, event.deliveryId ?? null, dedupeKey, event.kind,
         payloadHash, payloadJson, stamp);
       const eventRow = asSqlRow<EventIdRow>(
         this.db.prepare('SELECT id FROM events WHERE dedupe_key=? OR (provider=? AND delivery_id=?) LIMIT 1')
@@ -1851,7 +2242,7 @@ export class SQLiteStore {
         const queued = asSqlRow<EventIdRow>(this.db.prepare(`
           INSERT OR IGNORE INTO jobs(project_id, work_item_id, event_id, provider, state, workflow_state, attempts, created_at, updated_at)
           VALUES (?, ?, ?, ?, 'READY', 'READY', 0, ?, ?) RETURNING id
-        `).get(event.project, item.id, eventRow.id, event.provider, stamp, stamp));
+        `).get(project, item.id, eventRow.id, event.provider, stamp, stamp));
         if (queued) this.recordTransition(Number(queued.id), null, 'READY', 'event enqueued', event.provider, stamp);
       }
       return {
@@ -1870,12 +2261,56 @@ export class SQLiteStore {
     leaseMs?: number;
     maxAttempts?: number;
     configFile?: string;
+    maxConcurrency?: number;
+    projectConcurrency?: number;
+    resourceLocks?: string[];
+    processId?: number | null;
   } = {}) {
+    assertResourceLocks(options.resourceLocks);
+    const provider = options.provider ?? 'github';
+    const projectPredicate = githubProjectPredicate('j.project_id', provider);
     return this.transaction(() => {
       this.reapExpiredInTransaction(Date.now());
-      if (this.readLock()) return null;
-      const provider = options.provider ?? 'github';
+      const globalCap = options.maxConcurrency ?? 1;
+      const projectCap = options.projectConcurrency ?? globalCap;
+      if (!Number.isSafeInteger(globalCap) || globalCap < 1 || !Number.isSafeInteger(projectCap) || projectCap < 1 || projectCap > globalCap) {
+        throw new Error('claim capacity limits must be positive integers and project capacity cannot exceed global capacity');
+      }
+      const activeCount = Number(asSqlRow<CountRow>(this.db.prepare("SELECT COUNT(*) AS count FROM jobs WHERE state IN ('CLAIMED','RUNNING')").get())?.count ?? 0);
+      const storedGlobal = asSqlRow<SqlRow>(this.db.prepare('SELECT max_concurrency FROM scheduler_global_limit WHERE singleton=1').get());
+      if (activeCount > 0 && !storedGlobal && globalCap !== 1) throw new Error('Legacy active jobs use the default max_concurrency=1 until released');
+      if (activeCount > 0 && storedGlobal && Number(storedGlobal.max_concurrency) !== globalCap) throw new Error('Active configurations sharing ISSUE_ORCHESTRATOR_HOME must use the same max_concurrency');
+      const activeConfigs = asSqlRows<SqlRow>(this.db.prepare("SELECT DISTINCT config_file FROM jobs WHERE state IN ('CLAIMED','RUNNING') AND config_file IS NOT NULL").all());
+      for (const activeConfig of activeConfigs) {
+        const prior = asSqlRow<SqlRow>(this.db.prepare('SELECT max_concurrency FROM scheduler_config WHERE config_file=?').get(activeConfig.config_file));
+        if (!prior || Number(prior.max_concurrency) !== globalCap) throw new Error('Active configurations sharing ISSUE_ORCHESTRATOR_HOME must use the same max_concurrency');
+      }
+      if (activeCount >= globalCap) return null;
+      const duplicateOwner = this.db.prepare(`SELECT 1 FROM jobs j JOIN work_items w ON w.id=j.work_item_id
+        WHERE ${projectPredicate} AND ${trackerProviderPredicate('j', provider)} AND w.external_id=? AND j.state IN ('CLAIMED','RUNNING') LIMIT 1`).get(project, String(workItemId));
+      if (duplicateOwner) return null;
+      const projectCount = Number(asSqlRow<CountRow>(this.db.prepare(`SELECT COUNT(*) AS count FROM jobs j WHERE ${projectPredicate} AND ${trackerProviderPredicate('j', provider)} AND j.state IN ('CLAIMED','RUNNING')`).get(project))?.count ?? 0);
+      if (options.configFile) this.clearInactiveProjectConfigCap(path.resolve(options.configFile), project, provider);
+       const activeProjectRows = asSqlRows<SqlRow>(this.db.prepare(`SELECT config_file,project_id FROM jobs j WHERE ${projectPredicate} AND ${trackerProviderPredicate('j', provider)} AND j.state IN ('CLAIMED','RUNNING')`).all(project));
+       for (const activeRow of activeProjectRows) {
+         const prior = asSqlRow<SqlRow>(this.db.prepare('SELECT max_concurrency FROM scheduler_project_caps WHERE config_file=? AND project_id=?').get(activeRow.config_file, activeRow.project_id));
+         if ((prior ? Number(prior.max_concurrency) : 1) !== projectCap) throw new Error(`Active configurations sharing project ${project} must use the same project concurrency cap`);
+       }
+      if (projectCount >= projectCap) return null;
       const stamp = nowIso();
+      if (isGitHubTracker(provider)) {
+        const legacyIdentity = this.db.prepare(`SELECT 1 FROM work_items w JOIN jobs j ON j.work_item_id=w.id
+          WHERE lower(w.project_id)=lower(?) AND w.external_id=? AND w.project_id<>?
+            AND ${trackerProviderPredicate('j', provider)} LIMIT 1`)
+          .get(project, String(workItemId), project);
+        // Don't create a second queue row for an older mixed-case identity;
+        // safely mapping its workflow/retry history requires an explicit migration.
+        if (legacyIdentity) return null;
+        const exhausted = this.db.prepare(`SELECT 1 FROM jobs j JOIN work_items w ON w.id=j.work_item_id
+          WHERE ${projectPredicate} AND ${trackerProviderPredicate('j', provider)} AND w.external_id=?
+            AND j.state='FAILED' AND j.attempts>=j.max_attempts LIMIT 1`).get(project, String(workItemId));
+        if (exhausted) return null;
+      }
       this.upsertProject(project, provider, options.configFile);
       const item = asSqlRow<EventWorkItemRow>(this.db.prepare(`
         INSERT INTO work_items(project_id, external_id, state, created_at, updated_at)
@@ -1913,16 +2348,29 @@ export class SQLiteStore {
       const ownerToken = options.ownerToken ?? randomUUID();
       const leaseMs = options.leaseMs ?? DEFAULT_LEASE_MS;
       const claimed = asSqlRow<ClaimJobRow>(this.db.prepare(`
-        UPDATE jobs SET state='CLAIMED', owner_token=?, claimed_by=?, claimed_at=?, heartbeat_at=?,
+        UPDATE jobs SET state='CLAIMED', owner_token=?, claimed_by=?, lease_pid=?, lease_start_ticks=?, config_file=?, claimed_at=?, heartbeat_at=?,
           lease_expires_at=?, attempts=attempts+1, updated_at=?
         WHERE id=? AND state='READY' RETURNING id, project_id, work_item_id, provider, owner_token,
           claimed_by, claimed_at, heartbeat_at, lease_expires_at, attempts, max_attempts
-      `).get(ownerToken, options.workerId ?? String(process.pid), stamp, stamp,
-        new Date(Date.parse(stamp) + leaseMs).toISOString(), stamp, job.id));
+      `).get(ownerToken, options.workerId ?? String(process.pid), options.processId === undefined ? process.pid : options.processId,
+        options.processId === undefined || options.processId === process.pid ? processStartTicks(process.pid) : null,
+        options.configFile ? path.resolve(options.configFile) : null,
+        stamp, stamp, new Date(Date.parse(stamp) + leaseMs).toISOString(), stamp, job.id));
       if (!claimed) {
         this.db.prepare("UPDATE work_items SET state='READY' WHERE id=?").run(item.id);
         return null;
       }
+      for (const resource of [...new Set(options.resourceLocks ?? [])]) {
+        const reserved = this.db.prepare('INSERT OR IGNORE INTO job_resource_locks(resource,job_id,owner_token,lease_expires_at) VALUES (?,?,?,?)')
+          .run(resource, claimed.id, ownerToken, claimed.lease_expires_at);
+        if (Number(reserved.changes) !== 1) throw new Error(`Resource lock is busy: ${resource}`);
+      }
+      if (options.configFile) {
+        const configPath = path.resolve(options.configFile);
+        this.db.prepare('INSERT INTO scheduler_config(config_file,max_concurrency) VALUES (?,?) ON CONFLICT(config_file) DO UPDATE SET max_concurrency=excluded.max_concurrency').run(configPath, globalCap);
+        this.db.prepare('INSERT INTO scheduler_project_caps(config_file,project_id,max_concurrency) VALUES (?,?,?) ON CONFLICT(config_file,project_id) DO UPDATE SET max_concurrency=excluded.max_concurrency').run(configPath, project, projectCap);
+      }
+      this.db.prepare('INSERT INTO scheduler_global_limit(singleton,max_concurrency) VALUES (1,?) ON CONFLICT(singleton) DO UPDATE SET max_concurrency=excluded.max_concurrency').run(globalCap);
       this.recordTransition(Number(claimed.id), 'READY', 'CLAIMED', 'worker claim', claimed.claimed_by, stamp);
       const workflow = asSqlRow<SqlRow>(this.db.prepare('SELECT workflow_state FROM jobs WHERE id=?').get(claimed.id));
       if (workflow?.workflow_state === 'READY') {
@@ -1933,12 +2381,16 @@ export class SQLiteStore {
   }
 
   heartbeatJob(ownerToken: string, leaseMs = DEFAULT_LEASE_MS) {
-    const stamp = nowIso();
-    const result = this.db.prepare(`
-      UPDATE jobs SET heartbeat_at=?, lease_expires_at=?, updated_at=?
-      WHERE owner_token=? AND state IN ('CLAIMED', 'RUNNING')
-    `).run(stamp, new Date(Date.parse(stamp) + leaseMs).toISOString(), stamp, ownerToken);
-    return Number(result.changes) === 1;
+    return this.transaction(() => {
+      const stamp = nowIso();
+      const leaseUntil = new Date(Date.parse(stamp) + leaseMs).toISOString();
+      const result = this.db.prepare(`
+        UPDATE jobs SET heartbeat_at=?, lease_expires_at=?, updated_at=?
+        WHERE owner_token=? AND state IN ('CLAIMED', 'RUNNING')
+      `).run(stamp, leaseUntil, stamp, ownerToken);
+      if (Number(result.changes) === 1) this.db.prepare('UPDATE job_resource_locks SET lease_expires_at=? WHERE owner_token=?').run(leaseUntil, ownerToken);
+      return Number(result.changes) === 1;
+    });
   }
 
   reapExpiredLeases(now = Date.now()) {
@@ -1947,11 +2399,14 @@ export class SQLiteStore {
 
   private reapExpiredInTransaction(now: number) {
     const expired = asSqlRows<ExpiredJobRow>(this.db.prepare(`
-      SELECT j.id, j.owner_token, j.work_item_id, j.state, j.attempts, j.max_attempts
+      SELECT j.id, j.owner_token, j.work_item_id, j.project_id, j.provider, j.state, j.attempts, j.max_attempts,
+        j.claimed_by, j.lease_pid, j.lease_start_ticks
       FROM jobs j WHERE j.state IN ('CLAIMED', 'RUNNING') AND j.lease_expires_at <= ?
     `).all(new Date(now).toISOString()));
     const recovered: Array<{ jobId: number; state: string; workItemId: number }> = [];
     for (const job of expired) {
+      const pid = Number(job.lease_pid);
+      if (processOwnerAlive(pid, job.lease_start_ticks) !== false) continue;
       const exhausted = Number(job.attempts) >= Number(job.max_attempts);
       const jobState = exhausted ? 'FAILED' : 'READY';
       const itemState = exhausted ? 'BLOCKED' : 'READY';
@@ -1966,8 +2421,11 @@ export class SQLiteStore {
       this.db.prepare('UPDATE jobs SET state=?, owner_token=NULL, lease_expires_at=NULL, error_class=?, updated_at=? WHERE id=?')
         .run(jobState, exhausted ? 'LeaseExpiredMaxAttempts' : 'LeaseExpired', stamp, job.id);
       this.db.prepare('UPDATE work_items SET state=?, updated_at=? WHERE id=?').run(itemState, stamp, job.work_item_id);
+      this.db.prepare('DELETE FROM job_resource_locks WHERE job_id=? AND owner_token=?').run(job.id, job.owner_token);
       this.db.prepare('UPDATE runtime_state SET active_job_id=NULL, last_run=? WHERE active_job_id=?')
         .run(stamp, job.id);
+      this.db.prepare("DELETE FROM scheduler_global_limit WHERE singleton=1 AND NOT EXISTS (SELECT 1 FROM jobs WHERE state IN ('CLAIMED','RUNNING'))").run();
+       this.clearProjectCapacityIfIdle(job.project_id, job.provider);
       this.recordTransition(Number(job.id), job.state, jobState, 'lease expired; recovered by reaper', 'lease-reaper', stamp);
       recovered.push({ jobId: Number(job.id), state: jobState, workItemId: Number(job.work_item_id) });
     }

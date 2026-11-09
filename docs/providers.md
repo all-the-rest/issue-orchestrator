@@ -108,7 +108,7 @@ instructions; all issue/comment text remains explicitly untrusted.
 `--dry-run` reports the selected issue and intended gates without opening or
 mutating SQLite, acquiring a claim, creating a branch, or writing to the
 provider. Terminal outcomes are `DONE`, `REVIEW`, `BLOCKED`, and `NEEDS_INFO`;
-human handovers preserve the worktree and release the global claim. Unexpected
+human handovers preserve the worktree and release the job's queue claim. Unexpected
 errors, mismatched state, and unavailable builder/runtime dependencies fail
 closed and retain the claim and recovery artifacts. Merge is delegated to the
 existing gate only when `auto_merge` is enabled; it still requires trusted

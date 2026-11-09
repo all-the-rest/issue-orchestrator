@@ -4,7 +4,7 @@ import { withMutationGuard } from './core/config.js';
 import { VERSION } from './version.js';
 
 const GUARDED = new Set([
-  'run', 'dod',
+  'dod',
   'claim', 'resume-lock', 'checkpoint', 'release', 'label', 'comment',
   'change-create', 'merge', 'evidence', 'ensure-labels',
   'project',
@@ -48,6 +48,12 @@ async function main(): Promise<number> {
   // run --dry-run is deliberately outside the guard and does not reconcile or
   // open SQLite. The dod command stays guarded for its complete execution.
   if (command === 'run' && opts['dry-run']) return await handler(opts) ?? 0;
+  if (command === 'run') {
+    // Reconciliation remains globally serialized, but never hold the global
+    // mutation guard for the lifetime of an agent workflow.
+    opts.reconciliation = withMutationGuard(() => reconcilePendingSideEffects(opts));
+    return await handler(opts) ?? 0;
+  }
   if (command === 'doctor' || command === 'jobs' || command === 'logs') {
     if (command === 'jobs' && ['retry', 'cancel'].includes(opts._[0])) return await withMutationGuard(() => handler(opts)) ?? 0;
     return await handler(opts) ?? 0;

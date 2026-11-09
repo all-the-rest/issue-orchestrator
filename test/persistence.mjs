@@ -45,6 +45,29 @@ function runWorker(db, issue) {
   });
 }
 
+function runResumeWorker(db, configFile) {
+  const code = `
+    import { SQLiteStore } from ${JSON.stringify(SOURCE)};
+    const store = new SQLiteStore(process.env.TEST_DB);
+    const lock = store.readResumableLock(process.env.TEST_CONFIG);
+    console.log(lock ? 'won' : 'lost');
+    if (lock) await new Promise((resolve) => setTimeout(resolve, 2000));
+    store.close();
+  `;
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ['--input-type=module', '-e', code], {
+      env: { ...process.env, TEST_DB: db, TEST_CONFIG: configFile },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let out = '';
+    let err = '';
+    child.stdout.on('data', (part) => { out += part; });
+    child.stderr.on('data', (part) => { err += part; });
+    child.on('error', reject);
+    child.on('close', (exitCode) => resolve({ exitCode, out: out.trim(), err }));
+  });
+}
+
 function runOpen(db) {
   const code = `
     import { SQLiteStore } from ${JSON.stringify(SOURCE)};
@@ -115,10 +138,13 @@ try {
   assert.equal(Number(store.rows('PRAGMA foreign_keys')[0].foreign_keys), 1);
   assert.equal(store.rows('PRAGMA journal_mode')[0].journal_mode, 'wal');
   assert.equal(Number(store.rows('PRAGMA busy_timeout')[0].timeout), 5000);
-  assert.equal(store.rows('SELECT version FROM schema_migrations').length, 4);
+  assert.equal(store.rows('SELECT version FROM schema_migrations').length, 6);
+  assert.ok(columns('jobs').has('lease_pid'), 'jobs should record the OS process that owns its lease');
+  assert.ok(columns('jobs').has('lease_start_ticks'), 'jobs should record process identity to detect PID reuse');
+  assert.ok(tables.has('job_resource_locks') && tables.has('scheduler_global_limit'));
   store.close();
   store = new SQLiteStore(migrationFile);
-  assert.equal(store.rows('SELECT version FROM schema_migrations').length, 4, 'reopening must not reapply migrations');
+  assert.equal(store.rows('SELECT version FROM schema_migrations').length, 6, 'reopening must not reapply migrations');
   store.close();
   ok('empty database receives all schema migrations with WAL/foreign keys, and restart is idempotent');
 
@@ -155,12 +181,20 @@ try {
     ALTER TABLE agent_sessions DROP COLUMN execution_pgid;
     ALTER TABLE agent_sessions DROP COLUMN execution_start_ticks;
     ALTER TABLE agent_sessions DROP COLUMN execution_token;
-    DELETE FROM schema_migrations WHERE version IN (2, 3, 4);
+    DROP INDEX jobs_one_active_owner_per_work_item;
+    DROP TABLE job_resource_locks;
+    DROP TABLE scheduler_config;
+    DROP TABLE scheduler_project_caps;
+    DROP TABLE scheduler_global_limit;
+    DROP TABLE scheduler_project_limit;
+    ALTER TABLE jobs DROP COLUMN lease_pid;
+    ALTER TABLE jobs DROP COLUMN lease_start_ticks;
+    DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6);
   `);
   store.close();
   store = new SQLiteStore(upgradeFile);
   assert.equal(store.rows('SELECT workflow_state FROM jobs WHERE id=?', upgradeJob.id)[0].workflow_state, 'EVIDENCE_PUBLISHED');
-  assert.equal(store.rows('SELECT MAX(version) AS version FROM schema_migrations')[0].version, 4);
+  assert.equal(store.rows('SELECT MAX(version) AS version FROM schema_migrations')[0].version, 6);
   store.close();
   ok('v1 jobs retain their workflow meaning when the additive migration is applied');
 
@@ -168,11 +202,11 @@ try {
   fs.mkdirSync(path.dirname(futureSchema), { recursive: true });
   const futureDb = new DatabaseSync(futureSchema);
   futureDb.exec('CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)');
-  futureDb.prepare('INSERT INTO schema_migrations(version, applied_at) VALUES (5, ?)').run(new Date().toISOString());
+  futureDb.prepare('INSERT INTO schema_migrations(version, applied_at) VALUES (7, ?)').run(new Date().toISOString());
   futureDb.close();
   assert.throws(() => new SQLiteStore(futureSchema), /newer than supported version/);
   const stillFutureDb = new DatabaseSync(futureSchema);
-  assert.equal(Number(stillFutureDb.prepare('SELECT MAX(version) AS version FROM schema_migrations').get().version), 5);
+  assert.equal(Number(stillFutureDb.prepare('SELECT MAX(version) AS version FROM schema_migrations').get().version), 7);
   stillFutureDb.close();
   ok('a database with a newer schema version is rejected without being downgraded');
 
@@ -196,8 +230,48 @@ try {
   assert.equal(store.counts().events, 1);
   assert.equal(store.counts().jobs, 1);
   assert.equal(redelivery.job.state, 'READY');
+  const caseVariant = store.recordEventAndEnqueue({
+    project: 'EXAMPLE/PROJECT', provider: 'github+issues', deliveryId: 'delivery-case-variant',
+    workItemId: 42, kind: 'issue.updated', payload: { title: 'Updated' },
+  });
+  assert.equal(caseVariant.inserted, true);
+  assert.equal(store.counts().events, 2);
+  assert.equal(store.counts().jobs, 2);
+  const githubRows = store.rows(`SELECT e.project_id AS event_project,j.project_id AS job_project,
+      w.project_id AS item_project,w.id AS work_item_id,j.id AS job_id
+    FROM events e JOIN jobs j ON j.event_id=e.id JOIN work_items w ON w.id=j.work_item_id
+    WHERE e.delivery_id IN ('delivery-1','delivery-case-variant') ORDER BY e.id`);
+  assert.equal(new Set(githubRows.map((row) => row.work_item_id)).size, 1);
+  assert.equal(new Set(githubRows.map((row) => row.job_id)).size, 2);
+  assert.ok(githubRows.every((row) => row.event_project === 'example/project' &&
+    row.job_project === 'example/project' && row.item_project === 'example/project'),
+  'case-variant events retain the original GitHub project spelling everywhere');
+  const distinctTracker = store.recordEventAndEnqueue({
+    project: 'EXAMPLE/PROJECT', provider: 'gitlab', deliveryId: 'gitlab-case-variant',
+    workItemId: 42, kind: 'issue.opened', payload: { title: 'GitLab issue' },
+  });
+  assert.equal(distinctTracker.inserted, true);
+  assert.equal(store.counts().jobs, 3, 'a non-GitHub tracker remains a distinct case-sensitive project');
+  store.recordEventAndEnqueue({
+    project: 'example/project', provider: 'gitlab', deliveryId: 'gitlab-same-spelling',
+    workItemId: 44, kind: 'issue.opened', payload: {},
+  });
+  const githubAfterProviderOverwrite = store.recordEventAndEnqueue({
+    project: 'EXAMPLE/PROJECT', provider: 'github', deliveryId: 'github-after-overwrite',
+    workItemId: 45, kind: 'issue.opened', payload: {},
+  });
+  assert.equal(store.rows('SELECT project_id FROM events WHERE id=?', githubAfterProviderOverwrite.eventId)[0].project_id, 'example/project',
+    'GitHub alias resolution follows durable GitHub job/event identity despite project.provider being overwritten');
+  const ambiguousStamp = new Date().toISOString();
+  store.db.prepare(`INSERT INTO projects(id,provider,created_at,updated_at) VALUES (?,?,?,?)`)
+    .run('Example/Project', 'github', ambiguousStamp, ambiguousStamp);
+  assert.throws(() => store.recordEventAndEnqueue({
+    project: 'example/project', provider: 'github', deliveryId: 'ambiguous-case',
+    workItemId: 43, kind: 'issue.opened', payload: {},
+  }), /Ambiguous GitHub project identity/);
+  assert.equal(store.counts().events, 5, 'ambiguous identity must not persist an event');
   store.close();
-  ok('provider redelivery deduplicates to one event row and one queued job');
+  ok('event enqueue deduplicates deliveries, canonicalizes GitHub project casing, and rejects ambiguity');
 
   const concurrentDb = path.join(TMP, 'concurrent', 'orchestrator.sqlite3');
   const concurrent = await Promise.all([
@@ -284,7 +358,7 @@ try {
     workItemId: 201, kind: 'issue.opened', payload: { number: 201 },
   });
   store.db.prepare('UPDATE jobs SET max_attempts=1 WHERE event_id=?').run(eventJob.eventId);
-  const lastAllowedAttempt = store.claimWorkItem('example/project', 201, { leaseMs: 100 });
+  const lastAllowedAttempt = store.claimWorkItem('example/project', 201, { leaseMs: 100, processId: 2147483647 });
   assert.ok(lastAllowedAttempt);
   const exhausted = store.reapExpiredLeases(Date.parse(lastAllowedAttempt.lease_expires_at) + 1000);
   assert.equal(exhausted[0].state, 'FAILED');
@@ -301,6 +375,274 @@ try {
   assert.equal(store.counts().jobs, 1);
   store.close();
   ok('max-attempt failure stays blocked across retries and later events without an explicit requeue');
+
+  const scheduler = storeAt('scheduler-acceptance');
+  const configA = path.join(TMP, 'config-a.jsonc');
+  const configB = path.join(TMP, 'config-b.jsonc');
+  const projectA = scheduler.claimWorkItem('alpha/project', 1, {
+    configFile: configA, maxConcurrency: 2, projectConcurrency: 1, workerId: 'alpha-worker',
+  });
+  const projectB = scheduler.claimWorkItem('beta/project', 2, {
+    configFile: configB, maxConcurrency: 2, projectConcurrency: 1, workerId: 'beta-worker',
+  });
+  assert.ok(projectA && projectB, 'two projects should occupy the two globally configured slots');
+  const parallelRows = scheduler.rows("SELECT j.owner_token,w.id AS work_item_id,j.project_id FROM jobs j JOIN work_items w ON w.id=j.work_item_id WHERE j.state IN ('CLAIMED','RUNNING') ORDER BY j.project_id");
+  assert.equal(parallelRows.length, 2);
+  assert.notEqual(parallelRows[0].owner_token, parallelRows[1].owner_token);
+  assert.notEqual(parallelRows[0].work_item_id, parallelRows[1].work_item_id);
+  assert.equal(scheduler.claimWorkItem('alpha/project', 3, {
+    configFile: configA, maxConcurrency: 2, projectConcurrency: 1,
+  }), null, 'same-project cap must be enforced across its work items');
+  assert.equal(scheduler.claimWorkItem('gamma/project', 1, {
+    configFile: configB, maxConcurrency: 2, projectConcurrency: 1,
+  }), null, 'a full global cap blocks another project');
+  assert.throws(() => scheduler.claimWorkItem('gamma/project', 3, {
+    configFile: path.join(TMP, 'conflicting.jsonc'), maxConcurrency: 3,
+  }), /same max_concurrency/, 'active configs must share one DB-global cap');
+  scheduler.clearLock(projectA.owner_token);
+  scheduler.clearLock(projectB.owner_token);
+  scheduler.close();
+  ok('two-project concurrency=2, per-project cap, global cross-config cap and work-item uniqueness are transactional');
+
+  const duplicateScheduler = storeAt('scheduler-cross-config-duplicate');
+  const uniqueOwner = duplicateScheduler.claimWorkItem('alpha/project', 1, { configFile: configA, maxConcurrency: 2, projectConcurrency: 2 });
+  assert.ok(uniqueOwner);
+  assert.equal(duplicateScheduler.claimWorkItem('alpha/project', 1, { configFile: configB, maxConcurrency: 2, projectConcurrency: 2 }), null,
+    'the same work item cannot be claimed through another config even when capacity is available');
+  duplicateScheduler.clearLock(uniqueOwner.owner_token);
+  duplicateScheduler.close();
+
+  const githubCaseStore = storeAt('github-case-identity');
+  const githubOwner = githubCaseStore.acquireLock({
+    repo: 'Acme/Widget', issue: 12, provider: 'github', owner_token: 'github-case-owner',
+    config_file: configA, claimed_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+  }, false, undefined, { maxConcurrency: 2, projectConcurrency: 1 });
+  assert.equal(githubOwner.repo, 'Acme/Widget', 'claim results preserve the configured project spelling');
+  assert.throws(() => githubCaseStore.acquireLock({
+    repo: 'ACME/WIDGET', issue: 12, provider: 'github', owner_token: 'github-case-duplicate',
+    config_file: configB, claimed_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+  }, false, undefined, { maxConcurrency: 2, projectConcurrency: 1 }), /already has an active owner/);
+  assert.throws(() => githubCaseStore.acquireLock({
+    repo: 'acme/widget', issue: 13, provider: 'github', owner_token: 'github-case-cap',
+    config_file: configB, claimed_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+  }, false, undefined, { maxConcurrency: 2, projectConcurrency: 1 }), /Project run capacity is full/);
+  githubCaseStore.clearLock(githubOwner.owner_token);
+  const legacyCaseOwner = githubCaseStore.acquireLock({
+    repo: 'MiXeD/Legacy', issue: 44, provider: 'github+gitlab', owner_token: 'legacy-case-owner',
+    config_file: configA, claimed_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+  }, false, undefined, { maxConcurrency: 2, projectConcurrency: 1 });
+  assert.equal(legacyCaseOwner.repo, 'MiXeD/Legacy');
+  assert.equal(githubCaseStore.readLockForWorkItem('mixed/legacy', 44)?.repo, 'MiXeD/Legacy',
+    'case-insensitive owner lookup must return the persisted configured spelling');
+  assert.throws(() => githubCaseStore.acquireLock({
+    repo: 'mixed/legacy', issue: 44, provider: 'github+github', owner_token: 'legacy-case-duplicate',
+    config_file: configB, claimed_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+  }, false, undefined, { maxConcurrency: 2, projectConcurrency: 1 }), /already has an active owner/,
+  'the tracker (first provider component) controls GitHub case folding');
+  assert.throws(() => githubCaseStore.acquireLock({
+    repo: 'MIXED/LEGACY', issue: 45, provider: 'github+github', owner_token: 'legacy-case-cap',
+    config_file: configB, claimed_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+  }, false, undefined, { maxConcurrency: 2, projectConcurrency: 1 }), /Project run capacity is full/);
+  githubCaseStore.clearLock(legacyCaseOwner.owner_token);
+  githubCaseStore.close();
+  ok('GitHub tracker lock claims preserve configured spelling and match case-insensitive ownership and caps');
+
+  const trackerCapacity = storeAt('tracker-project-capacity');
+  const trackerGithub = trackerCapacity.acquireLock({ repo: 'shared/project', issue: 1, provider: 'github', owner_token: 'tracker-github',
+    config_file: configA, claimed_at: new Date().toISOString(), updated_at: new Date().toISOString() }, false, undefined,
+  { maxConcurrency: 3, projectConcurrency: 1 });
+  const trackerGitlab = trackerCapacity.acquireLock({ repo: 'shared/project', issue: 2, provider: 'gitlab', owner_token: 'tracker-gitlab',
+    config_file: configB, claimed_at: new Date().toISOString(), updated_at: new Date().toISOString() }, false, undefined,
+  { maxConcurrency: 3, projectConcurrency: 2 });
+  assert.ok(trackerGithub && trackerGitlab, 'same project spelling has independent tracker capacity');
+  assert.equal(trackerCapacity.activeJobCount(), 2);
+  assert.throws(() => trackerCapacity.acquireLock({ repo: 'shared/project', issue: 3, provider: 'github', owner_token: 'tracker-github-full',
+    config_file: configB, claimed_at: new Date().toISOString(), updated_at: new Date().toISOString() }, false, undefined,
+  { maxConcurrency: 3, projectConcurrency: 1 }), /Project run capacity is full/);
+  trackerCapacity.clearLock(trackerGithub.owner_token);
+  trackerCapacity.clearLock(trackerGitlab.owner_token);
+  trackerCapacity.close();
+  ok('same-spelling projects on GitHub and GitLab use independent project capacity');
+
+  const githubCapacityCleanup = storeAt('github-capacity-cleanup');
+  const firstCasedClaim = githubCapacityCleanup.acquireLock({ repo: 'Acme/Repo', issue: 1, provider: 'github', owner_token: 'case-cap-one', config_file: configA,
+    claimed_at: new Date().toISOString(), updated_at: new Date().toISOString() }, false, undefined, { maxConcurrency: 2, projectConcurrency: 2 });
+  const secondCasedClaim = githubCapacityCleanup.acquireLock({ repo: 'acme/repo', issue: 2, provider: 'github', owner_token: 'case-cap-two', config_file: configB,
+    claimed_at: new Date().toISOString(), updated_at: new Date().toISOString() }, false, undefined, { maxConcurrency: 2, projectConcurrency: 2 });
+  githubCapacityCleanup.clearLock(firstCasedClaim.owner_token);
+  githubCapacityCleanup.clearLock(secondCasedClaim.owner_token);
+  assert.equal(githubCapacityCleanup.rows('SELECT COUNT(*) AS count FROM scheduler_project_limit WHERE lower(project_id)=lower(?)', 'Acme/Repo')[0].count, 0,
+    'last release clears stale case-variant project capacity rows');
+  const newCapOne = githubCapacityCleanup.claimWorkItem('Acme/Repo', 3, { configFile: configA, maxConcurrency: 3, projectConcurrency: 3 });
+  const newCapTwo = githubCapacityCleanup.claimWorkItem('acme/repo', 4, { configFile: configB, maxConcurrency: 3, projectConcurrency: 3 });
+  assert.ok(newCapOne && newCapTwo, 'new cap may be adopted consistently after previous owners release');
+  githubCapacityCleanup.clearLock(newCapOne.owner_token);
+  githubCapacityCleanup.clearLock(newCapTwo.owner_token);
+  githubCapacityCleanup.close();
+
+  const githubSameConfigCaps = storeAt('github-same-config-caps');
+  const originalSpelling = githubSameConfigCaps.claimWorkItem('Case/Project', 1, { configFile: configA, maxConcurrency: 3, projectConcurrency: 2 });
+  assert.ok(originalSpelling);
+  githubSameConfigCaps.clearLock(originalSpelling.owner_token);
+  const changedSpelling = githubSameConfigCaps.claimWorkItem('case/project', 2, { configFile: configA, maxConcurrency: 3, projectConcurrency: 3 });
+  assert.ok(changedSpelling);
+  const sameConfigConcurrent = githubSameConfigCaps.claimWorkItem('case/project', 3, { configFile: configA, maxConcurrency: 3, projectConcurrency: 3 });
+  assert.ok(sameConfigConcurrent, 'inactive case-variant config cap must not conflict after the project cap changes');
+  githubSameConfigCaps.clearLock(changedSpelling.owner_token);
+  githubSameConfigCaps.clearLock(sameConfigConcurrent.owner_token);
+  githubSameConfigCaps.close();
+
+  const githubWorkerCaseStore = storeAt('github-worker-case-identity');
+  const oldCaseWorker = githubWorkerCaseStore.claimWorkItem('Old/Case', 31, {
+    provider: 'github+gitlab', configFile: configA, maxConcurrency: 2, projectConcurrency: 1,
+  });
+  assert.ok(oldCaseWorker, 'seed an existing mixed-case tracker record');
+  assert.equal(githubWorkerCaseStore.claimWorkItem('old/case', 31, {
+    provider: 'github+github', configFile: configB, maxConcurrency: 2, projectConcurrency: 1,
+  }), null, 'worker path must not permit a second active owner under different casing');
+  assert.equal(githubWorkerCaseStore.claimWorkItem('OLD/CASE', 32, {
+    provider: 'github+github', configFile: configB, maxConcurrency: 2, projectConcurrency: 1,
+  }), null, 'worker path must enforce project caps across mixed-case identities');
+  githubWorkerCaseStore.clearLock(oldCaseWorker.owner_token);
+  githubWorkerCaseStore.close();
+  ok('GitHub worker claims fail closed across legacy mixed-case active rows, retry history and project limits');
+
+  const legacyHistoryStore = storeAt('github-case-history');
+  const priorCase = legacyHistoryStore.claimWorkItem('History/Case', 71, { configFile: configA, maxConcurrency: 2, projectConcurrency: 2 });
+  assert.ok(priorCase);
+  legacyHistoryStore.clearLock(priorCase.owner_token);
+  assert.throws(() => legacyHistoryStore.acquireLock({ repo: 'history/case', issue: 71, provider: 'github', owner_token: 'history-case-new', config_file: configB,
+    claimed_at: new Date().toISOString(), updated_at: new Date().toISOString() }, false, undefined, { maxConcurrency: 2, projectConcurrency: 2 }), /existing history under a different project spelling/,
+    'CLI claim must fail closed rather than create a differently cased work item and reset existing retry/workflow history');
+  assert.equal(legacyHistoryStore.rows('SELECT COUNT(*) AS count FROM work_items WHERE lower(project_id)=lower(?) AND external_id=?', 'History/Case', '71')[0].count, 1);
+  const otherTrackerHistory = legacyHistoryStore.claimWorkItem('history/case', 71, {
+    provider: 'gitlab', configFile: configB, maxConcurrency: 2, projectConcurrency: 2,
+  });
+  assert.ok(otherTrackerHistory, 'same textual project and issue on a different tracker is a distinct work item');
+  legacyHistoryStore.clearLock(otherTrackerHistory.owner_token);
+  legacyHistoryStore.close();
+
+  const conflictingProjectScheduler = storeAt('scheduler-project-config-conflict');
+  const configuredOwner = conflictingProjectScheduler.claimWorkItem('alpha/project', 1, { configFile: configA, maxConcurrency: 2, projectConcurrency: 2 });
+  conflictingProjectScheduler.db.prepare('UPDATE scheduler_project_caps SET max_concurrency=1 WHERE config_file=? AND project_id=?').run(configA, 'alpha/project');
+  assert.throws(() => conflictingProjectScheduler.claimWorkItem('alpha/project', 2, { configFile: configB, maxConcurrency: 2, projectConcurrency: 2 }), /same project concurrency cap/);
+  conflictingProjectScheduler.clearLock(configuredOwner.owner_token);
+  conflictingProjectScheduler.close();
+
+  const defaultScheduler = storeAt('scheduler-default-one');
+  const defaultA = defaultScheduler.claimWorkItem('one/project', 1, { configFile: configA });
+  assert.ok(defaultA);
+  assert.equal(defaultScheduler.claimWorkItem('two/project', 2, { configFile: configB }), null,
+    'the default global limit remains one');
+  defaultScheduler.clearLock(defaultA.owner_token);
+  defaultScheduler.close();
+  ok('default max_concurrency remains one across configs');
+
+  const resourceScheduler = storeAt('scheduler-resource');
+  const browserA = resourceScheduler.claimWorkItem('browser/a', 1, {
+    configFile: configA, maxConcurrency: 2, resourceLocks: ['browser'], leaseMs: 100, processId: 2147483647,
+  });
+  assert.ok(browserA);
+  assert.throws(() => resourceScheduler.claimWorkItem('browser/b', 2, {
+    configFile: configB, maxConcurrency: 2, resourceLocks: ['browser'],
+  }), /Resource lock is busy/);
+  resourceScheduler.clearLock(browserA.owner_token);
+  const browserB = resourceScheduler.claimWorkItem('browser/b', 2, {
+    configFile: configB, maxConcurrency: 2, resourceLocks: ['browser'],
+  });
+  assert.ok(browserB, 'release must make the named resource available');
+  resourceScheduler.clearLock(browserB.owner_token);
+  const staleBrowser = resourceScheduler.claimWorkItem('browser/c', 3, {
+    configFile: configA, maxConcurrency: 2, resourceLocks: ['browser'], leaseMs: 100, processId: 2147483647,
+  });
+  const liveJob = resourceScheduler.claimWorkItem('browser/d', 4, {
+    configFile: configB, maxConcurrency: 2, leaseMs: 100, processId: process.pid, resourceLocks: ['build'],
+  });
+  assert.ok(staleBrowser && liveJob);
+  const staleBrowserJobId = resourceScheduler.jobIdForOwner(staleBrowser.owner_token);
+  const reaped = resourceScheduler.reapExpiredLeases(Date.parse(staleBrowser.lease_expires_at) + 1000);
+  assert.deepEqual(reaped.map((entry) => entry.jobId), [staleBrowserJobId]);
+  assert.equal(resourceScheduler.readLockByOwner(liveJob.owner_token)?.owner_token, liveJob.owner_token,
+    'an expired timestamp must not reap a live process lease');
+  assert.throws(() => resourceScheduler.claimWorkItem('browser/f', 6, {
+    configFile: configA, maxConcurrency: 2, resourceLocks: ['build'],
+  }), /Resource lock is busy/, 'a competing claim must not steal a live expired resource lease');
+  const browserAfterReap = resourceScheduler.claimWorkItem('browser/e', 5, {
+    configFile: configA, maxConcurrency: 2, resourceLocks: ['browser'],
+  });
+  assert.ok(browserAfterReap, 'reaping an expired owner releases its named resource');
+  resourceScheduler.clearLock(liveJob.owner_token);
+  resourceScheduler.clearLock(browserAfterReap.owner_token);
+  resourceScheduler.close();
+  ok('browser lock serializes then frees on release/reap; stale lease reaps while a live expired lease survives');
+
+  const resumeDb = path.join(TMP, 'atomic-resume', 'orchestrator.sqlite3');
+  const resumeConfig = path.join(TMP, 'atomic-resume', 'config.jsonc');
+  const resumeStore = new SQLiteStore(resumeDb);
+  const staleOwner = resumeStore.claimWorkItem('resume/project', 30, {
+    configFile: resumeConfig, leaseMs: 100, processId: 2147483647,
+  });
+  assert.ok(staleOwner);
+  const resumeWorkers = await Promise.all([
+    runResumeWorker(resumeDb, resumeConfig), runResumeWorker(resumeDb, resumeConfig),
+  ]);
+  assert.ok(resumeWorkers.every((worker) => worker.exitCode === 0), JSON.stringify(resumeWorkers));
+  assert.deepEqual(resumeWorkers.map((worker) => worker.out).sort(), ['lost', 'won']);
+  assert.equal(resumeStore.readResumableLock(resumeConfig)?.owner_token, staleOwner.owner_token,
+    'after the winning resumed owner exits, a later restart may atomically take ownership again');
+  resumeStore.clearLock(staleOwner.owner_token);
+  resumeStore.close();
+  ok('stale job resumption atomically binds the lease to one live process and refuses a concurrent resumer');
+
+  const autoResumeStore = storeAt('automatic-resume-resources');
+  const autoStale = autoResumeStore.claimWorkItem('resume/stale', 31, {
+    configFile: resumeConfig, maxConcurrency: 2, projectConcurrency: 2, processId: 2147483647,
+  });
+  const browserHolder = autoResumeStore.claimWorkItem('resume/browser', 32, {
+    configFile: resumeConfig, maxConcurrency: 2, projectConcurrency: 2, resourceLocks: ['browser'], processId: process.pid,
+  });
+  assert.ok(autoStale && browserHolder);
+  const resumeProjectLimits = {
+    'resume/stale': { maxConcurrency: 2, projectConcurrency: 2, resourceLocks: ['browser'] },
+    'resume/browser': { maxConcurrency: 2, projectConcurrency: 2, resourceLocks: ['browser'] },
+  };
+  assert.equal(autoResumeStore.readResumableLock(resumeConfig, resumeProjectLimits), null,
+    'busy stale candidate must be skipped without changing its owner');
+  assert.equal(autoResumeStore.readLockByOwner(autoStale.owner_token)?.owner_token, autoStale.owner_token);
+  autoResumeStore.clearLock(browserHolder.owner_token);
+  assert.equal(autoResumeStore.readResumableLock(resumeConfig, resumeProjectLimits)?.owner_token, autoStale.owner_token,
+    'after browser release the stale job resumes with the newly required resource reserved');
+  assert.equal(autoResumeStore.rows('SELECT resource FROM job_resource_locks WHERE job_id=?', autoStale.id)[0].resource, 'browser');
+  autoResumeStore.clearLock(autoStale.owner_token);
+  autoResumeStore.close();
+  ok('automatic stale resume respects newly configured resources and preserves ownership while busy');
+
+  const legacyResumeStore = storeAt('legacy-resume-capacity');
+  const legacyResumeOwner = legacyResumeStore.claimWorkItem('legacy/resume', 90, {
+    configFile: configA, maxConcurrency: 2, projectConcurrency: 2, processId: 2147483647,
+  });
+  const busyResourceOwner = legacyResumeStore.claimWorkItem('legacy/other', 91, {
+    configFile: configB, maxConcurrency: 2, projectConcurrency: 2, resourceLocks: ['gpu'], processId: 2147483647,
+  });
+  assert.ok(legacyResumeOwner && busyResourceOwner);
+  const legacyResumeLock = legacyResumeStore.readLockByOwner(legacyResumeOwner.owner_token);
+  assert.throws(() => legacyResumeStore.resumeLock(legacyResumeOwner.owner_token, { ...legacyResumeLock, owner_token: 'legacy-resume-busy', config_file: configA, resumed_at: new Date().toISOString(), updated_at: new Date().toISOString() },
+    { maxConcurrency: 2, projectConcurrency: 2, resourceLocks: ['gpu'] }), /Resource lock is busy/);
+  assert.equal(legacyResumeStore.readLockByOwner(legacyResumeOwner.owner_token)?.owner_token, legacyResumeOwner.owner_token,
+    'failed resume must not change ownership');
+  assert.throws(() => legacyResumeStore.resumeLock(legacyResumeOwner.owner_token, { ...legacyResumeLock, owner_token: 'legacy-resume-cap', config_file: configA, resumed_at: new Date().toISOString(), updated_at: new Date().toISOString() },
+    { maxConcurrency: 3, projectConcurrency: 3, resourceLocks: [] }), /same max_concurrency/);
+  legacyResumeStore.clearLock(busyResourceOwner.owner_token);
+  // Simulate an active legacy row whose scheduler/resource reservations were never recorded.
+  legacyResumeStore.db.prepare('DELETE FROM job_resource_locks WHERE job_id=?').run(legacyResumeStore.jobIdForOwner(legacyResumeOwner.owner_token));
+  legacyResumeStore.db.prepare('DELETE FROM scheduler_config WHERE config_file=?').run(configA);
+  const resumedLegacy = { ...legacyResumeLock, owner_token: 'legacy-resume-won', config_file: configA, resumed_at: new Date().toISOString(), updated_at: new Date().toISOString() };
+  legacyResumeStore.resumeLock(legacyResumeOwner.owner_token, resumedLegacy, { maxConcurrency: 2, projectConcurrency: 2, resourceLocks: ['gpu'] });
+  assert.equal(legacyResumeStore.rows('SELECT owner_token FROM job_resource_locks WHERE resource=?', 'gpu')[0].owner_token, resumedLegacy.owner_token);
+  assert.equal(Number(legacyResumeStore.rows('SELECT max_concurrency FROM scheduler_global_limit')[0].max_concurrency), 2);
+  legacyResumeStore.clearLock(resumedLegacy.owner_token);
+  legacyResumeStore.close();
+  ok('legacy explicit resume atomically reserves capacity/resources and refuses busy resources or conflicting caps');
 
   const workflowDb = path.join(TMP, 'workflow', 'orchestrator.sqlite3');
   let workflowStore = new SQLiteStore(workflowDb);
@@ -440,6 +782,64 @@ try {
   journalStore.close();
   ok('crash-injected side-effect intents reconcile comments and change requests without duplicate writes and fail closed on unknown state');
 
+  const mergeRecoveryStore = storeAt('merge-recovery-capacity');
+  const recoveryConfig = path.join(TMP, 'merge-recovery-config.json');
+  const mergeJob = mergeRecoveryStore.claimWorkItem('alpha/project', 42, { configFile: recoveryConfig, maxConcurrency: 2, projectConcurrency: 2 });
+  const mergeIntent = { project: 'alpha/project', number: 17, head_sha: 'a'.repeat(40), issue: 42, branch: 'fix/42', base: 'main', owner_token: mergeJob.owner_token };
+  mergeRecoveryStore.db.prepare("UPDATE jobs SET workflow_state='MERGING', branch=?, head_sha=?, change_number=? WHERE id=?")
+    .run(mergeIntent.branch, mergeIntent.head_sha, mergeIntent.number, mergeJob.id);
+  mergeRecoveryStore.beginSideEffect({ ownerToken: mergeJob.owner_token, idempotencyKey: 'merge-recovery-test', kind: 'merge', intent: mergeIntent });
+  mergeRecoveryStore.db.prepare("UPDATE jobs SET state='READY', owner_token=NULL WHERE id=?").run(mergeJob.id);
+  const browserOwner = mergeRecoveryStore.claimWorkItem('beta/project', 1, { configFile: recoveryConfig, maxConcurrency: 2, projectConcurrency: 2, resourceLocks: ['browser'] });
+  const recoveryLimits = { maxConcurrency: 2, projectConcurrency: 2, resourceLocks: ['browser'] };
+  assert.equal(mergeRecoveryStore.prepareMergedSideEffectRecovery('merge-recovery-test', mergeIntent, recoveryLimits), null, 'busy browser must block merge recovery');
+  mergeRecoveryStore.clearLock(browserOwner.owner_token);
+  const otherCaseOwner = mergeRecoveryStore.claimWorkItem('ALPHA/project', 43, { configFile: recoveryConfig, maxConcurrency: 2, projectConcurrency: 1 });
+  assert.ok(otherCaseOwner);
+  assert.equal(mergeRecoveryStore.prepareMergedSideEffectRecovery('merge-recovery-test', mergeIntent, { ...recoveryLimits, projectConcurrency: 1 }), null,
+    'merge recovery must count differently cased GitHub project owners against the same cap');
+  mergeRecoveryStore.clearLock(otherCaseOwner.owner_token);
+  const recoveredMerge = mergeRecoveryStore.prepareMergedSideEffectRecovery('merge-recovery-test', mergeIntent, recoveryLimits);
+  assert.ok(recoveredMerge);
+  assert.equal(mergeRecoveryStore.rows('SELECT owner_token FROM job_resource_locks WHERE resource=?', 'browser')[0].owner_token, recoveredMerge.owner_token);
+  mergeRecoveryStore.clearLock(recoveredMerge.owner_token);
+
+  const activeMergeJob = mergeRecoveryStore.claimWorkItem('gamma/project', 44, {
+    configFile: recoveryConfig, maxConcurrency: 2, projectConcurrency: 2, processId: 2147483647,
+  });
+  assert.ok(activeMergeJob);
+  const activeMergeIntent = {
+    project: 'gamma/project', number: 18, head_sha: 'b'.repeat(40), issue: 44,
+    branch: 'fix/44', base: 'main', owner_token: activeMergeJob.owner_token,
+  };
+  mergeRecoveryStore.db.prepare("UPDATE jobs SET workflow_state='MERGING', branch=?, head_sha=?, change_number=? WHERE id=?")
+    .run(activeMergeIntent.branch, activeMergeIntent.head_sha, activeMergeIntent.number, activeMergeJob.id);
+  mergeRecoveryStore.beginSideEffect({ ownerToken: activeMergeJob.owner_token, idempotencyKey: 'active-merge-recovery-test', kind: 'merge', intent: activeMergeIntent });
+  const activeBlocker = mergeRecoveryStore.claimWorkItem('delta/project', 1, {
+    configFile: recoveryConfig, maxConcurrency: 2, projectConcurrency: 2, resourceLocks: ['gpu'],
+  });
+  assert.ok(activeBlocker);
+  const priorActiveJob = mergeRecoveryStore.rows('SELECT stage, claimed_by, lease_pid, lease_start_ticks, lease_expires_at FROM jobs WHERE id=?', activeMergeJob.id)[0];
+  const priorTransitions = mergeRecoveryStore.rows('SELECT COUNT(*) AS count FROM workflow_transitions WHERE job_id=?', activeMergeJob.id)[0].count;
+  const activeRecoveryLimits = { maxConcurrency: 2, projectConcurrency: 2, resourceLocks: ['gpu'] };
+  assert.equal(mergeRecoveryStore.prepareMergedSideEffectRecovery('active-merge-recovery-test', activeMergeIntent, activeRecoveryLimits), null,
+    'a conflicting resource must block recovery for an active dead-owner job');
+  assert.deepEqual(mergeRecoveryStore.rows('SELECT stage, claimed_by, lease_pid, lease_start_ticks, lease_expires_at FROM jobs WHERE id=?', activeMergeJob.id)[0], priorActiveJob,
+    'resource conflict must not refresh or mutate the dead-owner job');
+  assert.equal(mergeRecoveryStore.rows('SELECT COUNT(*) AS count FROM workflow_transitions WHERE job_id=?', activeMergeJob.id)[0].count, priorTransitions);
+  assert.equal(mergeRecoveryStore.rows('SELECT status FROM side_effect_journal WHERE idempotency_key=?', 'active-merge-recovery-test')[0].status, 'INTENT');
+  assert.equal(Number(mergeRecoveryStore.rows("SELECT COUNT(*) AS count FROM jobs WHERE state IN ('CLAIMED','RUNNING')")[0].count), 2,
+    'failed recovery must preserve active capacity accounting');
+  mergeRecoveryStore.clearLock(activeBlocker.owner_token);
+  const acquiredActiveMerge = mergeRecoveryStore.prepareMergedSideEffectRecovery('active-merge-recovery-test', activeMergeIntent, activeRecoveryLimits);
+  assert.ok(acquiredActiveMerge, 'recovery should acquire the resource once it becomes free');
+  assert.equal(mergeRecoveryStore.rows('SELECT owner_token FROM job_resource_locks WHERE resource=?', 'gpu')[0].owner_token, activeMergeJob.owner_token);
+  assert.equal(mergeRecoveryStore.readLockByOwner(activeMergeJob.owner_token)?.owner_token, activeMergeJob.owner_token);
+  assert.equal(Number(mergeRecoveryStore.rows("SELECT COUNT(*) AS count FROM jobs WHERE state IN ('CLAIMED','RUNNING')")[0].count), 1,
+    'successful in-place recovery must retain, not double-count, the active capacity slot');
+  mergeRecoveryStore.close();
+  ok('merged side-effect recovery atomically reserves resources for queued and active dead-owner jobs');
+
   const legacyHome = path.join(TMP, 'legacy');
   const legacyDb = path.join(legacyHome, 'orchestrator.sqlite3');
   const configFile = path.join(legacyHome, 'config.jsonc');
@@ -461,6 +861,11 @@ try {
   assert.equal(store.counts().jobs, 1);
   store.importLegacy(lockFile, stateFile, configFile);
   assert.equal(store.counts().jobs, 1, 'legacy import marker must make reruns idempotent');
+  assert.equal(store.readResumableLock(configFile), null, 'unknown legacy owner must not be resumed automatically');
+  assert.equal(store.reapExpiredLeases().length, 0, 'unknown legacy owner must not be reaped automatically');
+  const importedLegacyResume = { ...legacyLock, owner_token: 'confirmed-legacy-owner', resumed_at: new Date().toISOString(), updated_at: new Date().toISOString() };
+  store.resumeLock(legacyLock.owner_token, importedLegacyResume);
+  assert.equal(store.readLock().owner_token, importedLegacyResume.owner_token, 'explicit stale confirmation allows manual legacy recovery');
   store.close();
   ok('legacy state.json/lock.json are imported once into the job and ownership tables');
 
