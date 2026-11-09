@@ -5,6 +5,7 @@ import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { SQLiteStore } from '../dist/core/persistence.js';
+import { loadConfig, repoConfig } from '../dist/core/config.js';
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'operator-cli-'));
 const bin = path.join(root, 'bin');
@@ -19,7 +20,18 @@ const dod = {
   required_checks: ['CI'], evidence_class: 'cli', acceptance_source: 'issue_body',
 };
 fs.writeFileSync(config, JSON.stringify({
-  model: 'openai/test-model', accounts: ['configured-account'],
+  model: 'openai/test-model', agent_runner: 'opencode', accounts: ['configured-account'],
+  repos: { 'owner/repo': { account: 'configured-account', dod } },
+}));
+assert.equal(loadConfig(config).agent_runner, 'opencode');
+assert.equal(repoConfig(loadConfig(config), 'owner/repo').agent_runner, 'opencode');
+fs.writeFileSync(config, JSON.stringify({
+  model: 'openai/test-model', agent_runner: 'unknown', accounts: ['configured-account'],
+  repos: { 'owner/repo': { account: 'configured-account', dod } },
+}));
+assert.throws(() => loadConfig(config), /unsupported agent_runner/);
+fs.writeFileSync(config, JSON.stringify({
+  model: 'openai/test-model', agent_runner: 'opencode', accounts: ['configured-account'],
   repos: { 'owner/repo': { account: 'configured-account', dod } },
 }));
 fs.writeFileSync(openCodeConfig, JSON.stringify({ agents: { general: { model: 'openai/test-model' } } }));

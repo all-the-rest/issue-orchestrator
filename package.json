@@ -23,7 +23,7 @@
     "build": "tsc -p tsconfig.json && node -e \"require('node:fs').chmodSync('dist/cli.js', 0o755)\"",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "prototype:sdk-host-recovery": "node prototype/sdk-host-recovery.mjs",
-    "test": "pnpm build && node test/evidence-capture.mjs && node test/evidence-validation.mjs && node test/operator-cli.mjs && node test/service.mjs && node test/e2e.mjs && node test/run-once.mjs && node test/skill-wrapper.mjs && node test/persistence.mjs && node test/opencode-runner.mjs",
+    "test": "pnpm build && node test/evidence-capture.mjs && node test/evidence-validation.mjs && node test/operator-cli.mjs && node test/service.mjs && node test/e2e.mjs && node test/run-once.mjs && node test/skill-wrapper.mjs && node test/persistence.mjs && node test/agent-runner-contract.mjs && node test/command-runner.mjs && node test/opencode-runner.mjs",
     "prepack": "pnpm build",
     "start": "node dist/cli.js"
   },

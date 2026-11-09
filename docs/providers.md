@@ -15,6 +15,57 @@ missing operation throws `UnsupportedCapabilityError` and stops the workflow.
 | Jira | Tracker | Stub; fails closed | Stub; fails closed | — | — | — | — | — |
 | Jira | CodeHost | — | Stub; fails closed | Not supported | Not supported | No | None | None |
 | OpenCode | AgentRunner | — | — | — | — | — | — | Local CLI adapter; builder requires the preloaded OCI sandbox image |
+| Command | AgentRunner | — | — | — | — | — | — | Trusted installed executable using versioned JSON stdio |
+
+Runner selection can be set globally with `agent_runner` (or
+`defaults.agent_runner`) and overridden for an individual project with
+`repos.<owner>/<repo>.agent_runner`. Project overrides take precedence;
+otherwise the global setting, default setting, then `opencode` is used. For
+example:
+
+```jsonc
+{
+  "agent_runner": "opencode",
+  "model": "provider/model",
+  "command_runner": { "executable": "/opt/agents/project-agent", "args": ["--stdio"] },
+  "repos": { "owner/repo": { "agent_runner": "command", "command_runner": { "executable": "/opt/agents/owner-agent" } } }
+}
+```
+
+The selected runner name is stored on every agent session. Recovery verifies
+that identity before reading results, resuming, or aborting a session; changing
+the configured runner while a job is active therefore fails closed. Existing
+SQLite databases migrate additively and identify pre-migration sessions as
+`opencode`, the prior default runner. The `model` remains independently
+configurable and is passed to the selected adapter. OpenCode remains the
+default. The `command` adapter invokes a trusted installed executable directly
+(never through a shell) using protocol `issue-orchestrator.agent-runner/v1`.
+Each request is `{protocol, request_id, operation, session_id, system_prompt,
+input}` with operations `createSession`, `run`, `resume`, `abort`, and
+`getResult`. `system_prompt` is distinct from structured user `input`; older
+callers may continue to provide `prompt`, which is carried as user input.
+Responses
+must be one JSON object with the same protocol; creation returns `session_id`,
+and result operations return a result conforming to shared `AgentResult`.
+Output is limited to 1 MiB and calls time out after 30 minutes by default
+(configurable up to one hour). Executable and argv come only from trusted global
+or per-project config, never ticket data. The child receives only PATH,
+locale, temp and Windows platform variables; host HOME/XDG paths, GitHub tokens,
+SSH-agent state, and unrelated host credentials are excluded. The installed executable must
+obtain approved auth through its own credential mechanism. Stderr is discarded
+and diagnostics are generic/redacted. This adapter only hands off structured
+goal/ticket/update data; it does not perform source, CI, PR, evidence, or merge
+operations, nor enforce merge policy. Actual enforcement belongs to the
+selected project/provider.
+
+The test suite includes an in-memory reference runner to exercise the basic
+port and shared result contract. It is test-only: it provides no isolation,
+credential boundary, durable recovery, timeout, or cancellation guarantees and
+is not selectable in production. Existing `agent_sessions` rows still persist
+OpenCode runtime details (private NDJSON/stderr paths, OCI identity, and
+process/lease recovery identity) alongside generic runner identity. These
+fields remain owned by the OpenCode adapter; they have not been generalized
+into an adapter-neutral persistence model.
 
 Jira has no pull requests or checks. Pair it with a code host explicitly, for
 example `"tracker": "jira", "code_host": "github"`; this is accepted by the
