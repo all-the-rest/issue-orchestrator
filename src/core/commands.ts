@@ -66,6 +66,7 @@ const HELP = `Usage: issue-orchestrator <command> [args] [--config <path>]
 
   run --once [--project <owner/repo>] [--dry-run]
                                   run one trusted issue through review and release
+  service install --print         print a user-level launchd/systemd timer template
   doctor [--json]                 read-only local dependency/config diagnostics
   jobs list|show|retry|cancel <id> inspect or safely control persisted jobs
   logs [--job <id>] [--follow] [--json] read bounded agent session logs
@@ -111,6 +112,31 @@ or extracts credentials.
 
 Exit codes: 0 done/green, 1 refused/failed, 2 config missing/invalid, 8 checks pending.`;
 
+function cmdService(opts: RunCliOptions) {
+  if (opts._.join(' ') !== 'install' || (opts as unknown as Record<string, unknown>).print !== true || Object.keys(opts).some((key) => !['_', 'print'].includes(key))) {
+    throw new CliError('usage: service install --print (prints templates only; save and enable manually)');
+  }
+  const safeValue = (value: string) => {
+    if (/[\u0000-\u001f\u007f]/.test(value)) throw new CliError('service template paths and PATH may not contain control characters');
+    return value;
+  };
+  const xml = (value: string) => safeValue(value).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&apos;');
+  const unit = (value: string) => value.replaceAll('\\', '\\\\').replaceAll('"', '\\"').replaceAll('%', '%%').replaceAll('$', '$$');
+  const unitPath = (value: string) => safeValue(value).replaceAll('\\', '\\\\').replaceAll(' ', '\\s').replaceAll('"', '\\x22').replaceAll('%', '%%');
+  const cwd = process.cwd();
+  const node = process.execPath;
+  const cli = path.resolve(process.argv[1]);
+  const providerPath = safeValue(process.env.PATH ?? '');
+  if (process.platform === 'darwin') {
+    const label = 'local.issue-orchestrator';
+    console.log(`<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>\n  <key>Label</key><string>${xml(label)}</string>\n  <key>ProgramArguments</key><array>${[node, cli, 'run', '--once'].map((arg) => `<string>${xml(arg)}</string>`).join('')}</array>\n  <key>WorkingDirectory</key><string>${xml(cwd)}</string>\n  <key>EnvironmentVariables</key><dict><key>PATH</key><string>${xml(providerPath)}</string></dict>\n  <key>RunAtLoad</key><true/><key>StartInterval</key><integer>300</integer>\n  <key>StandardOutPath</key><string>${xml(path.join(os.homedir(), 'Library/Logs/issue-orchestrator.log'))}</string>\n  <key>StandardErrorPath</key><string>${xml(path.join(os.homedir(), 'Library/Logs/issue-orchestrator.error.log'))}</string>\n</dict></plist>\n\nSave as ~/Library/LaunchAgents/${label}.plist, then run:\n  launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/${label}.plist\n  launchctl enable gui/$(id -u)/${label}`);
+  } else if (process.platform === 'linux') {
+    const dir = path.join(os.homedir(), '.config/systemd/user');
+    console.log(`# Save as ${dir}/issue-orchestrator.service\n[Unit]\nDescription=Issue Orchestrator one-shot worker\n\n[Service]\nType=oneshot\nWorkingDirectory=${unitPath(cwd)}\nEnvironment="PATH=${unit(providerPath)}"\nExecStart="${unit(node)}" "${unit(cli)}" run --once\n\n# Save as ${dir}/issue-orchestrator.timer\n[Unit]\nDescription=Run Issue Orchestrator periodically\n\n[Timer]\nOnBootSec=2min\nOnUnitActiveSec=5min\nPersistent=true\nUnit=issue-orchestrator.service\n\n[Install]\nWantedBy=timers.target\n\nSave both files, then run:\n  systemctl --user daemon-reload\n  systemctl --user enable --now issue-orchestrator.timer`);
+  } else throw new CliError(`service templates are unsupported on ${process.platform}`);
+  return 0;
+}
+
 class CliError extends Error {
   exitCode: number;
 
@@ -118,6 +144,35 @@ class CliError extends Error {
     super(message);
     this.exitCode = exitCode;
   }
+}
+
+let shutdownSignal: NodeJS.Signals | null = null;
+let activeRunner: ReturnType<typeof getAgentRunner> | null = null;
+let activeSessionId: string | null = null;
+let activeAgentPromise: Promise<AgentResult> | null = null;
+
+export async function requestRunShutdown(signal: NodeJS.Signals) {
+  shutdownSignal ??= signal;
+  const agentPromise = activeAgentPromise;
+  const runner = activeRunner;
+  const sessionId = activeSessionId;
+  if (!agentPromise || !runner || !sessionId) return;
+  let abortError: unknown;
+  while (activeAgentPromise === agentPromise) {
+    try {
+      if (await runner.abort({ sessionId })) abortError = undefined;
+    } catch (error) {
+      abortError = error;
+    }
+    if (activeAgentPromise !== agentPromise) break;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  await agentPromise.catch(() => undefined);
+  if (abortError) throw abortError;
+}
+
+function checkRunShutdown() {
+  if (shutdownSignal) throw new CliError(`run interrupted by ${shutdownSignal}; durable job preserved for recovery`, shutdownSignal === 'SIGINT' ? 130 : 143);
 }
 
 function parseArgs(argv: string[]): Record<string, any> {
@@ -2682,6 +2737,7 @@ async function runAgent(
       }
       resume = true;
     } else {
+      checkRunShutdown();
       const session = await runner.createSession({ jobId, role, model: cfg.model, worktree });
       sessionId = session.externalSessionId;
       if (process.env.NODE_ENV === 'test' && role === 'builder' &&
@@ -2689,12 +2745,30 @@ async function runAgent(
         process.kill(process.pid, 'SIGKILL');
       }
     }
-    const result = resume
-      ? await runner.resume({ sessionId, prompt })
-      : await runner.run({ sessionId, prompt });
+    checkRunShutdown();
+    activeRunner = runner;
+    activeSessionId = sessionId;
+    let result: AgentResult;
+    try {
+      const agentPromise = Promise.resolve().then(() => resume
+        ? runner.resume({ sessionId, prompt })
+        : runner.run({ sessionId, prompt }));
+      activeAgentPromise = agentPromise;
+      result = await agentPromise;
+    } catch (error) {
+      checkRunShutdown();
+      throw error;
+    }
+    activeRunner = null;
+    activeSessionId = null;
+    activeAgentPromise = null;
+    checkRunShutdown();
     clearAgentResultFile(worktree);
     return result;
   } finally {
+    activeRunner = null;
+    activeSessionId = null;
+    activeAgentPromise = null;
     process.chdir(previousCwd);
   }
 }
@@ -2991,6 +3065,7 @@ async function cmdRun(opts: RunCliOptions) {
     throw new CliError('--project requires an owner/repo value');
   }
   if (opts['dry-run'] !== undefined && opts['dry-run'] !== true) throw new CliError('--dry-run does not accept a value');
+  checkRunShutdown();
 
   const cfg = requireConfig(opts) as RunConfig;
   const dryRun = !!opts['dry-run'];
@@ -3025,6 +3100,7 @@ async function cmdRun(opts: RunCliOptions) {
     selected = { ...candidate, ...verified, issue: verified.issue };
   }
 
+  checkRunShutdown();
   const issueNumber = Number(active?.issue ?? selected.issue.number);
   if (dryRun) {
     const plan = {
@@ -3050,10 +3126,13 @@ async function cmdRun(opts: RunCliOptions) {
   }
 
   const { project, rc, tracker, codeHost, issue, acceptanceText } = selected;
+  checkRunShutdown();
   assertEnabled(rc, project);
+  checkRunShutdown();
   codeHost.verifyRepository({ project });
   let lock = active;
   if (!lock) {
+    checkRunShutdown();
     const now = new Date().toISOString();
     const proposed = {
       provider: rc.provider,
@@ -3070,14 +3149,18 @@ async function cmdRun(opts: RunCliOptions) {
     };
     try { lock = acquireLock(proposed); }
     catch (error) { throw new CliError(error.message); }
-    if (rc.labels.working) journalIssueLabel({
+    if (rc.labels.working) {
+      checkRunShutdown();
+      journalIssueLabel({
       lock, tracker, project, issue: issueNumber, label: rc.labels.working, action: 'add',
-    });
+      });
+    }
   }
 
   const store = getRuntimeStore();
   let workflow = store.workflowStateForOwner(lock.owner_token);
   if (RUN_TERMINAL_STATES.has(workflow)) {
+    checkRunShutdown();
     const result = workflow === 'DONE' ? 'done' : workflow === 'REVIEW' ? 'review' :
       workflow === 'NEEDS_INFO' ? 'needs-info' : 'blocked';
     releaseRun(lock, opts, result);
@@ -3089,6 +3172,7 @@ async function cmdRun(opts: RunCliOptions) {
   const initial = !readRunMetadata(paths.metadata);
   let workspace: ReturnType<typeof ensureRunWorktree>;
   try {
+    checkRunShutdown();
     workspace = ensureRunWorktree(lock, rc, codeHost, paths, initial);
   } catch (error) {
     throw new CliError(`${error.message}; active claim and artifacts were preserved`);
@@ -3125,6 +3209,7 @@ async function cmdRun(opts: RunCliOptions) {
         const reviewReady = await restoreRunReviewAuthorization(
           lock, cfg, tracker, codeHost, rc, workspace, dataPreamble,
         );
+        checkRunShutdown();
         final = reviewReady
           ? finishRunMerge(lock, opts, tracker, codeHost, rc, workspace)
           : handoverRun(lock, opts, tracker, codeHost, rc, workspace, 'review');
@@ -3245,6 +3330,7 @@ async function cmdRun(opts: RunCliOptions) {
       if (dod !== 0) throw new CliError('configured DoD verification did not pass; active claim retained');
 
       const identity = { project, branch: workspace.branch, head_sha: currentHead };
+      checkRunShutdown();
       journaledWrite({
         lock,
         kind: 'branch-push',
@@ -3264,6 +3350,7 @@ async function cmdRun(opts: RunCliOptions) {
       fs.writeFileSync(pullBody, `Closes #${issueNumber}\n\nImplemented by issue-orchestrator run --once.`, { mode: 0o600 });
       const title = String(issueData.title ?? `Implement issue #${issueNumber}`);
       if (containsSecretLikeContent(title)) throw new CliError('issue title looks credential-like; refusing to create a change request');
+      checkRunShutdown();
       quiet(() => cmdChangeCreate({
         ...opts,
         _: [project],
@@ -3303,6 +3390,7 @@ async function cmdRun(opts: RunCliOptions) {
 
       const beforeEvidenceRecovery = store.workflowStateForOwner(lock.owner_token);
       if (['CHANGE_OPEN', 'EVIDENCE_PUBLISHED'].includes(beforeEvidenceRecovery)) {
+        checkRunShutdown();
         quiet(() => cmdEvidence({
           ...opts,
           _: [project, String(issueNumber)],
@@ -3313,6 +3401,7 @@ async function cmdRun(opts: RunCliOptions) {
         throw new CliError(`cannot recover evidence publication from workflow state ${beforeEvidenceRecovery}; preserving claim`);
       }
       lock = readLock(lockPath(configFile(opts)), configFile(opts));
+      checkRunShutdown();
       crashAfterWorkflowStateForTest('EVIDENCE_PUBLISHED');
       publishRunMarker(lock, tracker, codeHost, rc, 'tests');
       publishRunMarker(lock, tracker, codeHost, rc, 'evidence');
@@ -3337,6 +3426,7 @@ async function cmdRun(opts: RunCliOptions) {
         console.log(JSON.stringify(final, null, 2));
         return 0;
       }
+      checkRunShutdown();
       publishRunMarker(lock, tracker, codeHost, rc, 'review-approved');
       if (store.workflowStateForOwner(lock.owner_token) === 'REVIEWING') {
         updateRunStage(lock, 'reviewed', { head_sha: lock.head_sha });
@@ -3347,6 +3437,7 @@ async function cmdRun(opts: RunCliOptions) {
         console.log(JSON.stringify(final, null, 2));
         return 0;
       }
+      checkRunShutdown();
       final = finishRunMerge(lock, opts, tracker, codeHost, rc, workspace);
       succeeded = final.outcome === 'DONE';
       console.log(JSON.stringify(final, null, 2));
@@ -3454,6 +3545,7 @@ const COMMANDS = {
   logs: cmdLogs,
   project: cmdProject,
   run: cmdRun,
+  service: cmdService,
   status: cmdStatus,
   list: cmdList,
   view: cmdView,

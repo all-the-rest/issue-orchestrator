@@ -86,6 +86,9 @@ after the existing exact-head native-approval, machine-marker, DoD, and required
 check gates pass. With `auto_merge: false`, the run always hands off for human
 review.
 
+For user-level launchd/systemd timers, Docker operation, persistence, and
+shutdown/recovery behavior, see [`docs/service.md`](docs/service.md).
+
 Exit codes: `0` done/green, `1` refused/failed, `2` config missing or invalid,
 `8` checks pending.
 
