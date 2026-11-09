@@ -238,6 +238,15 @@ function addProjectCheckout(scenario, project) {
   return repo;
 }
 
+function isolatedIssueFixtures(scenario, project) {
+  const fixtures = path.join(scenario.base, `fixtures-${project.replace('/', '-')}`);
+  fs.mkdirSync(fixtures, { recursive: true });
+  const state = JSON.parse(fs.readFileSync(path.join(scenario.fixtures, 'state.json'), 'utf8'));
+  state.issue.url = `https://github.com/${project}/issues/${state.issue.number}`;
+  write(path.join(fixtures, 'state.json'), state);
+  return fixtures;
+}
+
 const ghSource = `#!/usr/bin/env node
 import fs from 'node:fs';
 import { spawnSync } from 'node:child_process';
@@ -822,6 +831,8 @@ ok('explicit --project preserves origin-mismatch refusal instead of returning NO
 
 const parallelProjects = makeScenario('two-project-workers', { autoMerge: false, project: 'beta/demo' });
 addProjectCheckout(parallelProjects, 'acme/demo');
+const betaProjectFixtures = isolatedIssueFixtures(parallelProjects, 'beta/demo');
+const acmeProjectFixtures = isolatedIssueFixtures(parallelProjects, 'acme/demo');
 const parallelConfig = JSON.parse(fs.readFileSync(parallelProjects.configFile, 'utf8'));
 parallelConfig.max_concurrency = 2;
 parallelConfig.repos['acme/demo'] = {
@@ -833,7 +844,7 @@ const secondAgentGate = path.join(parallelProjects.base, 'release-second-agent')
 fs.writeFileSync(firstAgentGate, 'wait');
 fs.writeFileSync(secondAgentGate, 'wait');
 const firstProjectRun = runAsync(parallelProjects, ['run', '--once', '--project', 'beta/demo'], {
-  FAKE_AGENT_WAIT_FILE: firstAgentGate, FAKE_AGENT_BLOCK_ROLE: 'triage',
+  FAKE_DIR: betaProjectFixtures, FAKE_AGENT_WAIT_FILE: firstAgentGate, FAKE_AGENT_BLOCK_ROLE: 'triage',
 });
 const firstProjectDeadline = Date.now() + 10000;
 while (Date.now() < firstProjectDeadline) {
@@ -843,7 +854,7 @@ while (Date.now() < firstProjectDeadline) {
 }
 assert.ok(fs.existsSync(parallelProjects.agentLog) && fs.readFileSync(parallelProjects.agentLog, 'utf8').includes('"role":"triage"'));
 const secondProjectRun = runAsync(parallelProjects, ['run', '--once', '--project', 'acme/demo'], {
-  FAKE_AGENT_WAIT_FILE: secondAgentGate, FAKE_AGENT_BLOCK_ROLE: 'triage',
+  FAKE_DIR: acmeProjectFixtures, FAKE_AGENT_WAIT_FILE: secondAgentGate, FAKE_AGENT_BLOCK_ROLE: 'triage',
 });
 const bothProjectsDeadline = Date.now() + 10000;
 while (Date.now() < bothProjectsDeadline) {
