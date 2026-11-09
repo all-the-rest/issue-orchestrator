@@ -120,6 +120,8 @@ review.
 For user-level launchd/systemd timers, Docker operation, persistence, and
 shutdown/recovery behavior, see [`docs/service.md`](docs/service.md).
 The dispatcher topology and event-delivery idempotency contract are recorded in [`docs/agent-dispatch.md`](docs/agent-dispatch.md).
+For safe OpenCode context transfer between implementation sessions, see
+[`docs/session-handoff.md`](docs/session-handoff.md).
 
 Exit codes: `0` done/green, `1` refused/failed, `2` config missing or invalid,
 `8` checks pending.
