@@ -108,14 +108,29 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 const args = process.argv.slice(2);
-const agent = args[args.indexOf('--agent') + 1] || '';
-const role = /issue-orchestrator-(triage|builder|verifier|reviewer)-/.exec(agent)?.[1] || 'unknown';
+const config = process.env.OPENCODE_CONFIG ? JSON.parse(fs.readFileSync(process.env.OPENCODE_CONFIG, 'utf8')) : null;
+const agentIndex = args.indexOf('--agent');
+const agent = agentIndex >= 0 ? args[agentIndex + 1] : config?.default_agent || '';
+const profile = config?.agents?.[agent];
 const prompt = args.at(-1) || '';
 const userInputText = prompt.startsWith('Task from issue-orchestrator:\\n')
   ? prompt.slice('Task from issue-orchestrator:\\n'.length, prompt.indexOf('\\n\\nMachine result contract:')) : '';
 const userInput = userInputText ? JSON.parse(userInputText) : null;
-const config = process.env.OPENCODE_CONFIG ? JSON.parse(fs.readFileSync(process.env.OPENCODE_CONFIG, 'utf8')) : null;
-const configuredSystemPrompt = config?.agents?.[agent]?.system || '';
+const roleByDescription = {
+  'Classify a trusted issue and identify acceptance criteria without editing files.': 'triage',
+  'Implement a change in the isolated workspace and report the structured result. Shell commands run in disposable network-disabled OCI containers.': 'builder',
+  'Inspect the change read-only and report verification evidence without running commands or asking questions.': 'verifier',
+  'Review the current change read-only and report findings without asking questions.': 'reviewer',
+};
+const roleByTask = [
+  [/Classify the ticket/, 'triage'],
+  [/Verify the acceptance scenario/, 'verifier'],
+  [/Implement the ticket/, 'builder'],
+  [/Review the complete diff/, 'reviewer'],
+];
+const role = roleByDescription[profile?.description] || /issue-orchestrator-(triage|builder|verifier|reviewer)-/.exec(agent)?.[1] ||
+  roleByTask.find(([pattern]) => pattern.test(userInput?.task || ''))?.[1] || 'unknown';
+const configuredSystemPrompt = profile?.system || '';
 const match = /absolute path ("[^\"]+") with required fields/.exec(prompt);
 if (!match) { process.stderr.write('result path missing\\n'); process.exit(2); }
 const resultFile = JSON.parse(match[1]);

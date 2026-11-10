@@ -206,8 +206,8 @@ try {
   // A changed issue snapshot is a structured follow-up; comments stay in `updates`.
   const changed = fixture(7, { onDispatch: (input, count, issue) => {
     if (count === 1) throw Error('transient');
-    if (count === 2) return { sessionId: input.sessionId ?? 'session-7', result: validResult('BLOCKED') };
-    return { sessionId: input.sessionId, result: validResult('BLOCKED') };
+    if (count < 4) return { sessionId: input.sessionId ?? 'session-7', result: validResult('BLOCKED') };
+    return { sessionId: input.sessionId, result: validResult('DONE') };
   } });
   const changedDb = new SQLiteStore(path.join(dir, 'changed.sqlite3'));
   assert.equal((await run(changed, changedDb, 7)).state, 'failed');
@@ -218,6 +218,18 @@ try {
   const followup = JSON.parse(changed.messages[2].message);
   assert.equal(followup.kind, 'update'); assert.equal(followup.ticket.title, 'changed title');
   assert.equal(followup.mode, 'auto-implement'); assert.equal(followup.updates[0].body, 'new comment');
+  assert.equal((await run(changed, changedDb, 7)).state, 'blocked');
+  assert.equal(changed.dispatchCount, 3, 'terminal BLOCKED outcomes do not retry implicitly');
+  const blockedSession = blocked.sessionId;
+  const retried = await runTicketHandoff({ port: changed.port, dispatch: changed.dispatch, store: changedDb,
+    project: 'owner/repo', issue: 7, policy: { ...policy, retryBlocked: true } });
+  assert.equal(retried.state, 'done');
+  assert.equal(retried.sessionId, blockedSession, 'explicit retry must reuse the persisted OpenCode conversation');
+  assert.equal(changed.dispatchCount, 4);
+  assert.equal(changed.messages[3].continueCompleted, true);
+  assert.match(changed.messages[3].bootstrap, /explicit operator retry/);
+  assert.equal(JSON.parse(changed.messages[3].message).finalAcceptanceCriteria, policy.goal,
+    'retry preserves the exact original acceptance criteria');
 
   // Final status retry reuses persisted key and does not dispatch again.
   const retryStatus = fixture(8, { failStatus: 1 });

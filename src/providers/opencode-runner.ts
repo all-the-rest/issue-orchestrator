@@ -16,6 +16,7 @@ import {
   writeOciShellWrapper,
   type OciSandbox,
 } from './oci-sandbox.js';
+import { parseJsonc } from '../core/config.js';
 import {
   descriptor,
   type AgentResult,
@@ -38,6 +39,7 @@ const MAX_NDJSON_BYTES = 50 * 1024 * 1024;
 const MAX_STDERR_BYTES = 5 * 1024 * 1024;
 const RESULT_RELATIVE_PATH = path.join('.issue-orchestrator', 'result.json');
 const SUPPORTED_ROLES = new Set<AgentRole>(['triage', 'builder', 'verifier', 'reviewer']);
+const OPENCODE_BUILTIN_DEFAULT_AGENT = 'build';
 
 const ZERO_USAGE: AgentUsage = {
   inputTokens: 0,
@@ -141,7 +143,45 @@ function agentPermissions(role: AgentRole, worktree: string) {
   ];
 }
 
-function agentConfig(role: AgentRole, agentName: string, worktree: string, shellWrapper?: string, trustedSystemPrompt?: string) {
+function configuredDefaultAgent(source: NodeJS.ProcessEnv) {
+  const configFiles = source.OPENCODE_CONFIG
+    ? [source.OPENCODE_CONFIG]
+    : ['opencode.jsonc', 'opencode.json'].map((file) => path.join(
+      source.OPENCODE_CONFIG_DIR || path.join(source.XDG_CONFIG_HOME || path.join(source.HOME || os.homedir(), '.config'), 'opencode'),
+      file,
+    ));
+  let config: Record<string, unknown> = {};
+  try {
+    if (source.OPENCODE_CONFIG_CONTENT !== undefined) {
+      const parsed = parseJsonc(source.OPENCODE_CONFIG_CONTENT, 'OPENCODE_CONFIG_CONTENT');
+      if (isRecord(parsed)) config = parsed;
+    } else {
+      const configFile = configFiles.find((file) => fs.existsSync(file));
+      if (configFile) {
+        const parsed = parseJsonc(fs.readFileSync(configFile, 'utf8'), configFile);
+        if (isRecord(parsed)) config = parsed;
+      }
+    }
+  } catch (error) {
+    throw new AgentRunnerError('AGENT_SPAWN_FAILED', 'Could not read the configured OpenCode default agent', undefined, error);
+  }
+
+  const name = config.default_agent === undefined ? OPENCODE_BUILTIN_DEFAULT_AGENT : config.default_agent;
+  if (typeof name !== 'string' || !name.trim()) {
+    throw new AgentRunnerError('AGENT_SPAWN_FAILED', 'Configured OpenCode default_agent must be a non-empty string');
+  }
+  const agents = isRecord(config.agents) ? config.agents : {};
+  const definition = isRecord(agents[name]) ? agents[name] : {};
+  return { name, definition };
+}
+
+function agentConfig(
+  role: AgentRole,
+  defaultAgent: { name: string; definition: Record<string, unknown> },
+  worktree: string,
+  shellWrapper?: string,
+  trustedSystemPrompt?: string,
+) {
   const resultFile = path.join(worktree, RESULT_RELATIVE_PATH);
   const descriptions: Record<AgentRole, string> = {
     triage: 'Classify a trusted issue and identify acceptance criteria without editing files.',
@@ -151,20 +191,26 @@ function agentConfig(role: AgentRole, agentName: string, worktree: string, shell
   };
   const systems: Record<AgentRole, string> = {
     triage: `Triage only. Never ask a question. If required information is missing, return BLOCKED. Write the result contract to the absolute path ${JSON.stringify(resultFile)}.`,
-    builder: `Implement only in the mounted workspace at /workspace. Every shell command is executed in a fresh, disposable OCI container with no network, no host home, no credentials, and no runtime socket. The shell starts in /workspace. Never push, use gh/glab, comment, merge, or ask questions. Write the result contract to the absolute path ${JSON.stringify(resultFile)}.`,
+    builder: `Implement only in the repository worktree. The host repository worktree is ${JSON.stringify(worktree)}. Use that path for OpenCode file tools and for the shell tool's workdir; never pass /workspace as an OpenCode tool path or workdir. The shell wrapper runs every shell command in a fresh, disposable OCI container with no network, no host home, no credentials, and no runtime socket. Inside shell commands, the repository is mounted at /workspace and the shell starts there; use repository-relative paths in commands. If an OpenCode edit or patch tool is denied, use the shell tool to make the requested change through the same isolated container. Never push, use gh/glab, comment, merge, or ask questions. Write the result contract to the absolute path ${JSON.stringify(resultFile)}.`,
     verifier: `Verify only by read-only inspection. Do not edit or run shell commands. Never ask a question. Report blockers in the result file at ${JSON.stringify(resultFile)}.`,
     reviewer: `Review only. Do not edit or run shell commands. Never ask a question. Write the result contract to ${JSON.stringify(resultFile)}.`,
   };
   return {
     $schema: 'https://opencode.ai/config.json',
+    default_agent: defaultAgent.name,
     plugins: [],
     mcp: {},
     ...(role === 'builder' && shellWrapper ? { shell: shellWrapper } : {}),
     agents: {
-      [agentName]: {
+      [defaultAgent.name]: {
+        ...defaultAgent.definition,
         description: descriptions[role],
         mode: 'primary',
-        system: trustedSystemPrompt === undefined ? systems[role] : `${systems[role]}\n\nAdditional trusted system instructions:\n${trustedSystemPrompt}`,
+        system: [
+          typeof defaultAgent.definition.system === 'string' ? defaultAgent.definition.system : undefined,
+          systems[role],
+          trustedSystemPrompt === undefined ? undefined : `Additional trusted system instructions:\n${trustedSystemPrompt}`,
+        ].filter(Boolean).join('\n\n'),
         permissions: agentPermissions(role, worktree),
       },
     },
@@ -253,7 +299,7 @@ function scrubEnvironment(
   return clean;
 }
 
-function seedOpenCodeProviderAuth(source: NodeJS.ProcessEnv, privateDataHome: string) {
+function seedOpenCodeProviderAuth(source: NodeJS.ProcessEnv, privateDataHome: string, model: string) {
   const sourceDataHome = source.XDG_DATA_HOME || path.join(source.HOME || os.homedir(), '.local', 'share');
   const sourceAuth = path.join(sourceDataHome, 'opencode', 'auth.json');
   const targetDirectory = path.join(privateDataHome, 'opencode');
@@ -269,28 +315,81 @@ function seedOpenCodeProviderAuth(source: NodeJS.ProcessEnv, privateDataHome: st
     let parsed: unknown;
     try { parsed = JSON.parse(fs.readFileSync(file, 'utf8')); }
     catch (error) { throw new AgentRunnerError('AGENT_SPAWN_FAILED', `${label} is not valid JSON`, undefined, error); }
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      throw new AgentRunnerError('AGENT_SPAWN_FAILED', `${label} must contain an OpenCode provider-auth object`);
+    if (Array.isArray(parsed)) {
+      if (!parsed.every((entry) => entry && typeof entry === 'object' && !Array.isArray(entry) &&
+          typeof entry.integrationID === 'string' && typeof entry.active === 'boolean' &&
+          entry.value && typeof entry.value === 'object' && !Array.isArray(entry.value))) {
+        throw new AgentRunnerError('AGENT_SPAWN_FAILED', `${label} must contain credentials exported by OpenCode`);
+      }
+      return parsed;
+    }
+    if (!parsed || typeof parsed !== 'object') {
+      throw new AgentRunnerError('AGENT_SPAWN_FAILED', `${label} must contain an OpenCode provider-auth object or export`);
     }
     return parsed;
   };
 
+  let auth: unknown;
   try {
     fs.lstatSync(targetAuth);
-    return collectProviderAuthSecrets(validateAuthFile(targetAuth, 'Private OpenCode auth'));
+    auth = validateAuthFile(targetAuth, 'Private OpenCode auth');
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    try {
+      fs.lstatSync(sourceAuth);
+    } catch (sourceError) {
+      if ((sourceError as NodeJS.ErrnoException).code === 'ENOENT') return { secrets: [], importFile: undefined };
+      throw new AgentRunnerError('AGENT_SPAWN_FAILED', 'Could not inspect configured OpenCode provider auth', undefined, sourceError);
+    }
+    auth = validateAuthFile(sourceAuth, 'Configured OpenCode auth');
+    if (!Array.isArray(auth)) {
+      fs.copyFileSync(sourceAuth, targetAuth, fs.constants.COPYFILE_EXCL);
+      fs.chmodSync(targetAuth, 0o600);
+    }
   }
+
+  if (!Array.isArray(auth)) return { secrets: collectProviderAuthSecrets(auth), importFile: undefined };
+
+  // OpenCode V2's `auth export` format is an array, not the legacy provider map.
+  // Keep only the active credential for the selected model's provider, then
+  // load it into the isolated session database through OpenCode's own importer.
+  const provider = model.split('/')[0];
+  const selected = auth.filter((entry) => entry.integrationID === provider && entry.active);
+  if (selected.length === 0) {
+    throw new AgentRunnerError('AGENT_SPAWN_FAILED', `Configured OpenCode auth export has no active credential for model provider "${provider}"`);
+  }
+  const temporaryAuth = `${targetAuth}.${randomUUID()}.tmp`;
+  fs.writeFileSync(temporaryAuth, JSON.stringify(selected), { mode: 0o600, flag: 'wx' });
   try {
-    fs.lstatSync(sourceAuth);
+    fs.renameSync(temporaryAuth, targetAuth);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
-    throw new AgentRunnerError('AGENT_SPAWN_FAILED', 'Could not inspect configured OpenCode provider auth', undefined, error);
+    try { fs.unlinkSync(temporaryAuth); } catch { /* best effort temporary-file cleanup */ }
+    throw new AgentRunnerError('AGENT_SPAWN_FAILED', 'Could not prepare private OpenCode provider credentials', undefined, error);
   }
-  const auth = validateAuthFile(sourceAuth, 'Configured OpenCode auth');
-  fs.copyFileSync(sourceAuth, targetAuth, fs.constants.COPYFILE_EXCL);
-  fs.chmodSync(targetAuth, 0o600);
-  return collectProviderAuthSecrets(auth);
+  return { secrets: collectProviderAuthSecrets(selected), importFile: targetAuth };
+}
+
+function importOpenCodeProviderAuth(
+  executable: string,
+  env: NodeJS.ProcessEnv,
+  cwd: string,
+  authFile: string,
+  sessionId: string,
+) {
+  const result = spawnSync(executable, ['--standalone', 'auth', 'import', authFile], {
+    cwd,
+    env,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    timeout: 30_000,
+    maxBuffer: 1024 * 1024,
+    windowsHide: true,
+  });
+  if (result.error || result.status !== 0) {
+    const reason = result.error ? 'could not start the OpenCode auth importer' :
+      `OpenCode auth import failed (${result.signal ? `signal ${result.signal}` : `exit ${String(result.status)}`})`;
+    throw new AgentRunnerError('AGENT_SPAWN_FAILED', reason, sessionId, result.error);
+  }
 }
 
 function collectProviderAuthSecrets(value: unknown): string[] {
@@ -1165,7 +1264,7 @@ export class OpenCodeAgentRunner implements AgentRunner {
     const safeId = safeSessionPart(record.externalSessionId);
     const sessionDirectory = ensurePrivateDirectory(path.join(sessions, safeId));
       const privatePaths = preparePrivateAgentDirectories(sessionDirectory);
-      const providerAuthSecrets = seedOpenCodeProviderAuth(this.environment, privatePaths.xdgData);
+      const providerAuth = seedOpenCodeProviderAuth(this.environment, privatePaths.xdgData, record.model);
     const sandbox = role === 'builder'
       ? requireBuilderSandbox(worktree, this.containerRuntime, this.environment, record.externalSessionId)
       : undefined;
@@ -1178,7 +1277,7 @@ export class OpenCodeAgentRunner implements AgentRunner {
         record.externalSessionId,
       );
     }
-    const agentName = `issue-orchestrator-${role}-${safeId}`;
+    const defaultAgent = configuredDefaultAgent(this.environment);
     if (path.resolve(record.ndjsonPath) !== path.join(sessionDirectory, 'events.ndjson') ||
         path.resolve(record.stderrPath) !== path.join(sessionDirectory, 'stderr.log')) {
       throw new AgentRunnerError('INVALID_AGENT_SESSION', 'Persisted agent output paths do not match this session', args.sessionId);
@@ -1334,7 +1433,7 @@ export class OpenCodeAgentRunner implements AgentRunner {
         shellWrapper = generatedWrapper.file;
         gitHooksDirectory = generatedWrapper.gitHooksDirectory;
       }
-      fs.writeFileSync(configFile, JSON.stringify(agentConfig(role, agentName, worktree, shellWrapper, structured ? args.systemPrompt : undefined)), {
+      fs.writeFileSync(configFile, JSON.stringify(agentConfig(role, defaultAgent, worktree, shellWrapper, structured ? args.systemPrompt : undefined)), {
         mode: 0o600,
         flag: 'wx',
       });
@@ -1348,10 +1447,13 @@ export class OpenCodeAgentRunner implements AgentRunner {
       ].join('\n');
       const argv = [
         'run', '--standalone', '--session', record.externalSessionId,
-        '--agent', agentName, '--model', record.model, '--format', 'json', '--auto', prompt,
+        '--model', record.model, '--format', 'json', '--auto', prompt,
       ];
       const agentPath = makeAgentPath(this.environment.PATH ?? this.environment.Path, runDirectory);
       const env = scrubEnvironment(this.environment, configFile, agentPath, privatePaths, executionId);
+      if (providerAuth.importFile) {
+        importOpenCodeProviderAuth(this.executable, env, privatePaths.cwd, providerAuth.importFile, record.externalSessionId);
+      }
       const launchFiles = writeAgentLaunchFiles(runDirectory, {
         executable: this.executable,
         argv,
@@ -1451,7 +1553,7 @@ export class OpenCodeAgentRunner implements AgentRunner {
           const lines = pendingLine.split('\n');
           pendingLine = lines.pop() ?? '';
           if (lines.length) {
-            const completeLines = lines.map((line) => redactLogText(`${line}\n`, this.environment, providerAuthSecrets)).join('');
+            const completeLines = lines.map((line) => redactLogText(`${line}\n`, this.environment, providerAuth.secrets)).join('');
             fs.writeSync(ndjsonFd!, completeLines);
           }
           for (const line of lines) onLine(line);
@@ -1567,13 +1669,13 @@ export class OpenCodeAgentRunner implements AgentRunner {
       cleanupSandboxContainers(true);
       if (!renewOwnership()) throw leaseFailure;
       try {
-        const completeStderr = redactLogText(Buffer.concat(stderrChunks).toString('utf8'), this.environment, providerAuthSecrets);
+        const completeStderr = redactLogText(Buffer.concat(stderrChunks).toString('utf8'), this.environment, providerAuth.secrets);
         fs.writeSync(stderrFd!, Buffer.from(completeStderr).subarray(0, MAX_STDERR_BYTES));
       } catch { /* stderr capture is diagnostic only */ }
       // A final event without a trailing newline still decides the run: a
       // question tool must fail closed before any result is accepted.
       if (pendingLine) {
-        fs.writeSync(ndjsonFd!, redactLogText(pendingLine, this.environment, providerAuthSecrets));
+        fs.writeSync(ndjsonFd!, redactLogText(pendingLine, this.environment, providerAuth.secrets));
         if (pendingLine.trim()) onLine(pendingLine);
       }
 
@@ -1595,7 +1697,12 @@ export class OpenCodeAgentRunner implements AgentRunner {
         throw new AgentRunnerError('AGENT_PROCESS_FAILED', `OpenCode exited with code ${String(outcome.code)}${outcome.signal ? ` (${outcome.signal})` : ''}`, record.externalSessionId);
       }
 
-      const result = readAgentResult(worktree, record.externalSessionId);
+      let result: AgentResult;
+      try {
+        result = readAgentResult(worktree, record.externalSessionId);
+      } finally {
+        clearResultFile(worktree);
+      }
       this.store().completeAgentSession({
         externalSessionId: record.externalSessionId,
         owner,

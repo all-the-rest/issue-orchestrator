@@ -138,6 +138,17 @@ const mode = process.env.FAKE_OPENCODE_MODE || 'success';
 if (process.env.FAKE_OPENCODE_SPAWN_LOG) {
   fs.appendFileSync(process.env.FAKE_OPENCODE_SPAWN_LOG, String(process.pid) + String.fromCharCode(10));
 }
+if (args[0] === '--standalone' && args[1] === 'auth' && args[2] === 'import') {
+  const authFile = args[3];
+  const auth = JSON.parse(fs.readFileSync(authFile, 'utf8'));
+  const privateAuthFile = path.join(process.env.XDG_DATA_HOME, 'opencode', 'auth.json');
+  fs.writeFileSync(process.env.FAKE_OPENCODE_AUTH_IMPORT_REPORT, JSON.stringify({
+    authFile, authFileMode: fs.statSync(authFile).mode & 0o777,
+    privateAuthFile, xdgDataHome: process.env.XDG_DATA_HOME,
+    integrationIDs: auth.map((entry) => entry.integrationID),
+  }));
+  process.exit(0);
+}
 const configFile = process.env.OPENCODE_CONFIG;
 const prompt = args.at(-1) || '';
 const resultMatch = /absolute path ("[^"]+") with required fields/.exec(prompt);
@@ -185,6 +196,10 @@ if (mode === 'question') {
   if (mode === 'auth-log') {
     process.stderr.write('provider auth: test saved ');
     setTimeout(() => process.stderr.write('OpenCode auth' + String.fromCharCode(10)), 10);
+  }
+  if (mode === 'auth-export-log') {
+    process.stderr.write('access_token=integration-');
+    setTimeout(() => process.stderr.write('openai-access-secret' + String.fromCharCode(10)), 10);
   }
   if (mode.startsWith('builder')) {
     const command = mode === 'builder-hang'
@@ -345,6 +360,7 @@ try {
       ISSUE_ORCHESTRATOR_OWNER_TOKEN: 'must-not-pass',
       HOME: os.homedir(), XDG_CONFIG_HOME: path.join(os.homedir(), '.config'),
       XDG_DATA_HOME: trustedData,
+      OPENCODE_CONFIG_CONTENT: '{}',
       GIT_CONFIG_GLOBAL: path.join(os.homedir(), '.gitconfig'), SSH_AUTH_SOCK: '/tmp/host-agent.sock',
       AWS_PROFILE: 'host-profile', HTTPS_PROXY: 'http://host-user:host-password@proxy.example.invalid:8080',
       PATH: `${providerBin}${path.delimiter}${process.env.PATH}`,
@@ -361,6 +377,8 @@ try {
     assert.equal(record.model, 'test/model');
     assert.equal(record.worktree, fs.realpathSync(worktree));
     assert.ok(record.startedAt && record.endedAt);
+    assert.equal(fs.existsSync(path.join(worktree, '.issue-orchestrator', 'result.json')), false,
+      'validated machine result files are removed so the builder leaves only requested repository changes');
     assert.deepEqual([
       record.inputTokens, record.outputTokens, record.reasoningTokens,
       record.cacheReadTokens, record.cacheWriteTokens, record.costUsd,
@@ -383,7 +401,9 @@ try {
     assert.ok(report.args.includes('--standalone') && report.args.includes('--auto'));
     assert.ok(report.args.includes('--format') && report.args.includes('json'));
     assert.ok(report.args.includes(session.externalSessionId));
-    assert.ok(report.args.some((arg) => arg.startsWith('issue-orchestrator-verifier-')));
+    assert.ok(!report.args.includes('--agent'), 'OpenCode must choose the configured default agent');
+    assert.equal(report.config.default_agent, 'build', 'OpenCode’s built-in default is retained when none is configured');
+    assert.deepEqual(Object.keys(report.config.agents), ['build'], 'role restrictions are applied to the selected default agent');
     assert.ok(!report.path.split(path.delimiter).includes(providerBin), 'the original provider CLI directory must be absent');
     assert.equal(fs.existsSync(path.join(report.path, 'gh')), false, 'gh must not be available on agent PATH');
     assert.ok(profile.permissions.some((rule) => (
@@ -407,6 +427,95 @@ try {
     await assert.rejects(runner.getResult({ sessionId: session.externalSessionId }), /belongs to runner/);
     store.close();
     ok('OpenCode captures NDJSON privately, rejects verifier shell requests, isolates credentials, and refuses mismatched-runner recovery');
+  }
+
+  // A user-selected default agent remains the selected identity while the
+  // runner overlays its role-specific system prompt and restrictive tools.
+  {
+    const worktree = createWorktree('configured-default-agent');
+    const store = new SQLiteStore(path.join(TMP, 'configured-default-agent.sqlite3'));
+    const configFile = path.join(TMP, 'configured-default-opencode.jsonc');
+    const reportFile = path.join(TMP, 'configured-default-agent-report.json');
+    fs.writeFileSync(configFile, `{
+      // The test proves JSONC and a non-builtin configured default are honored.
+      "default_agent": "workspace-default",
+      "agents": {
+        "workspace-default": {
+          "system": "Keep my configured default-agent persona.",
+          "temperature": 0.25,
+          "permissions": [{ "action": "shell", "resource": "*", "effect": "allow" }]
+        }
+      }
+    }`);
+    const runner = runnerFor(store, { environment: {
+      FAKE_OPENCODE_REPORT: reportFile,
+      OPENCODE_CONFIG: configFile,
+      OPENCODE_CONFIG_CONTENT: undefined,
+    } });
+    const session = await runner.createSession({
+      jobId: makeJob(store, 597), role: 'verifier', model: 'test/model', worktree,
+    });
+    const result = await runner.run({ sessionId: session.externalSessionId, prompt: 'Verify this fixture.' });
+    assert.equal(result.status, 'DONE');
+    const report = readReport(reportFile);
+    const profile = report.config.agents['workspace-default'];
+    assert.equal(report.config.default_agent, 'workspace-default');
+    assert.deepEqual(Object.keys(report.config.agents), ['workspace-default']);
+    assert.ok(!report.args.includes('--agent'), 'the configured default is selected through config, not CLI');
+    assert.ok(profile.system.includes('Keep my configured default-agent persona.'));
+    assert.ok(profile.system.includes('Verify only by read-only inspection.'));
+    assert.equal(profile.temperature, 0.25, 'non-security settings from the selected default agent are retained');
+    assert.ok(profile.permissions.some((rule) => rule.action === 'shell' && rule.effect === 'deny'));
+    assert.ok(!profile.permissions.some((rule) => rule.action === 'shell' && rule.effect === 'allow'),
+      'the selected agent’s broader permission cannot weaken the runner role boundary');
+    store.close();
+    ok('OpenCode uses the configured default-agent identity without --agent and preserves role sandbox boundaries');
+  }
+
+  // OpenCode V2 auth exports are imported only into the private session DB,
+  // narrowed to the configured model's active provider credential.
+  {
+    const worktree = createWorktree('v2-auth-export');
+    const store = new SQLiteStore(path.join(TMP, 'v2-auth-export.sqlite3'));
+    const jobId = makeJob(store, 598);
+    const sourceData = path.join(TMP, 'v2-auth-export-source');
+    const sourceAuth = path.join(sourceData, 'opencode', 'auth.json');
+    const reportFile = path.join(TMP, 'v2-auth-export-report.json');
+    const importReportFile = path.join(TMP, 'v2-auth-import-report.json');
+    fs.mkdirSync(path.dirname(sourceAuth), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(sourceAuth, JSON.stringify([
+      { id: 'openai-active', integrationID: 'openai', label: 'OpenAI', active: true,
+        value: { type: 'oauth', access: 'integration-openai-access-secret', refresh: 'integration-openai-refresh-secret' } },
+      { id: 'openai-inactive', integrationID: 'openai', label: 'OpenAI old', active: false,
+        value: { type: 'oauth', access: 'inactive-openai-access-secret' } },
+      { id: 'anthropic-active', integrationID: 'anthropic', label: 'Anthropic', active: true,
+        value: { type: 'api', key: 'unselected-anthropic-api-secret' } },
+    ]), { mode: 0o600 });
+    const runner = runnerFor(store, { environment: {
+      FAKE_OPENCODE_MODE: 'auth-export-log',
+      FAKE_OPENCODE_REPORT: reportFile,
+      FAKE_OPENCODE_AUTH_IMPORT_REPORT: importReportFile,
+      HOME: os.homedir(), XDG_DATA_HOME: sourceData,
+    } });
+    const session = await runner.createSession({ jobId, role: 'verifier', model: 'openai/gpt-6.1-sol', worktree });
+    const result = await runner.run({ sessionId: session.externalSessionId, prompt: 'Verify this fixture.' });
+    assert.equal(result.status, 'DONE');
+    const report = readReport(reportFile);
+    assert.equal(report.providerAuth.length, 1, 'only the selected provider account is provisioned');
+    assert.equal(report.providerAuth[0].integrationID, 'openai');
+    assert.equal(report.providerAuth[0].id, 'openai-active');
+    const imported = readReport(importReportFile);
+    assert.deepEqual(imported.integrationIDs, ['openai']);
+    assert.equal(imported.authFileMode, 0o600);
+    assert.equal(imported.xdgDataHome, report.xdgDataHome);
+    assert.equal(imported.privateAuthFile, path.join(report.xdgDataHome, 'opencode', 'auth.json'));
+    assert.notEqual(imported.xdgDataHome, sourceData, 'OpenCode V2 imports credentials into session-private data');
+    const record = store.getAgentSession(session.externalSessionId);
+    const capturedLogs = fs.readFileSync(record.ndjsonPath, 'utf8') + fs.readFileSync(record.stderrPath, 'utf8');
+    assert.doesNotMatch(capturedLogs, /integration-openai-(?:access|refresh)-secret/);
+    assert.doesNotMatch(capturedLogs, /unselected-anthropic-api-secret|inactive-openai-access-secret/);
+    store.close();
+    ok('OpenCode V2 auth exports import privately, only for the selected provider, with secrets redacted');
   }
 
   // Structured handoff remains a user turn; ticket-controlled text never enters system config.
@@ -1283,6 +1392,11 @@ setInterval(() => {}, 1000);
     assert.ok(profile.permissions.some((rule) => rule.action === 'external_directory' && rule.resource === `${worktree}/**` && rule.effect === 'allow'));
     assert.ok(profile.permissions.some((rule) => rule.action === 'read' && rule.resource === `${worktree}/**` && rule.effect === 'allow'));
     assert.ok(profile.permissions.some((rule) => rule.action === 'edit' && rule.resource === `${worktree}/**` && rule.effect === 'allow'));
+    assert.ok(profile.system.includes(`The host repository worktree is ${JSON.stringify(worktree)}.`));
+    assert.ok(profile.system.includes('Use that path for OpenCode file tools and for the shell tool\'s workdir'));
+    assert.ok(profile.system.includes('never pass /workspace as an OpenCode tool path or workdir'));
+    assert.ok(profile.system.includes('Inside shell commands, the repository is mounted at /workspace'));
+    assert.ok(profile.system.includes('If an OpenCode edit or patch tool is denied, use the shell tool'));
     assert.ok(profile.permissions.filter((rule) => rule.action === 'read' && rule.effect === 'allow')
       .every((rule) => [
         `${worktree}/**`, `${worktree}/*.env.example`, `${worktree}/**/*.env.example`,

@@ -25,7 +25,7 @@ With `--follow --json`, the initial snapshot is followed by JSON Lines append
 events `{ "schema_version": 1, "event": "append", "session_id", "kind", "content" }`;
 Ctrl-C ends the stream. Logs never expose agent process credentials.
 
-`goal --project <owner/repo> --issue <number> --goal-file <private-path|->`
+`goal --project <owner/repo> --issue <number> --goal-file <private-path|-> [--retry-blocked]`
 accepts the exact final acceptance criteria from an owned, private regular file
 or stdin, bounded to 32 KiB. The text is persisted with the GitHub ticket
 handoff and must not be replaced during recovery. The command reads the current
@@ -33,7 +33,11 @@ issue and comments, filters tool-authored updates, and sends structured ticket,
 update, and acceptance data to the configured project agent. Without the
 configured auto-implementation label it publishes `REVIEW (human-directed)` and
 creates no agent session. A repeat with the same goal resumes recovery or a
-persisted follow-up turn; status comments use stable idempotency markers.
+persisted follow-up turn; status comments use stable idempotency markers. A
+terminal `BLOCKED` result is not retried implicitly. After fixing a local runner
+or tool-permission issue, `--retry-blocked` explicitly continues that same
+persisted agent conversation with the unchanged acceptance criteria; it does
+not write a human comment to GitHub.
 Run it from a checkout whose `origin` matches the configured project; that
 working tree is passed to the selected agent integration.
 Terminal comments cover `DONE`, `REVIEW`, `BLOCKED`, `NEEDS_INFO`, and `FAILED`;

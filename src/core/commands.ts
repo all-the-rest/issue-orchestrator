@@ -74,8 +74,8 @@ const HELP = `Usage: issue-orchestrator <command> [args] [--config <path>]
 
   run --once [--project <owner/repo>] [--dry-run]
                                   run one trusted issue through review and release
-  goal --project <owner/repo> --issue <number> --goal-file <path|->
-                                  hand exact final AC and a GitHub ticket to its selected agent
+  goal --project <owner/repo> --issue <number> --goal-file <path|-> [--retry-blocked]
+                                   hand exact final AC to its agent; explicitly resume BLOCKED results
   service install --print         print a user-level launchd/systemd timer template
   doctor [--json]                 read-only local dependency/config diagnostics
   jobs list|show|retry|cancel <id> inspect or safely control persisted jobs
@@ -2578,9 +2578,12 @@ function readPrivateGoal(file: unknown): string {
 }
 
 async function cmdGoal(opts: Record<string, any>) {
-  const allowed = new Set(['_', 'project', 'issue', 'goal-file', 'config', 'reconciliation']);
+  const allowed = new Set(['_', 'project', 'issue', 'goal-file', 'config', 'reconciliation', 'retry-blocked']);
   if (Object.keys(opts).some((key) => !allowed.has(key)) || opts._.length !== 0) {
-    throw new CliError('usage: goal --project <owner/repo> --issue <number> --goal-file <private-path|->');
+    throw new CliError('usage: goal --project <owner/repo> --issue <number> --goal-file <private-path|-> [--retry-blocked]');
+  }
+  if (opts['retry-blocked'] !== undefined && opts['retry-blocked'] !== true) {
+    throw new CliError('--retry-blocked does not accept a value');
   }
   if (typeof opts.project !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(opts.project)) {
     throw new CliError('goal requires --project <owner/repo>');
@@ -2616,7 +2619,8 @@ async function cmdGoal(opts: Record<string, any>) {
       goal,
       mergePolicy: rc.auto_merge ? 'autonomous-after-required-checks' : 'manual',
       autoImplementLabel: rc.labels.auto_implement ?? 'agent:auto-implement',
-       toolAuthors: [...new Set([...(cfg.accounts ?? []), rc.account, rc.tracker_account, rc.code_host_account,
+      retryBlocked: opts['retry-blocked'] === true,
+      toolAuthors: [...new Set([...(cfg.accounts ?? []), rc.account, rc.tracker_account, rc.code_host_account,
          ...(rc.tool_authors ?? [])].filter((author): author is string => typeof author === 'string' && !!author))],
     },
     dispatch: async (request) => {
