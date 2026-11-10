@@ -2,9 +2,7 @@
 
 **Decision:** Keep the V1 tool focused on structured GitHub ticket intake and
 agent handoff. This decision is tracked by
-[issue #53](https://github.com/all-the-rest/issue-orchestrator/issues/53); the
-runtime migration is still in progress and this document does not claim that the
-current implementation already matches the target.
+[issue #53](https://github.com/all-the-rest/issue-orchestrator/issues/53).
 
 ## Responsibilities
 
@@ -47,10 +45,8 @@ enforced by provider permissions or an equivalent control, not prompt wording
 alone. The bridge still gates trusted ticket dispatch, treats all ticket content
 as untrusted, and never puts credentials in agent payloads.
 
-## Migration status
+## Runtime distinction
 
-The current `run --once` implementation still performs CodeHost, CI, source,
-evidence, and merge operations. Those responsibilities must be removed from or
-disabled in the V1 bridge before issue #53 can be considered complete; until
-then, the architecture is transitional and the existing security documentation
-continues to describe the current runtime.
+`goal` is the V1 entry point and follows the bridge boundary above. The older
+`run --once` workflow remains separate for compatibility; it retains its
+CLI-owned source, CI, evidence, and merge gates and is not called by `/goal`.

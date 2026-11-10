@@ -138,13 +138,13 @@ try {
   assert.equal(Number(store.rows('PRAGMA foreign_keys')[0].foreign_keys), 1);
   assert.equal(store.rows('PRAGMA journal_mode')[0].journal_mode, 'wal');
   assert.equal(Number(store.rows('PRAGMA busy_timeout')[0].timeout), 5000);
-  assert.equal(store.rows('SELECT version FROM schema_migrations').length, 8);
+  assert.equal(store.rows('SELECT version FROM schema_migrations').length, 9);
   assert.ok(columns('jobs').has('lease_pid'), 'jobs should record the OS process that owns its lease');
   assert.ok(columns('jobs').has('lease_start_ticks'), 'jobs should record process identity to detect PID reuse');
   assert.ok(tables.has('job_resource_locks') && tables.has('scheduler_global_limit'));
   store.close();
   store = new SQLiteStore(migrationFile);
-  assert.equal(store.rows('SELECT version FROM schema_migrations').length, 8, 'reopening must not reapply migrations');
+  assert.equal(store.rows('SELECT version FROM schema_migrations').length, 9, 'reopening must not reapply migrations');
   store.close();
   ok('empty database receives all schema migrations with WAL/foreign keys, and restart is idempotent');
 
@@ -191,12 +191,13 @@ try {
     DROP TABLE scheduler_project_limit;
     ALTER TABLE jobs DROP COLUMN lease_pid;
     ALTER TABLE jobs DROP COLUMN lease_start_ticks;
-    DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8);
+    DROP TABLE ticket_handoffs;
+    DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9);
   `);
   store.close();
   store = new SQLiteStore(upgradeFile);
   assert.equal(store.rows('SELECT workflow_state FROM jobs WHERE id=?', upgradeJob.id)[0].workflow_state, 'EVIDENCE_PUBLISHED');
-  assert.equal(store.rows('SELECT MAX(version) AS version FROM schema_migrations')[0].version, 8);
+  assert.equal(store.rows('SELECT MAX(version) AS version FROM schema_migrations')[0].version, 9);
   store.close();
   ok('v1 jobs retain their workflow meaning when the additive migration is applied');
 
@@ -204,11 +205,11 @@ try {
   fs.mkdirSync(path.dirname(futureSchema), { recursive: true });
   const futureDb = new DatabaseSync(futureSchema);
   futureDb.exec('CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)');
-  futureDb.prepare('INSERT INTO schema_migrations(version, applied_at) VALUES (9, ?)').run(new Date().toISOString());
+  futureDb.prepare('INSERT INTO schema_migrations(version, applied_at) VALUES (10, ?)').run(new Date().toISOString());
   futureDb.close();
   assert.throws(() => new SQLiteStore(futureSchema), /newer than supported version/);
   const stillFutureDb = new DatabaseSync(futureSchema);
-  assert.equal(Number(stillFutureDb.prepare('SELECT MAX(version) AS version FROM schema_migrations').get().version), 9);
+  assert.equal(Number(stillFutureDb.prepare('SELECT MAX(version) AS version FROM schema_migrations').get().version), 10);
   stillFutureDb.close();
   ok('a database with a newer schema version is rejected without being downgraded');
 
@@ -870,6 +871,22 @@ try {
   assert.equal(store.readLock().owner_token, importedLegacyResume.owner_token, 'explicit stale confirmation allows manual legacy recovery');
   store.close();
   ok('legacy state.json/lock.json are imported once into the job and ownership tables');
+
+  const ticketAnchor = storeAt('ticket-agent-anchor');
+  const handoffId = 'a'.repeat(64);
+  const anchorJobId = ticketAnchor.ensureTicketAgentJob({
+    handoffId, project: 'owner/repo', issue: 71, configFile: path.join(TMP, 'ticket-config.jsonc'),
+  });
+  assert.equal(ticketAnchor.ensureTicketAgentJob({ handoffId, project: 'owner/repo', issue: 71 }), anchorJobId,
+    'recovery must reuse the same runner job anchor');
+  assert.equal(Number(ticketAnchor.rows("SELECT COUNT(*) AS count FROM jobs WHERE stage='ticket-handoff'")[0].count), 1);
+  const anchorSession = ticketAnchor.createAgentSession({ jobId: anchorJobId, externalSessionId: 'ticket-session-71',
+    role: 'builder', model: 'test/model', worktree: TMP, ndjsonPath: path.join(TMP, 'ticket-events.ndjson'),
+    stderrPath: path.join(TMP, 'ticket-stderr.log') });
+  assert.equal(anchorSession.jobId, anchorJobId);
+  assert.equal(ticketAnchor.rows('SELECT state,workflow_state FROM jobs WHERE id=?', anchorJobId)[0].state, 'DONE');
+  ticketAnchor.close();
+  ok('ticket agent sessions have a stable terminal job anchor without occupying queue capacity');
 
   console.log(`\n${passed} persistence checks passed`);
 } finally {

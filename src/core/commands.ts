@@ -36,6 +36,8 @@ import {
   type DodCommandExecutor,
 } from './dod.js';
 import { getCodeHost, getTracker } from '../providers/index.js';
+import { githubTicket } from '../providers/github-ticket.js';
+import { runTicketHandoff } from './ticket-runtime.js';
 import type { AgentResult, CodeHost, Tracker, WorkItem } from '../providers/ports.js';
 import { git } from '../git/index.js';
 import {
@@ -72,6 +74,8 @@ const HELP = `Usage: issue-orchestrator <command> [args] [--config <path>]
 
   run --once [--project <owner/repo>] [--dry-run]
                                   run one trusted issue through review and release
+  goal --project <owner/repo> --issue <number> --goal-file <path|->
+                                  hand exact final AC and a GitHub ticket to its selected agent
   service install --print         print a user-level launchd/systemd timer template
   doctor [--json]                 read-only local dependency/config diagnostics
   jobs list|show|retry|cancel <id> inspect or safely control persisted jobs
@@ -116,7 +120,8 @@ shared by all configs under the runtime home. The active provider CLI
 identity must match the configured account; the agent never switches accounts
 or extracts credentials.
 
-Exit codes: 0 done/green, 1 refused/failed, 2 config missing/invalid, 8 checks pending.`;
+Exit codes: 0 command completed (goal may be REVIEW), 1 refused/failed or pending status write,
+2 config missing/invalid, 8 checks pending.`;
 
 function cmdService(opts: RunCliOptions) {
   if (opts._.join(' ') !== 'install' || (opts as unknown as Record<string, unknown>).print !== true || Object.keys(opts).some((key) => !['_', 'print'].includes(key))) {
@@ -2529,6 +2534,181 @@ interface RunCliOptions {
   config?: string;
 }
 
+function readPrivateGoal(file: unknown): string {
+  if (typeof file !== 'string' || !file) throw new CliError('goal requires --goal-file <private-path|->');
+  let fd: number | null = null;
+  try {
+    let before: fs.Stats | null = null;
+    if (file === '-') {
+      fd = 0;
+    } else {
+      const absolute = path.resolve(file);
+      before = fs.lstatSync(absolute);
+      if (!before.isFile() || before.isSymbolicLink() ||
+          (typeof process.getuid === 'function' && before.uid !== process.getuid()) ||
+          (process.platform !== 'win32' && (before.mode & 0o077) !== 0) || before.size > 32 * 1024) {
+        throw new Error('unsafe goal file');
+      }
+      fd = fs.openSync(absolute, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+      const opened = fs.fstatSync(fd);
+      if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino || opened.size > 32 * 1024 ||
+          (typeof process.getuid === 'function' && opened.uid !== process.getuid()) ||
+          (process.platform !== 'win32' && (opened.mode & 0o077) !== 0)) throw new Error('goal file changed while opening');
+    }
+    const chunks: Buffer[] = [];
+    let size = 0;
+    for (;;) {
+      const chunk = Buffer.alloc(Math.min(4096, 32 * 1024 + 1 - size));
+      const count = fs.readSync(fd, chunk, 0, chunk.length, null);
+      if (count === 0) break;
+      size += count;
+      if (size > 32 * 1024) throw new Error('goal file is too large');
+      chunks.push(chunk.subarray(0, count));
+    }
+    const value = new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks));
+    if (!value.trim() || containsSecretLikeContent(value)) throw new Error('goal is empty or credential-like');
+    return value;
+  } catch {
+    throw new CliError('goal text must be nonempty, valid UTF-8, credential-free, at most 32 KiB, and read from an owned private regular file');
+  } finally {
+    if (fd !== null && fd !== 0) {
+      try { fs.closeSync(fd); } catch { /* closed */ }
+    }
+  }
+}
+
+async function cmdGoal(opts: Record<string, any>) {
+  const allowed = new Set(['_', 'project', 'issue', 'goal-file', 'config', 'reconciliation']);
+  if (Object.keys(opts).some((key) => !allowed.has(key)) || opts._.length !== 0) {
+    throw new CliError('usage: goal --project <owner/repo> --issue <number> --goal-file <private-path|->');
+  }
+  if (typeof opts.project !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(opts.project)) {
+    throw new CliError('goal requires --project <owner/repo>');
+  }
+  if (typeof opts.issue !== 'string' || !/^[1-9][0-9]*$/.test(opts.issue) || !Number.isSafeInteger(Number(opts.issue))) {
+    throw new CliError('goal requires a positive --issue number');
+  }
+  const project = opts.project;
+  const issue = Number(opts.issue);
+  const goal = readPrivateGoal(opts['goal-file']);
+  const cfg = requireConfig(opts);
+  const rc = repoConfig(cfg, project);
+  if (!rc.enabled) throw new CliError(`Project ${project} is disabled in the configuration`);
+  if (rc.tracker !== 'github') throw new CliError('goal V1 supports GitHub tickets only');
+  const tracker = getTracker('github');
+  if (typeof rc.tracker_account !== 'string' || !rc.tracker_account) throw new CliError(`Project ${project} has no configured GitHub account`);
+  tracker.verifyAccount(rc.tracker_account);
+  getCodeHost('github').verifyRepository({ project });
+
+  const store = getRuntimeStore();
+  const runner = getAgentRunner(rc.agent_runner, rc.command_runner && {
+    executable: rc.command_runner.executable,
+    args: rc.command_runner.args,
+    timeoutMs: rc.command_runner.timeout_ms,
+  });
+  const worktree = fs.realpathSync(process.cwd());
+  const jobResult = await runTicketHandoff({
+    port: githubTicket,
+    store,
+    project,
+    issue,
+    policy: {
+      goal,
+      mergePolicy: rc.auto_merge ? 'autonomous-after-required-checks' : 'manual',
+      autoImplementLabel: rc.labels.auto_implement ?? 'agent:auto-implement',
+       toolAuthors: [...new Set([...(cfg.accounts ?? []), rc.account, rc.tracker_account, rc.code_host_account,
+         ...(rc.tool_authors ?? [])].filter((author): author is string => typeof author === 'string' && !!author))],
+    },
+    dispatch: async (request) => {
+      checkRunShutdown();
+      const jobId = store.ensureTicketAgentJob({
+        handoffId: request.handoffId, project, issue, configFile: cfg.__file,
+      });
+      let sessionId = request.sessionId;
+      let persisted = sessionId ? store.getAgentSession(sessionId) : null;
+      if (sessionId && (!persisted || persisted.jobId !== jobId)) {
+        throw new CliError('ticket handoff session does not match its persisted runner job');
+      }
+      if (!sessionId) {
+        const sessions = store.agentSessionsForJobRole(jobId, 'builder');
+        if (sessions.length > 1) throw new CliError('ticket handoff has ambiguous persisted agent sessions');
+        persisted = sessions[0] ?? null;
+        if (!persisted) {
+          const created = await runner.createSession({ jobId, role: 'builder', model: cfg.model, worktree });
+          sessionId = created.externalSessionId;
+          persisted = store.getAgentSession(sessionId);
+        } else {
+          sessionId = persisted.externalSessionId;
+        }
+      }
+      if (!sessionId || !persisted || persisted.role !== 'builder' || persisted.model !== cfg.model ||
+          fs.realpathSync(persisted.worktree) !== worktree) {
+        throw new CliError('ticket handoff runner session identity changed; refusing to run or resume');
+      }
+
+      let handoff: Record<string, unknown>;
+      try {
+        const parsed: unknown = JSON.parse(request.message);
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) ||
+            (parsed as Record<string, unknown>).protocol !== 'issue-orchestrator.ticket.v1') throw new Error();
+        handoff = parsed as Record<string, unknown>;
+      } catch {
+        throw new CliError('persisted ticket handoff payload is invalid; refusing agent dispatch');
+      }
+      const kind = handoff.kind;
+      if ((kind !== 'initial' && kind !== 'update') ||
+          (handoff.mode !== 'auto-implement' && handoff.mode !== 'human-directed') ||
+          !handoff.ticket || typeof handoff.ticket !== 'object' || Array.isArray(handoff.ticket) ||
+          typeof handoff.finalAcceptanceCriteria !== 'string' || !Array.isArray(handoff.updates) ||
+          (handoff.mergePolicy !== 'manual' && handoff.mergePolicy !== 'autonomous-after-required-checks')) {
+        throw new CliError('persisted ticket handoff fields are invalid; refusing agent dispatch');
+      }
+      const task = kind === 'initial'
+        ? 'Implement the ticket represented by the structured ticket fields and satisfy its exact final acceptance criteria. Work in the configured project; the selected project integration owns source, pull requests, CI, and merge. When available, include same-repository GitHub pull-request or checks URLs in optional AgentResult.references; do not claim that this bridge verified them or their check state.'
+        : 'Continue the existing agent conversation for this ticket. Apply the new structured ticket changes and human updates while preserving prior work and satisfying the original exact final acceptance criteria. When available, include same-repository GitHub pull-request or checks URLs in optional AgentResult.references; do not claim that this bridge verified them or their check state.';
+      const input = {
+        protocol: handoff.protocol,
+        kind,
+        mode: handoff.mode,
+        mergePolicy: handoff.mergePolicy,
+        ticket: handoff.ticket,
+        finalAcceptanceCriteria: handoff.finalAcceptanceCriteria,
+        updates: handoff.updates,
+        task,
+      };
+      const requestArgs = {
+        sessionId,
+        systemPrompt: request.bootstrap,
+        input,
+        ...(request.continueCompleted ? { continueCompleted: true as const, turnId: request.turnId } : {}),
+      };
+      if (!request.continueCompleted && ['DONE', 'BLOCKED', 'CHANGES_REQUIRED', 'NEEDS_INFO'].includes(persisted.status)) {
+        const result = await runner.getResult({ sessionId });
+        if (!result) throw new CliError('completed ticket agent session has no persisted result');
+        return { sessionId, result };
+      }
+      const resume = request.continueCompleted === true || persisted.status !== 'CREATED';
+      activeRunner = runner;
+      activeSessionId = sessionId;
+      const agentPromise = Promise.resolve().then(() => resume ? runner.resume(requestArgs) : runner.run(requestArgs));
+      activeAgentPromise = agentPromise;
+      try {
+        const result = await agentPromise;
+        checkRunShutdown();
+        return { sessionId, result };
+      } finally {
+        if (activeSessionId === sessionId) {
+          activeRunner = null;
+          activeSessionId = null;
+          activeAgentPromise = null;
+        }
+      }
+    },
+  });
+  console.log(JSON.stringify({ ...jobResult, project, issue }, null, 2));
+  return jobResult.state === 'failed' || jobResult.statusPending ? 1 : 0;
+}
+
 type RunHandoverOutcome = 'review' | 'blocked' | 'needs-info';
 type RunReleaseResult = 'done' | 'blocked' | 'review' | 'needs-info';
 type RunMarkerKind = 'tests' | 'review-approved' | 'evidence';
@@ -2800,7 +2980,7 @@ async function runAgent(
         throw new CliError(`${role} agent session identity differs from the active run; preserving ownership`);
       }
       sessionId = existing.externalSessionId;
-      if (['DONE', 'BLOCKED', 'CHANGES_REQUIRED'].includes(existing.status) && !continueCompleted) {
+      if (['DONE', 'BLOCKED', 'CHANGES_REQUIRED', 'NEEDS_INFO'].includes(existing.status) && !continueCompleted) {
         const persisted = await runner.getResult({ sessionId });
         if (!persisted) throw new CliError(`${role} agent completed without a persisted result; preserving ownership`);
         clearAgentResultFile(worktree);
@@ -2829,7 +3009,7 @@ async function runAgent(
     try {
       const request = typeof handoff === 'string' ? { sessionId, prompt: handoff } : {
         sessionId, systemPrompt: handoff.systemPrompt, input: handoff.input,
-        ...(handoff.continueCompleted === true ? { continueCompleted: true } : {}),
+        ...(handoff.continueCompleted === true ? { continueCompleted: true as const } : {}),
       };
       const agentPromise = Promise.resolve().then(() => resume ? runner.resume(request) : runner.run(request));
       activeAgentPromise = agentPromise;
@@ -3650,6 +3830,7 @@ function setModel(opts, model) {
 
 const COMMANDS = {
   doctor: cmdDoctor,
+  goal: cmdGoal,
   jobs: cmdJobs,
   logs: cmdLogs,
   project: cmdProject,

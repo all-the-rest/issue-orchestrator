@@ -25,6 +25,27 @@ With `--follow --json`, the initial snapshot is followed by JSON Lines append
 events `{ "schema_version": 1, "event": "append", "session_id", "kind", "content" }`;
 Ctrl-C ends the stream. Logs never expose agent process credentials.
 
+`goal --project <owner/repo> --issue <number> --goal-file <private-path|->`
+accepts the exact final acceptance criteria from an owned, private regular file
+or stdin, bounded to 32 KiB. The text is persisted with the GitHub ticket
+handoff and must not be replaced during recovery. The command reads the current
+issue and comments, filters tool-authored updates, and sends structured ticket,
+update, and acceptance data to the configured project agent. Without the
+configured auto-implementation label it publishes `REVIEW (human-directed)` and
+creates no agent session. A repeat with the same goal resumes recovery or a
+persisted follow-up turn; status comments use stable idempotency markers.
+Run it from a checkout whose `origin` matches the configured project; that
+working tree is passed to the selected agent integration.
+Terminal comments cover `DONE`, `REVIEW`, `BLOCKED`, `NEEDS_INFO`, and `FAILED`;
+failed comment writes remain pending for retry. Validated agent summaries are
+sanitized before publication. If the agent returns structured same-repository
+GitHub PR/check references, the comment includes them as agent-provided links;
+the bridge does not verify their existence or report check state.
+
+The `/goal` OpenCode command is a thin wrapper over this CLI path. The CLI
+reports the selected agent's structured result; it does not claim that it
+observed green CI or authorized a merge.
+
 `project add <id> --from <existing>` clones a validated project definition;
 `project remove <id>` refuses to remove the last project; `pause` and `resume`
 set the project's `enabled` flag. Updates preserve unrelated config text and

@@ -154,6 +154,13 @@ function validateConfig(cfg, file) {
     throw new Error(`${file}: "trusted_authors" must be an array of non-empty usernames`);
   }
   if (new Set(trusted).size !== trusted.length) throw new Error(`${file}: "trusted_authors" must not contain duplicates`);
+  const toolAuthors = cfg.tool_authors ?? [];
+  if (!Array.isArray(toolAuthors) || toolAuthors.some((author) => typeof author !== 'string' || !author.trim())) {
+    throw new Error(`${file}: "tool_authors" must be an array of non-empty usernames`);
+  }
+  if (new Set(toolAuthors.map((author) => author.toLocaleLowerCase())).size !== toolAuthors.length) {
+    throw new Error(`${file}: "tool_authors" must not contain duplicates`);
+  }
 
   const defaults: any = cfg.defaults ?? {};
   if (!defaults || typeof defaults !== 'object' || Array.isArray(defaults)) {
@@ -161,6 +168,11 @@ function validateConfig(cfg, file) {
   }
   for (const field of ['enabled', 'local_only', 'auto_merge']) {
     if (field in defaults) requireType(defaults[field], 'boolean', `defaults.${field}`, file);
+  }
+  for (const [name, value] of [['agent_runner', cfg.agent_runner], ['defaults.agent_runner', defaults.agent_runner]]) {
+    if (value !== undefined && (typeof value !== 'string' || !/^[a-z][a-z0-9_-]*$/.test(value))) {
+      throw new Error(`${file}: "${name}" must be a runner name`);
+    }
   }
   for (const provider of [cfg.provider, defaults.provider, cfg.tracker, cfg.code_host,
     defaults.tracker, defaults.code_host].filter((value) => value !== undefined)) {
@@ -238,6 +250,11 @@ function validateConfig(cfg, file) {
     if (repo.trusted_authors !== undefined &&
         (!Array.isArray(repo.trusted_authors) || repo.trusted_authors.some((author) => typeof author !== 'string' || !author))) {
       throw new Error(`${file}: repos.${project}.trusted_authors must be an array of usernames`);
+    }
+    if (repo.tool_authors !== undefined &&
+        (!Array.isArray(repo.tool_authors) || repo.tool_authors.some((author) => typeof author !== 'string' || !author.trim()) ||
+         new Set(repo.tool_authors.map((author) => author.toLocaleLowerCase())).size !== repo.tool_authors.length)) {
+      throw new Error(`${file}: repos.${project}.tool_authors must be an array of unique usernames`);
     }
     if (repo.labels !== undefined && (!repo.labels || typeof repo.labels !== 'object' || Array.isArray(repo.labels) ||
         Object.values(repo.labels).some((label) => typeof label !== 'string' || !label))) {
@@ -334,6 +351,7 @@ export function repoConfig(cfg, project) {
     trusted_authors: Array.isArray(own.trusted_authors)
       ? own.trusted_authors
       : (cfg.trusted_authors ?? []),
+    tool_authors: [...new Set([...(cfg.tool_authors ?? []), ...(own.tool_authors ?? [])])],
     labels,
     dod: own.dod,
     evidence_branch_prefix: own.evidence?.branch_prefix ?? cfg.evidence?.branch_prefix ?? 'agent-evidence',

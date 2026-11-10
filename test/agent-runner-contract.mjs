@@ -9,11 +9,21 @@ const done = {
 };
 assert.deepEqual(validateAgentResult(done), done);
 assert.equal(validateAgentResult({ ...done, status: 'BLOCKED', blocked_reason: 'needs input' }).status, 'BLOCKED');
+assert.equal(validateAgentResult({ ...done, status: 'NEEDS_INFO', blocked_reason: 'needs input' }).status, 'NEEDS_INFO');
+assert.deepEqual(validateAgentResult({ ...done, references: [
+  { kind: 'pull_request', url: 'https://github.com/owner/repo/pull/7' },
+  { kind: 'checks', url: 'https://github.com/owner/repo/pull/7/checks' },
+] }).references, [
+  { kind: 'pull_request', url: 'https://github.com/owner/repo/pull/7' },
+  { kind: 'checks', url: 'https://github.com/owner/repo/pull/7/checks' },
+]);
 for (const invalid of [
   { ...done, unexpected: true },
   { ...done, blocked_reason: '' },
   { ...done, status: 'BLOCKED' },
   { ...done, changed_files: [''] },
+  { ...done, references: [{ kind: 'pull_request', url: 'https://evil.example/owner/repo/pull/7' }] },
+  { ...done, references: [{ kind: 'checks', url: 'https://github.com/owner/repo/pull/7/checks?token=secret' }] },
 ]) {
   assert.throws(() => validateAgentResult(invalid), AgentResultContractError);
 }

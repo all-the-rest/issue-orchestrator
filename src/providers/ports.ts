@@ -130,7 +130,12 @@ export interface CodeHost {
 
 export type AgentRole = 'triage' | 'builder' | 'verifier' | 'reviewer';
 
-export type AgentResultStatus = 'DONE' | 'BLOCKED' | 'CHANGES_REQUIRED';
+export type AgentResultStatus = 'DONE' | 'BLOCKED' | 'CHANGES_REQUIRED' | 'NEEDS_INFO';
+
+export interface AgentResultReference {
+  kind: 'pull_request' | 'checks';
+  url: string;
+}
 
 export interface AgentResult {
   status: AgentResultStatus;
@@ -141,6 +146,8 @@ export interface AgentResult {
   blocked_reason: string | null;
   evidence_dir: string | null;
   verdict: string;
+  /** Optional, agent-reported same-repository GitHub PR/check URLs. */
+  references?: AgentResultReference[];
 }
 
 export type AgentSessionStatus = AgentResultStatus | 'CREATED' | 'RUNNING' | 'FAILED' | 'ABORTED';
@@ -171,9 +178,10 @@ export interface RunAgentSessionArgs {
   /** Stable instructions are separate from untrusted structured ticket data. */
   systemPrompt?: string;
   /** Structured ticket/goal/update handoff; never interpolate into systemPrompt. */
-  input?: unknown;
-  /** Explicit V1 follow-up only: continue an already completed conversation. */
-  continueCompleted?: boolean;
+  input?: Record<string, unknown>;
+  /** Explicitly resume a completed conversation for a persisted ticket update turn. */
+  continueCompleted?: true;
+  turnId?: string;
   timeoutMs?: number;
 }
 

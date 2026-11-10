@@ -1,44 +1,42 @@
 # Architecture
 
-## Current implementation
+## V1 ticket-to-agent path
 
-The current `main` implementation is the earlier broad Tracker/CodeHost
-workflow; it has **not** yet migrated to the adopted design in
-[issue #53](https://github.com/all-the-rest/issue-orchestrator/issues/53).
-The CLI/core owns queueing, persistence and recovery, workflow gates, evidence,
-and merge decisions. It selects separate `Tracker` and `CodeHost` provider
-ports, plus an `AgentRunner`. GitHub and the OpenCode runner are the working
-vertical slice; GitLab and Jira adapters are fail-closed stubs. See
-[`providers.md`](providers.md) for the current adapter matrix and behavior.
+The V1 entry point is `issue-orchestrator goal --project <owner/repo> --issue
+<number> --goal-file <private-path|->`. The CLI accepts GitHub only, reads the
+exact operator-supplied final acceptance criteria, and persists them with the
+ticket handoff. The `Ticket` port normalizes issue fields, labels, and comments;
+SQLite stores the exact goal, handoff/turn state, status idempotency keys, and
+the selected runner session identity for recovery. Run it from a checkout whose
+`origin` matches the configured target project; that working tree is passed to
+the selected agent integration.
 
-The `run --once` path selects or resumes work, runs agent roles in a private
-worktree, executes configured local DoD commands, publishes evidence, and
-performs review and the configured merge gates. In this implementation the CLI
-observes required checks and may merge after its gates pass. This is a
-description of existing behavior, not the target responsibility split.
+The configured issue label (default `agent:auto-implement`) alone selects
+auto-implement mode. Without it the ticket remains human-directed: the CLI
+publishes a `REVIEW` status and does not start an agent. Titles are never
+rewritten. Orchestrator/tool-authored comments are excluded from agent input.
+Human comments and meaningful issue-field/label changes are separate structured
+follow-up data and resume the same agent conversation with a stable turn ID.
+Ticket and final-AC data stay outside the stable system prompt and are treated
+as untrusted data.
 
-## Adopted target (pending migration)
+There is one task-facing `Ticket` provider and the existing replaceable
+`AgentRunner`; V1 does not add source-code, CI-observer, or merge provider ports.
+The selected project agent/CLI integration owns source changes, pull requests,
+CI observation, and merge. The orchestrator reports status but must not claim
+that it independently verified CI or authorized a merge. Provider permissions,
+branch protections, and required checks enforce manual-merge restrictions; the
+system prompt is not an authorization boundary.
 
-Issue #53 adopts a narrower GitHub ticket/update-to-agent bridge: one
-ticket-facing provider port and the existing `AgentRunner` boundary. V1 does
-not add separate CI-observer or source-code provider ports. A project's chosen
-agent/CLI integration owns source edits, pull-request lifecycle, CI observation,
-and merge. The orchestrator must not claim that it verified CI or authorize a
-merge. GitHub is the only V1 provider; GitLab, Jira, remote runners, optional
-webhook/event triggers, and npm publishing/binaries are out of scope.
+GitHub is the only V1 ticket provider. GitLab, Jira, remote runners, optional
+event/webhook triggers, npm publishing, and binary releases are out of scope.
+Direct PR-review polling is also post-V1; feedback copied into the GitHub issue
+thread can trigger a follow-up.
 
-In the target flow, an issue label alone selects auto-implement mode; there is
-no title prefix. Initial and status comments identify the mode. Orchestrator- or
-agent-authored comments are not new inputs. Human issue comments are structured
-follow-up messages. Direct PR-review polling is post-V1; feedback copied into
-the ticket thread can trigger a follow-up. `/goal` carries persisted final
-acceptance criteria as structured untrusted data, while the system prompt stays
-minimal.
+## Retained legacy path
 
-Autonomous merge after required CI is the default policy passed to the selected
-agent integration; manual merge is an opt-out. Provider/project branch
-protections and required checks, with no agent bypass, enforce hard denies.
-Manual mode must be enforced by provider permissions, not prompt text. These
-are target decisions, not capabilities or configuration currently implemented
-by this repository. In particular, current `auto_merge` and CLI-owned gates
-described above must not be mistaken for this target policy.
+`run --once` remains a separate, earlier broad workflow for compatibility. It
+can still select/resume queue work, use a private worktree, run local DoD and
+evidence gates, observe PR checks, and perform its configured merge flow. It is
+not invoked by `/goal` and is not the V1 ticket-to-agent responsibility model.
+See [`providers.md`](providers.md) for the distinctions between these paths.
