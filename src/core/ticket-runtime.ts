@@ -3,11 +3,66 @@ import type { SQLiteStore } from './persistence.js';
 import {
   createTicketHandoff, humanTicketComments, normalizeTicket, serializeTicketHandoff,
   sanitizeTicketText, TICKET_AGENT_SYSTEM_PROMPT,
-  type NormalizedTicket, type TicketMergePolicy,
+  type NormalizedTicket, type TicketAgentMode, type TicketComment, type TicketMergePolicy,
 } from './ticket-handoff.js';
 import type { AgentResult, AgentResultStatus } from '../providers/ports.js';
 import { validateAgentResult } from '../providers/agent-result.js';
-import type { TicketPort } from '../providers/ticket-port.js';
+import type { TicketIssue, TicketPort } from '../providers/ticket-port.js';
+
+type TicketSnapshot = Omit<NormalizedTicket, 'updatedAt' | 'comments'>;
+type StatusName = 'started' | 'finished';
+
+interface StatusKeys { started: string; finished: string }
+interface StatusTurn {
+  statusKeys: StatusKeys;
+  statusIds: Record<string, string>;
+  finalStatusBody: string;
+}
+interface TicketTurn extends StatusTurn {
+  id: string;
+  message: string;
+  sessionId: string | null;
+  ticket: NormalizedTicket;
+  cursor: string | null;
+  changedFields: string[];
+  statusMode: TicketAgentMode;
+  dispatched: boolean;
+  finalized?: boolean;
+  result: AgentResult | null;
+  summary: string;
+}
+interface TurnHistoryEntry {
+  id: string;
+  result: AgentResult;
+  summary: string;
+  message?: string;
+  statusKeys?: StatusKeys;
+}
+interface FailureStatus extends StatusTurn { initialRead?: boolean }
+interface TicketHandoffState {
+  ticket: NormalizedTicket;
+  mergePolicy: TicketMergePolicy;
+  cursor: string | null;
+  sessionId: string | null;
+  initialDispatched: boolean;
+  state: 'active' | 'REVIEW' | AgentResultStatus;
+  terminal: boolean;
+  statusKeys: StatusKeys;
+  statusIds: Record<string, string>;
+  turns: TurnHistoryEntry[];
+  pendingTurn: TicketTurn | null;
+  result: AgentResult | null;
+  summary: string;
+  finalStatusBody: string;
+  failureStatus: FailureStatus | null;
+  deferredUpdates: TicketComment[];
+  deferredFields: string[];
+}
+
+interface UpdateMessageData {
+  updates: TicketComment[];
+  changedFields: string[];
+}
 
 export type TicketDispatch = (input: {
   /** Stable across retries; adapter uses this to find/create the runner job. */
@@ -95,20 +150,46 @@ function referenceText(result: AgentResult, project: string): string {
   return ` Agent-provided links (not verified by this bridge): ${references.map((reference) =>
     `${reference.kind === 'pull_request' ? 'PR' : 'Checks'} ${reference.url}`).join('; ')}.`;
 }
-function handoff(ticket: NormalizedTicket, goal: string, mergePolicy: TicketMergePolicy, kind: 'initial' | 'update', updates?: any[]) {
+function handoff(ticket: NormalizedTicket, goal: string, mergePolicy: TicketMergePolicy, kind: 'initial' | 'update', updates?: TicketComment[]) {
   return { ...createTicketHandoff({ ticket, finalAcceptanceCriteria: goal, mergePolicy, updates }), kind };
 }
-function updateMessage(ticket: NormalizedTicket, goal: string, mergePolicy: TicketMergePolicy, updates: any[], changedFields: string[]) {
+function updateMessage(ticket: NormalizedTicket, goal: string, mergePolicy: TicketMergePolicy, updates: TicketComment[], changedFields: string[]) {
   return JSON.stringify({ ...handoff(ticket, goal, mergePolicy, 'update', updates), changedFields });
 }
-function snapshot(ticket: NormalizedTicket) {
+function snapshot(ticket: NormalizedTicket): TicketSnapshot {
   const { updatedAt: _updatedAt, comments: _comments, ...meaningful } = ticket;
   return meaningful;
 }
-function publicOutcome(jobId: string, state: Record<string, any>, pending = false): TicketRuntimeOutcome {
-  const result = state.result as AgentResult | null;
+function changedTicketFields(current: NormalizedTicket, previous: NormalizedTicket): string[] {
+  const currentSnapshot = snapshot(current);
+  const previousSnapshot = snapshot(previous);
+  return (Object.keys(currentSnapshot) as (keyof TicketSnapshot)[]).filter((key) =>
+    JSON.stringify(currentSnapshot[key]) !== JSON.stringify(previousSnapshot[key]));
+}
+function publicOutcome(jobId: string, state: TicketHandoffState, pending = false): TicketRuntimeOutcome {
+  const result = state.result;
   return { jobId, sessionId: state.sessionId, state: state.state === 'REVIEW' ? 'review' : result ? statusFor(result.status) : 'active',
     ...(result ? { result, summary: state.summary } : {}), ...(pending ? { statusPending: true } : {}) };
+}
+
+function parseUpdateMessage(message: string): UpdateMessageData {
+  let value: unknown;
+  try { value = JSON.parse(message); } catch { throw new Error('persisted update turn is invalid'); }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('persisted update turn is invalid');
+  const data = value as Record<string, unknown>;
+  if (!Array.isArray(data.updates) || !data.updates.every((entry) => isTicketComment(entry)) ||
+      !Array.isArray(data.changedFields) || !data.changedFields.every((field) => typeof field === 'string')) {
+    throw new Error('persisted update turn is invalid');
+  }
+  return { updates: data.updates, changedFields: data.changedFields };
+}
+
+function isTicketComment(value: unknown): value is TicketComment {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const comment = value as Record<string, unknown>;
+  return typeof comment.id === 'string' && (typeof comment.author === 'string' || comment.author === null) &&
+    typeof comment.body === 'string' && (typeof comment.createdAt === 'string' || comment.createdAt === null) &&
+    (typeof comment.url === 'string' || comment.url === null);
 }
 
 export async function runTicketHandoff(args: {
@@ -116,7 +197,7 @@ export async function runTicketHandoff(args: {
 }): Promise<TicketRuntimeOutcome> {
   const { port, dispatch, store, project, issue, policy } = args;
   if (!policy.goal.trim() || !['manual', 'autonomous-after-required-checks'].includes(policy.mergePolicy)) throw new Error('invalid ticket runtime policy');
-  let issueData: any = null;
+  let issueData: TicketIssue | null = null;
   let initialReadFailed = false;
   let current: NormalizedTicket;
   try {
@@ -125,36 +206,38 @@ export async function runTicketHandoff(args: {
       { autoImplementLabel: policy.autoImplementLabel, toolAuthors: policy.toolAuthors }));
   } catch {
     initialReadFailed = true;
-    issueData = { comments: [] };
+    issueData = null;
     current = scrubTicket(normalizeTicket({ project, number: issue, title: 'Ticket read unavailable', body: '', labels: [], comments: [] },
       { autoImplementLabel: policy.autoImplementLabel, toolAuthors: policy.toolAuthors }));
   }
   const goal = policy.goal;
   const goalHash = createHash('sha256').update(goal).digest('hex');
   const jobId = createHash('sha256').update(`${project}#${issue}\0${goalHash}`).digest('hex');
-  const seed = { ticket: current, mergePolicy: policy.mergePolicy, cursor: issueData.comments.at(-1)?.id ?? null,
+  const seed: TicketHandoffState = { ticket: current, mergePolicy: policy.mergePolicy, cursor: issueData?.comments.at(-1)?.id ?? null,
     sessionId: null as string | null, initialDispatched: false, state: 'active', terminal: false,
     statusKeys: { started: randomUUID(), finished: randomUUID() }, statusIds: {} as Record<string, string>,
-    turns: [] as any[], pendingTurn: null as any, result: null as AgentResult | null, summary: '', finalStatusBody: '',
-    failureStatus: null as any, deferredUpdates: [] as any[], deferredFields: [] as string[] };
-  const record = store.getOrCreateTicketHandoff({ id: jobId, project, issue, goalHash, goal, state: seed });
-  const state = record.state as typeof seed;
+    turns: [], pendingTurn: null, result: null, summary: '', finalStatusBody: '',
+    failureStatus: null, deferredUpdates: [], deferredFields: [] };
+  const record = store.getOrCreateTicketHandoff({ id: jobId, project, issue, goalHash, goal,
+    state: seed as unknown as Record<string, unknown> });
+  const state = record.state as unknown as TicketHandoffState;
   // A manual policy is a hard deny: config can tighten an active handoff but
   // cannot silently loosen a previously selected manual restriction.
   const tightenedMergePolicy = policy.mergePolicy === 'manual' && state.mergePolicy !== 'manual';
   if (tightenedMergePolicy) state.mergePolicy = 'manual';
   const activeOwner = randomUUID();
   if (!store.claimTicketHandoff(jobId, activeOwner)) throw new Error('ticket handoff is already active in another CLI process');
-  if (tightenedMergePolicy) store.updateTicketHandoff(jobId, state);
-  const save = () => store.updateTicketHandoff(jobId, state);
-  const publish = async (turn: any, name: 'started' | 'finished', body: string) => {
+  const persistState = () => store.updateTicketHandoff(jobId, state as unknown as Record<string, unknown>);
+  if (tightenedMergePolicy) persistState();
+  const save = persistState;
+  const publish = async (turn: StatusTurn, name: StatusName, body: string) => {
     const key = turn.statusKeys[name];
     if (turn.statusIds[key]) return;
     const posted = await port.publishStatus(project, issue, key, safeText(body, 2500));
     turn.statusIds[key] = posted.id;
     save();
   };
-  const finishStatus = async (turn: any) => {
+  const finishStatus = async (turn: StatusTurn) => {
     try { await publish(turn, 'finished', turn.finalStatusBody); return false; } catch { return true; }
   };
   const retryFailureStatus = async () => {
@@ -173,7 +256,7 @@ export async function runTicketHandoff(args: {
     if (initialReadFailed) {
       if (!state.initialDispatched && !state.terminal) { state.state = 'active'; state.terminal = false; }
       if (!state.failureStatus) {
-        state.failureStatus = { initialRead: true, statusKeys: { finished: randomUUID() }, statusIds: {}, finalStatusBody: '' };
+        state.failureStatus = { initialRead: true, statusKeys: { started: randomUUID(), finished: randomUUID() }, statusIds: {}, finalStatusBody: '' };
       }
       state.failureStatus.initialRead = true;
       state.failureStatus.finalStatusBody = `Agent outcome FAILED (${state.ticket.mode}): The GitHub ticket could not be read, so no agent was started. Next action: retry /goal with the same project, issue, and exact acceptance criteria.`;
@@ -186,7 +269,7 @@ export async function runTicketHandoff(args: {
     }
     if (state.failureStatus?.initialRead && !initialReadFailed && !state.initialDispatched) {
       state.ticket = current;
-      state.cursor = issueData.comments.at(-1)?.id ?? null;
+      state.cursor = issueData?.comments.at(-1)?.id ?? null;
       save();
     }
     if ((state.terminal || (state.initialDispatched && state.result)) && !state.pendingTurn) {
@@ -212,9 +295,8 @@ export async function runTicketHandoff(args: {
           if (batch.nextCursor !== state.cursor) { state.cursor = batch.nextCursor; save(); }
           return pendingTerminal();
         }
-        const changedFields = changed ? Object.keys(snapshot(current)).filter((key) =>
-          JSON.stringify((snapshot(current) as any)[key]) !== JSON.stringify((snapshot(state.ticket) as any)[key])) : [];
-        const deferred = new Map<string, any>();
+        const changedFields = changedTicketFields(current, state.ticket);
+        const deferred = new Map<string, TicketComment>();
         for (const comment of [...(state.deferredUpdates ?? []), ...updates]) deferred.set(comment.id, comment);
         state.deferredUpdates = [...deferred.values()];
         state.deferredFields = [...new Set([...(state.deferredFields ?? []), ...changedFields])];
@@ -240,17 +322,16 @@ export async function runTicketHandoff(args: {
         }
         return pendingTerminal();
       }
-      const changedFields = changed ? Object.keys(snapshot(current)).filter((key) =>
-        JSON.stringify((snapshot(current) as any)[key]) !== JSON.stringify((snapshot(state.ticket) as any)[key])) : [];
+      const changedFields = changedTicketFields(current, state.ticket);
       const turnId = randomUUID();
-      const deferred = new Map<string, any>();
+      const deferred = new Map<string, TicketComment>();
       for (const comment of [...(state.deferredUpdates ?? []), ...updates]) deferred.set(comment.id, comment);
       const allChangedFields = [...new Set([...(state.deferredFields ?? []), ...changedFields])];
       state.pendingTurn = { id: turnId, message: updateMessage(current, goal, state.mergePolicy, [...deferred.values()], allChangedFields), sessionId: state.sessionId,
         ticket: current, cursor: batch.nextCursor ?? state.cursor, changedFields,
         statusKeys: { started: randomUUID(), finished: randomUUID() }, statusIds: {}, statusMode: current.mode,
         dispatched: false, result: null, summary: '', finalStatusBody: '' };
-      if (state.result && !state.turns.some((turn: any) => turn.id === state.pendingTurn.id)) {
+      if (state.result && !state.turns.some((turn) => turn.id === state.pendingTurn?.id)) {
         state.turns.push({ id: `result-before-${turnId}`, result: state.result, summary: state.summary });
       }
       // Ticket context and cursor intent are durable before any external effect.
@@ -265,14 +346,12 @@ export async function runTicketHandoff(args: {
       const batch = await port.updates(project, issue, state.cursor);
       const updates = humanTicketComments(batch.updates, policy.toolAuthors)
         .map((c) => ({ ...c, body: safeText(c.body), url: c.url ? safeText(c.url, 1000) : null }));
-      let priorPayload: Record<string, any> = {};
-      try { priorPayload = JSON.parse(turn.message); } catch { throw new Error('persisted update turn is invalid'); }
-      const changedFields = Object.keys(snapshot(current)).filter((key) =>
-        JSON.stringify((snapshot(current) as any)[key]) !== JSON.stringify((snapshot(turn.ticket) as any)[key]));
-      const comments = new Map<string, any>();
-      for (const comment of [...(state.deferredUpdates ?? []), ...(priorPayload.updates ?? []), ...updates]) comments.set(comment.id, comment);
+      const priorPayload = parseUpdateMessage(turn.message);
+      const changedFields = changedTicketFields(current, turn.ticket);
+      const comments = new Map<string, TicketComment>();
+      for (const comment of [...state.deferredUpdates, ...priorPayload.updates, ...updates]) comments.set(comment.id, comment);
       state.deferredUpdates = [...comments.values()];
-      state.deferredFields = [...new Set([...(state.deferredFields ?? []), ...(priorPayload.changedFields ?? []), ...changedFields])];
+      state.deferredFields = [...new Set([...state.deferredFields, ...priorPayload.changedFields, ...changedFields])];
       state.pendingTurn = null;
       state.ticket = current; state.cursor = batch.nextCursor ?? state.cursor;
       state.state = 'REVIEW'; state.terminal = true;
@@ -296,7 +375,8 @@ export async function runTicketHandoff(args: {
     }
     if (!state.initialDispatched) {
       const priorTicket = state.ticket;
-      const initialTurn = { id: 'initial', statusKeys: state.statusKeys, statusIds: state.statusIds, statusMode: state.ticket.mode };
+      const initialTurn = { id: 'initial', statusKeys: state.statusKeys, statusIds: state.statusIds,
+        statusMode: state.ticket.mode, finalStatusBody: state.finalStatusBody };
       if (!state.statusIds[state.statusKeys.started]) await publish(initialTurn, 'started', `Agent handoff started (${state.ticket.mode}).`);
       const response = await dispatch({ handoffId: jobId, sessionId: state.sessionId, bootstrap: TICKET_AGENT_SYSTEM_PROMPT,
         message: serializeTicketHandoff(handoff(state.ticket, goal, state.mergePolicy, 'initial')) });
@@ -309,11 +389,10 @@ export async function runTicketHandoff(args: {
       const changed = JSON.stringify(snapshot(current)) !== JSON.stringify(snapshot(priorTicket));
       if (changed || updates.length) {
         const turnId = randomUUID();
-        const changedFields = Object.keys(snapshot(current)).filter((key) =>
-          JSON.stringify((snapshot(current) as any)[key]) !== JSON.stringify((snapshot(priorTicket) as any)[key]));
+        const changedFields = changedTicketFields(current, priorTicket);
         state.pendingTurn = { id: turnId, message: updateMessage(current, goal, state.mergePolicy, updates, changedFields),
           sessionId: state.sessionId, ticket: current, cursor: batch.nextCursor ?? state.cursor,
-          statusKeys: { started: randomUUID(), finished: randomUUID() }, statusIds: {}, statusMode: current.mode,
+          changedFields, statusKeys: { started: randomUUID(), finished: randomUUID() }, statusIds: {}, statusMode: current.mode,
           dispatched: false, result: null, summary: '', finalStatusBody: '' };
         if (state.result) state.turns.push({ id: 'initial', result: state.result, summary: state.summary });
         save();
@@ -371,7 +450,7 @@ export async function runTicketHandoff(args: {
     if (!reviewStatusPending) { state.state = 'active'; state.terminal = false; }
     save();
     if (!state.failureStatus || state.failureStatus.statusIds?.[state.failureStatus.statusKeys.finished]) {
-      state.failureStatus = { statusKeys: { finished: randomUUID() }, statusIds: {}, finalStatusBody: '' };
+      state.failureStatus = { statusKeys: { started: randomUUID(), finished: randomUUID() }, statusIds: {}, finalStatusBody: '' };
     }
     state.failureStatus.finalStatusBody = `Agent outcome FAILED (${state.ticket.mode}): The agent run did not produce a validated result. Next action: retry /goal with the same project, issue, and exact acceptance criteria.`;
     save();

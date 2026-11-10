@@ -46,7 +46,8 @@ standalone binaries are not available.
 
 Copy the synthetic example to the private default config location, then edit
 its model, GitHub account, and repository fields to match a repository you can
-access. Keep the placeholder project disabled from real use until replaced.
+access. The placeholder project is disabled; set `enabled: true` only after
+replacing the sample identity and confirming the provider permissions.
 
 ```sh
 install -d -m 700 "$HOME/.config/issue-orchestrator"

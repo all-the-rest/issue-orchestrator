@@ -9,7 +9,7 @@
   },
   "repos": {
     "example-org/sample-project": {
-      "enabled": true,
+      "enabled": false,
       "account": "example-bot",
       "tracker": "github",
       "code_host": "github",

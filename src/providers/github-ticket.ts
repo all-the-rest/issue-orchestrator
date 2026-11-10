@@ -6,31 +6,64 @@ const cli: Driver = { json: (args) => ghJson(args), run: (args) => gh(args) };
 const validProject = (p: string) => {
   if (typeof p !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(p)) throw new Error('project must be owner/repository');
 };
-function record(v: unknown, name: string): Record<string, any> {
+function record(v: unknown, name: string): Record<string, unknown> {
   if (!v || typeof v !== 'object' || Array.isArray(v)) throw new Error(`Invalid GitHub ${name} response`);
-  return v as Record<string, any>;
+  return v as Record<string, unknown>;
+}
+function authorLogin(value: unknown, name: string): string | null {
+  if (value === null) return null;
+  const author = record(value, `${name} author`);
+  if (typeof author.login !== 'string') throw new Error(`Invalid GitHub ${name} author`);
+  return author.login;
+}
+function labelNames(value: unknown, name: string): string[] {
+  if (!Array.isArray(value)) throw new Error(`Invalid GitHub ${name} labels`);
+  return value.map((label) => {
+    const item = record(label, `${name} label`);
+    if (typeof item.name !== 'string') throw new Error(`Invalid GitHub ${name} label`);
+    return item.name;
+  });
+}
+function requiredString(value: unknown, name: string): string {
+  if (typeof value !== 'string') throw new Error(`Invalid GitHub ${name}`);
+  return value;
+}
+function nullableString(value: unknown, name: string): string | null {
+  return value === null ? null : requiredString(value, name);
+}
+function stableId(value: unknown, name: string): string | number {
+  if ((typeof value !== 'number' && typeof value !== 'string') || !String(value).trim()) throw new Error(`Invalid GitHub ${name} (stable id required)`);
+  return value;
+}
+function issueNumber(value: unknown, name: string): number {
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 1) throw new Error(`Invalid GitHub ${name} number`);
+  return value;
 }
 function comment(v: unknown): TicketComment {
   const c = record(v, 'comment');
-  const id = c.id;
-  if ((typeof id !== 'number' && typeof id !== 'string') || !String(id).trim() || typeof c.body !== 'string' ||
-      typeof c.created_at !== 'string' || typeof c.user?.login !== 'string') throw new Error('Invalid GitHub comment (stable id, body, author and timestamp required)');
-  return { id: String(id), body: c.body, author: c.user.login, createdAt: c.created_at, ...(typeof c.html_url === 'string' ? { url: c.html_url } : {}) };
+  const author = authorLogin(c.user, 'comment');
+  if (author === null) throw new Error('Invalid GitHub comment (stable id, body, author and timestamp required)');
+  const id = stableId(c.id, 'comment');
+  const body = requiredString(c.body, 'comment body');
+  const createdAt = requiredString(c.created_at, 'comment timestamp');
+  return { id: String(id), body, author, createdAt, ...(typeof c.html_url === 'string' ? { url: c.html_url } : {}) };
 }
 function issue(v: unknown): TicketIssue {
   const i = record(v, 'issue');
-  if ((typeof i.id !== 'number' && typeof i.id !== 'string') || !Number.isInteger(i.number) || typeof i.title !== 'string' ||
-      (typeof i.body !== 'string' && i.body !== null) || typeof i.state !== 'string' || typeof i.html_url !== 'string' || !Array.isArray(i.comments) ||
-      (i.author !== null && typeof i.author?.login !== 'string') || !Array.isArray(i.labels) ||
-      i.labels.some((label: unknown) => !label || typeof label !== 'object' || typeof (label as Record<string, unknown>).name !== 'string') ||
-      (i.updatedAt !== null && typeof i.updatedAt !== 'string')) {
-    throw new Error('Invalid GitHub issue response');
-  }
+  const id = stableId(i.id, 'issue');
+  const number = issueNumber(i.number, 'issue');
+  const title = requiredString(i.title, 'issue title');
+  const body = nullableString(i.body, 'issue body') ?? '';
+  const author = authorLogin(i.author, 'issue');
+  const labels = labelNames(i.labels, 'issue');
+  const state = requiredString(i.state, 'issue state');
+  const url = requiredString(i.html_url, 'issue URL');
+  const updatedAt = nullableString(i.updatedAt, 'issue update timestamp');
+  if (!Array.isArray(i.comments)) throw new Error('Invalid GitHub issue comments');
   return {
-    id: String(i.id), number: i.number, title: i.title, body: i.body ?? '',
-    author: typeof i.author?.login === 'string' ? i.author.login : null,
-    labels: i.labels.map((label: { name: string }) => label.name),
-    state: i.state, url: i.html_url, updatedAt: i.updatedAt ?? null,
+    id: String(id), number, title, body,
+    author, labels,
+    state, url, updatedAt,
     comments: i.comments.map(comment),
   };
 }
@@ -50,16 +83,19 @@ export function createGithubTicketPort(driver: Driver = cli): TicketPort {
       if (!Array.isArray(v)) throw new Error('Invalid GitHub issue list response');
       return v.map((x) => {
         const i = record(x, 'issue');
-        if ((typeof i.id !== 'number' && typeof i.id !== 'string') || !Number.isInteger(i.number) || typeof i.title !== 'string' ||
-            (typeof i.body !== 'string' && i.body !== null) || typeof i.state !== 'string' || typeof i.url !== 'string' ||
-            (i.author !== null && typeof i.author?.login !== 'string') || !Array.isArray(i.labels) ||
-            i.labels.some((label: unknown) => !label || typeof label !== 'object' || typeof (label as Record<string, unknown>).name !== 'string') ||
-            (i.updatedAt !== null && typeof i.updatedAt !== 'string')) throw new Error('Invalid GitHub issue list item');
+        const id = stableId(i.id, 'issue');
+        const number = issueNumber(i.number, 'issue');
+        const title = requiredString(i.title, 'issue title');
+        const body = nullableString(i.body, 'issue body') ?? '';
+        const author = authorLogin(i.author, 'issue');
+        const labels = labelNames(i.labels, 'issue');
+        const state = requiredString(i.state, 'issue state');
+        const url = requiredString(i.url, 'issue URL');
+        const updatedAt = nullableString(i.updatedAt, 'issue update timestamp');
         return {
-          id: String(i.id), number: i.number, title: i.title, body: i.body ?? '',
-          author: typeof i.author?.login === 'string' ? i.author.login : null,
-          labels: i.labels.map((label: { name: string }) => label.name),
-          state: i.state, url: i.url, updatedAt: i.updatedAt ?? null, comments: [],
+          id: String(id), number, title, body,
+          author, labels,
+          state, url, updatedAt, comments: [],
         };
       });
     },
