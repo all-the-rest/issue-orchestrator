@@ -1,8 +1,9 @@
 # Provider ports and capabilities
 
-The orchestration core selects three independent ports: a **Tracker** for work
-items, a **CodeHost** for branches/change requests/reviews/checks/evidence, and
-an **AgentRunner** for agent sessions. Adapters export a capability descriptor;
+The retained legacy workflow selects a **Tracker** for work items and a
+**CodeHost** for branches/change requests/reviews/checks/evidence. The V1
+ticket-to-agent path uses one task-facing **Ticket** port plus the replaceable
+**AgentRunner** for sessions. Adapters export a capability descriptor;
 the descriptor is descriptive, not a permission to skip a gate. Calling a
 missing operation throws `UnsupportedCapabilityError` and stops the workflow.
 
@@ -14,14 +15,17 @@ missing operation throws `UnsupportedCapabilityError` and stops the workflow.
 | GitLab | CodeHost | — | Stub; fails closed | Stub; fails closed | Stub; fails closed | No | None | None |
 | Jira | Tracker | Stub; fails closed | Stub; fails closed | — | — | — | — | — |
 | Jira | CodeHost | — | Stub; fails closed | Not supported | Not supported | No | None | None |
+| GitHub | Ticket | Issues | Labels, human comments/updates, idempotent status comments | — | — | — | — | — |
 | OpenCode | AgentRunner | — | — | — | — | — | — | Local CLI adapter; builder requires the preloaded OCI sandbox image |
 | Command | AgentRunner | — | — | — | — | — | — | Trusted installed executable using versioned JSON stdio |
 
+## Runner selection
+
 Runner selection can be set globally with `agent_runner` (or
 `defaults.agent_runner`) and overridden for an individual project with
-`repos.<owner>/<repo>.agent_runner`. Project overrides take precedence;
-otherwise the global setting, default setting, then `opencode` is used. For
-example:
+`repos.<owner>/<repo>.agent_runner`. Precedence is repository, top-level,
+`defaults`, then `opencode`. `command_runner` follows the same precedence and
+contains trusted executable/argv/timeout settings. For example:
 
 ```jsonc
 {
@@ -71,6 +75,32 @@ Jira has no pull requests or checks. Pair it with a code host explicitly, for
 example `"tracker": "jira", "code_host": "github"`; this is accepted by the
 configuration schema, but Jira operations remain unavailable until its adapter
 is implemented. The GitHub code host is not inferred from a Jira tracker.
+Those adapters belong to the older broad workflow; V1 ticket intake is GitHub-only.
+
+## V1 ticket-to-agent path
+
+`issue-orchestrator goal --project <owner/repo> --issue <number> --goal-file
+<private-path|->` reads a GitHub issue through the `Ticket` port. It provides the
+normalized title, body, author, labels, state, URL, human comments, and exact
+operator-supplied final acceptance criteria as structured input, separate from
+the stable system prompt. Credentials and host-private paths are redacted or
+rejected before handoff. Comments from configured tool accounts and comments
+with orchestrator status markers are excluded.
+
+The configured `labels.auto_implement` value (default
+`agent:auto-implement`) is the only auto-implementation opt-in. Without it the
+ticket gets a `REVIEW (human-directed)` status and no runner session is started.
+Human issue comments and meaningful ticket-field/label changes after a result
+are persisted as follow-up turns on the same agent conversation. The selected
+agent integration owns source edits, PRs, CI, and merge; the orchestrator does
+not add Ticket-adjacent source or CI provider ports. Manual merge enforcement is
+by provider permissions and branch protection, not prompt wording.
+
+The GitHub Ticket adapter lists/reads issue fields, paginates comments, uses a
+comment ID cursor, and publishes bounded status comments with stable markers so
+uncertain writes can be reconciled without duplicates. Direct PR-review polling,
+GitLab, Jira, remote runners, event/webhook triggers, and publishing are outside
+V1.
 
 ## Configuration
 
@@ -79,12 +109,12 @@ may select them independently at the global, defaults, or repository level:
 
 ```jsonc
 {
-  "accounts": ["reisi007"],
+  "accounts": ["example-bot"],
   "tracker": "jira",
   "code_host": "github",
   "repos": {
-    "reisi007/demo": {
-      "account": "reisi007",
+    "example-org/demo": {
+      "account": "example-bot",
       "enabled": true,
       "dod": {
         "commands": {
@@ -198,11 +228,17 @@ must be trusted. Verifier shell is denied; builder shell runs in the OCI
 sandbox without host home/data mounts or provider credentials.
 
 Each completed agent must write `.issue-orchestrator/result.json` with exactly
-these fields: `status` (`DONE`, `BLOCKED`, or `CHANGES_REQUIRED`), non-empty
+these required fields: `status` (`DONE`, `BLOCKED`, `CHANGES_REQUIRED`, or
+`NEEDS_INFO`), non-empty
 `summary`, string arrays `changed_files`, `commands`, and `acceptance`,
 `blocked_reason` (string or null), `evidence_dir` (string or null), and a
-non-empty `verdict`. `BLOCKED` requires a reason; other statuses require a null
-reason. Missing, malformed, or invalid files are failures, never success. A
+non-empty `verdict`. `BLOCKED` and `NEEDS_INFO` require a reason; other statuses
+require a null reason. An optional `references` array may contain up to 20
+structured same-repository GitHub pull-request or checks URLs. The bridge
+validates their host, path shape, and repository before including at most five
+in a status comment; it labels them agent-provided and does not verify their
+existence or check state. Missing, malformed, or invalid files are failures,
+never success. A
 timeout is recorded as `FAILED`; the runner sends SIGTERM to the process group
 and escalates to SIGKILL after the configured grace period. A question-tool
   event is also terminated, in addition to the explicit V2 `question: deny`

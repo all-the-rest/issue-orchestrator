@@ -32,17 +32,47 @@ function requireNonEmptyString(value: unknown, field: string): string {
   return value;
 }
 
+function validateReferences(value: unknown) {
+  if (!Array.isArray(value) || value.length > 20) {
+    throw new AgentResultContractError('result.json field "references" must be an array of at most 20 GitHub links');
+  }
+  return value.map((item, index) => {
+    if (!isRecord(item) || Object.keys(item).length !== 2 ||
+        !['kind', 'url'].every((key) => key in item) ||
+        !['pull_request', 'checks'].includes(String(item.kind)) ||
+        typeof item.url !== 'string' || item.url.length > 2048) {
+      throw new AgentResultContractError(`result.json field "references[${index}]" is invalid`);
+    }
+    let url: URL;
+    try { url = new URL(item.url); } catch {
+      throw new AgentResultContractError(`result.json field "references[${index}].url" is invalid`);
+    }
+    const pullRequest = /^\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/pull\/[1-9][0-9]*\/?$/i.test(url.pathname);
+    const pullChecks = /^\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/pull\/[1-9][0-9]*\/checks\/?$/i.test(url.pathname);
+    const actionRun = /^\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/actions\/runs\/[1-9][0-9]*\/?$/i.test(url.pathname);
+    const validPath = item.kind === 'pull_request' ? pullRequest : pullChecks || actionRun;
+    if (url.protocol !== 'https:' || url.hostname !== 'github.com' || url.port || url.username || url.password ||
+        url.search || url.hash || !validPath) {
+      throw new AgentResultContractError(`result.json field "references[${index}].url" must be a safe GitHub PR/check URL`);
+    }
+    return { kind: item.kind as 'pull_request' | 'checks', url: url.toString() };
+  });
+}
+
 /** Validate the shared agent result contract independently of any adapter. */
 export function validateAgentResult(value: unknown): AgentResult {
   if (!isRecord(value)) throw new AgentResultContractError('result.json must contain a JSON object');
   const expected = ['status', 'summary', 'changed_files', 'commands', 'acceptance', 'blocked_reason', 'evidence_dir', 'verdict'];
   const keys = Object.keys(value).sort();
   const sortedExpected = [...expected].sort();
-  if (keys.length !== expected.length || keys.some((key, index) => key !== sortedExpected[index])) {
-    throw new AgentResultContractError(`result.json must contain exactly: ${expected.join(', ')}`);
+  const hasReferences = Object.hasOwn(value, 'references');
+  if ((!hasReferences && keys.length !== expected.length) ||
+      (hasReferences && (keys.length !== expected.length + 1 || !keys.includes('references'))) ||
+      sortedExpected.some((key) => !keys.includes(key))) {
+    throw new AgentResultContractError(`result.json must contain exactly: ${expected.join(', ')} and optional references`);
   }
-  if (!['DONE', 'BLOCKED', 'CHANGES_REQUIRED'].includes(String(value.status))) {
-    throw new AgentResultContractError('result.json status must be DONE, BLOCKED or CHANGES_REQUIRED');
+  if (!['DONE', 'BLOCKED', 'CHANGES_REQUIRED', 'NEEDS_INFO'].includes(String(value.status))) {
+    throw new AgentResultContractError('result.json status must be DONE, BLOCKED, CHANGES_REQUIRED or NEEDS_INFO');
   }
   const stringList = (field: string) => {
     const list = value[field];
@@ -56,11 +86,11 @@ export function validateAgentResult(value: unknown): AgentResult {
   if (blockedReason !== null && (typeof blockedReason !== 'string' || blockedReason.trim().length === 0)) {
     throw new AgentResultContractError('result.json field "blocked_reason" must be a non-empty string or null');
   }
-  if (status === 'BLOCKED' && blockedReason === null) {
-    throw new AgentResultContractError('BLOCKED result requires blocked_reason (put questions here; do not ask)');
+  if (['BLOCKED', 'NEEDS_INFO'].includes(status) && blockedReason === null) {
+    throw new AgentResultContractError(`${status} result requires blocked_reason (put questions here; do not ask)`);
   }
-  if (status !== 'BLOCKED' && blockedReason !== null) {
-    throw new AgentResultContractError('blocked_reason must be null unless status is BLOCKED');
+  if (!['BLOCKED', 'NEEDS_INFO'].includes(status) && blockedReason !== null) {
+    throw new AgentResultContractError('blocked_reason must be null unless status is BLOCKED or NEEDS_INFO');
   }
   const evidenceDir = value.evidence_dir;
   if (evidenceDir !== null && (typeof evidenceDir !== 'string' || evidenceDir.trim().length === 0)) {
@@ -75,5 +105,6 @@ export function validateAgentResult(value: unknown): AgentResult {
     blocked_reason: blockedReason as string | null,
     evidence_dir: evidenceDir as string | null,
     verdict: requireNonEmptyString(value.verdict, 'verdict'),
+    ...(hasReferences ? { references: validateReferences(value.references) } : {}),
   };
 }

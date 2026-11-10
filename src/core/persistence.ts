@@ -721,8 +721,34 @@ const MIGRATIONS = [
   `,
   `
     ALTER TABLE agent_sessions ADD COLUMN runner_name TEXT NOT NULL DEFAULT 'opencode';
+    CREATE TABLE ticket_handoffs (
+      id TEXT PRIMARY KEY,
+      project TEXT NOT NULL,
+      issue INTEGER NOT NULL CHECK(issue > 0),
+      goal_hash TEXT NOT NULL,
+      goal_json TEXT NOT NULL,
+      state_json TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE(project, issue, goal_hash)
+    );
+    CREATE INDEX ticket_handoffs_issue ON ticket_handoffs(project, issue, created_at);
+  `,
+  `
+    ALTER TABLE ticket_handoffs ADD COLUMN active_owner TEXT;
+    ALTER TABLE ticket_handoffs ADD COLUMN active_pid INTEGER;
+    ALTER TABLE ticket_handoffs ADD COLUMN active_start_ticks TEXT;
   `,
 ];
+
+export interface TicketHandoffRecord {
+  id: string;
+  project: string;
+  issue: number;
+  goalHash: string;
+  goal: string;
+  state: Record<string, unknown>;
+}
 
 export class SQLiteStore {
   readonly db: DatabaseSync;
@@ -746,6 +772,66 @@ export class SQLiteStore {
 
   close() {
     this.db.close();
+  }
+
+  /** Get or atomically create durable ticket handoff state. */
+  getOrCreateTicketHandoff(input: Omit<TicketHandoffRecord, 'id'> & { id: string }): TicketHandoffRecord {
+    return this.transaction(() => {
+      const existing = asSqlRow<{ id: string; goal_json: string; state_json: string }>(this.db.prepare(
+        'SELECT id, goal_json, state_json FROM ticket_handoffs WHERE project=? AND issue=? AND goal_hash=?',
+      ).get(input.project, input.issue, input.goalHash));
+      if (existing) {
+        if (existing.goal_json !== JSON.stringify(input.goal)) throw new Error('persisted ticket goal does not match its digest');
+        return { ...input, id: existing.id, state: JSON.parse(existing.state_json) as Record<string, unknown> };
+      }
+      const active = asSqlRow<{ id: string; goal_json: string }>(this.db.prepare(
+        "SELECT id, goal_json FROM ticket_handoffs WHERE project=? AND issue=? AND json_extract(state_json,'$.terminal')=0 LIMIT 1",
+      ).get(input.project, input.issue));
+      if (active) throw new Error('ticket already has an active handoff with a different goal');
+      const now = nowIso();
+      this.db.prepare('INSERT INTO ticket_handoffs(id,project,issue,goal_hash,goal_json,state_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)')
+        .run(input.id, input.project, input.issue, input.goalHash, JSON.stringify(input.goal), JSON.stringify(input.state), now, now);
+      return input;
+    });
+  }
+
+  readTicketHandoff(id: string): TicketHandoffRecord | null {
+    const row = asSqlRow<{ id: string; project: string; issue: number; goal_hash: string; goal_json: string; state_json: string }>(
+      this.db.prepare('SELECT id,project,issue,goal_hash,goal_json,state_json FROM ticket_handoffs WHERE id=?').get(id));
+    return row ? { id: row.id, project: row.project, issue: Number(row.issue), goalHash: row.goal_hash, goal: JSON.parse(row.goal_json) as string, state: JSON.parse(row.state_json) as Record<string, unknown> } : null;
+  }
+
+  updateTicketHandoff(id: string, state: Record<string, unknown>): void {
+    this.transaction(() => {
+      const result = this.db.prepare('UPDATE ticket_handoffs SET state_json=?,updated_at=? WHERE id=?')
+        .run(JSON.stringify(state), nowIso(), id);
+      if (Number(result.changes) !== 1) throw new Error('ticket handoff not found');
+    });
+  }
+
+  /** Claim one ticket handoff so concurrent CLI retries cannot duplicate its external effects. */
+  claimTicketHandoff(id: string, owner: string): boolean {
+    if (!id || !owner) throw new Error('ticket handoff claim requires an id and owner');
+    return this.transaction(() => {
+      const row = asSqlRow<{ active_owner: string | null; active_pid: number | bigint | null; active_start_ticks: string | null }>(
+        this.db.prepare('SELECT active_owner,active_pid,active_start_ticks FROM ticket_handoffs WHERE id=?').get(id));
+      if (!row) return false;
+      if (row.active_owner && row.active_owner !== owner &&
+          processOwnerAlive(Number(row.active_pid), row.active_start_ticks) !== false) return false;
+      const result = this.db.prepare(`
+        UPDATE ticket_handoffs SET active_owner=?,active_pid=?,active_start_ticks=?,updated_at=?
+        WHERE id=? AND active_owner IS ? AND active_pid IS ? AND active_start_ticks IS ?
+      `).run(owner, process.pid, processStartTicks(process.pid), nowIso(), id,
+        row.active_owner, row.active_pid ?? null, row.active_start_ticks ?? null);
+      return Number(result.changes) === 1;
+    });
+  }
+
+  releaseTicketHandoff(id: string, owner: string): void {
+    this.transaction(() => {
+      this.db.prepare(`UPDATE ticket_handoffs SET active_owner=NULL,active_pid=NULL,active_start_ticks=NULL,updated_at=?
+        WHERE id=? AND active_owner=?`).run(nowIso(), id, owner);
+    });
   }
 
   /** Serialize a CLI mutation without filesystem locks; dead owners are reclaimed. */
@@ -1605,6 +1691,47 @@ export class SQLiteStore {
     return created;
   }
 
+  /**
+   * Create a stable, terminal queue-job anchor for a GitHub ticket handoff.
+   * Agent sessions require a jobs row for their foreign key, while ticket
+   * handoffs have their own lifecycle and must not occupy worker capacity.
+   */
+  ensureTicketAgentJob(input: { handoffId: string; project: string; issue: number; configFile?: string }): number {
+    if (!/^[a-f0-9]{64}$/.test(input.handoffId) || !input.project || !Number.isSafeInteger(input.issue) || input.issue < 1) {
+      throw new Error('ticket agent job requires a stable handoff id, project, and positive issue number');
+    }
+    return this.transaction(() => {
+      const externalId = `ticket-handoff:${input.handoffId}`;
+      const prior = asSqlRow<{ id: number }>(this.db.prepare(`
+        SELECT j.id FROM jobs j JOIN work_items w ON w.id=j.work_item_id
+        WHERE j.project_id=? AND w.external_id=? AND j.provider='github' ORDER BY j.id LIMIT 1
+      `).get(input.project, externalId));
+      if (prior) return Number(prior.id);
+
+      const stamp = nowIso();
+      this.upsertProject(input.project, 'github', input.configFile);
+      const item = asSqlRow<{ id: number }>(this.db.prepare(`
+        INSERT INTO work_items(project_id, external_id, title, url, state, attempts, created_at, updated_at)
+        VALUES (?, ?, ?, ?, 'DONE', 1, ?, ?) RETURNING id
+      `).get(input.project, externalId, `Ticket handoff for issue #${input.issue}`,
+        `https://github.com/${input.project}/issues/${input.issue}`, stamp, stamp));
+      if (!item) throw new Error('could not create ticket agent work-item anchor');
+      const job = asSqlRow<{ id: number }>(this.db.prepare(`
+        INSERT INTO jobs(project_id, work_item_id, config_file, provider, state, stage, attempts, max_attempts,
+          release_result, workflow_state, created_at, updated_at)
+        VALUES (?, ?, ?, 'github', 'DONE', 'ticket-handoff', 1, 1, 'done', 'DONE', ?, ?) RETURNING id
+      `).get(input.project, item.id, input.configFile ? path.resolve(input.configFile) : null, stamp, stamp));
+      if (!job) throw new Error('could not create ticket agent job anchor');
+      const jobId = Number(job.id);
+      this.recordTransition(jobId, null, 'DONE', 'ticket agent session anchor created', 'ticket-runtime', stamp);
+      this.db.prepare(`
+        INSERT INTO workflow_transitions(job_id, from_state, to_state, reason, actor, created_at)
+        VALUES (?, 'NEW', 'DONE', 'ticket handoff lifecycle is persisted separately', 'cli', ?)
+      `).run(jobId, stamp);
+      return jobId;
+    });
+  }
+
   getAgentSession(externalSessionId: string): PersistedAgentSession | null {
     const rows = asSqlRows<AgentSessionRow>(this.db.prepare(
       'SELECT * FROM agent_sessions WHERE external_session_id=? ORDER BY id',
@@ -1772,7 +1899,7 @@ export class SQLiteStore {
   completeAgentSession(input: {
     externalSessionId: string;
     owner: string;
-    status: 'DONE' | 'BLOCKED' | 'CHANGES_REQUIRED';
+    status: 'DONE' | 'BLOCKED' | 'CHANGES_REQUIRED' | 'NEEDS_INFO';
     result: unknown;
     usage: AgentUsage;
   }) {

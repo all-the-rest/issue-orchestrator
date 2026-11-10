@@ -1,12 +1,8 @@
 # Configuration
 
-This page describes the **currently implemented** JSONC config on `main`. The
-ticket/agent configuration adopted in
-[issue #53](https://github.com/all-the-rest/issue-orchestrator/issues/53) is
-pending migration. Its fields and commands are not supported by the current
-schema; no finished target schema is specified here. See
-[`architecture.md`](architecture.md) for the current/target responsibility
-split.
+This page describes the JSONC config used by the GitHub V1 ticket-to-agent path
+and the retained legacy `run --once` workflow. See
+[`architecture.md`](architecture.md) for the responsibility split.
 
 ## Location and format
 
@@ -29,16 +25,23 @@ Top-level fields:
 
 - `model`: required `provider/model` string.
 - `repos`: required nonempty object keyed by `owner/repository`.
+- `agent_runner`: optional selected AgentRunner name; defaults to `opencode`.
+- `command_runner`: optional trusted executable configuration used when
+  `agent_runner` is `command`; fields are `executable`, optional `args`, and
+  optional `timeout_ms` (default 30 minutes, maximum one hour).
 - `accounts`: optional unique account-name array; an enabled repo needs an
   account, selected from its `account` or the first configured account.
 - `trusted_authors`: optional username array.
+- `tool_authors`: optional usernames to exclude from ticket comment inputs (the
+  configured GitHub accounts are excluded automatically).
 - `max_concurrency`: optional positive integer (default `1`).
-- `provider`, `tracker`, `code_host`: optional provider selectors (`github`,
-  `gitlab`, or `jira`). Legacy `provider` selects both tracker and code host;
-  they may instead be selected independently.
+- `provider`, `tracker`, `code_host`: legacy workflow provider selectors
+  (`github`, `gitlab`, or `jira`). Legacy `provider` selects both tracker and
+  code host; they may instead be selected independently. V1 `/goal` requires
+  the GitHub tracker.
 - `defaults`: optional defaults object. `enabled` (default true),
-  `local_only` (default false), `auto_merge` (default true), provider
-  selectors, and label mappings can be set here.
+  `local_only` (default false), `auto_merge` (default true), provider and agent
+  runner selectors, `command_runner`, and label mappings can be set here.
 - `labels`: optional label-name mapping.
 - `merge.method`: optional `squash`, `merge`, or `rebase` (default `squash`).
 - `evidence.branch_prefix`: optional safe branch prefix (default
@@ -47,7 +50,9 @@ Top-level fields:
 Repository fields include `account`, `tracker_account`,
 `code_host_account`, `provider`, `tracker`, `code_host`, and
 `code_host_project`; `enabled`, `local_only`, and `auto_merge` booleans;
-`base_branch` (default `main`); `trusted_authors`; `labels`; `max_concurrency`;
+`base_branch` (default `main`); `trusted_authors`; `tool_authors`; `labels`;
+`agent_runner`; `command_runner`;
+`max_concurrency`;
 `resource_locks`; `merge_method`; `evidence.branch_prefix`; and required `dod`.
 Repository values override applicable defaults/global provider selections.
 The legacy repo `provider` fills either port that has no more specific
@@ -61,9 +66,20 @@ nonempty argv array or `null` to skip; commands run without a shell.
 1 through 3,600,000 (default 300,000). For `triage_comment`, current behavior
 requires exactly one marked acceptance comment from a trusted author.
 
-The current implementation's `auto_merge` controls its CLI-owned merge path;
-it defaults true for enabled repos, subject to existing approval, marker,
-DoD, and required-check gates. It is separate from the target policy in issue
-#53, where the selected agent integration owns merge and provider permissions
-enforce manual mode. Do not infer that the target configuration is available
-from the similarly named current field.
+For `/goal`, `labels.auto_implement` selects auto-implement mode and defaults to
+`agent:auto-implement`; set it globally, under `defaults`, or for one repo to
+use a different label. Without the label, the command publishes a human-directed
+`REVIEW` status and starts no agent. `agent_runner` may be selected globally,
+under `defaults`, or per repository. Selection precedence is repository,
+top-level, `defaults`, then `opencode`. `command_runner` uses the same precedence
+and its executable/arguments must be trusted configuration, never ticket data.
+The configured `model` and selected runner are used for the persisted ticket
+conversation. Both built-in runner adapters execute on Linux and macOS only.
+
+The legacy `run --once` path still uses `auto_merge` for its CLI-owned merge
+flow. The `/goal` ticket handoff passes the configured merge policy to the
+selected integration, but does not perform CI checks or merge itself. Manual
+merge restrictions must be enforced through provider permissions/branch
+protection, never by relying on prompt text. In manual mode the selected agent's
+credentials must not have merge authority, or the GitHub ruleset must withhold
+it; setting `auto_merge: false` only changes the policy delivered by this bridge.

@@ -1100,7 +1100,7 @@ export class OpenCodeAgentRunner implements AgentRunner {
         throw new AgentResultContractError('Persisted result_json violates the result contract', args.sessionId, error);
       }
     }
-    if (['DONE', 'BLOCKED', 'CHANGES_REQUIRED'].includes(record.status)) {
+    if (['DONE', 'BLOCKED', 'CHANGES_REQUIRED', 'NEEDS_INFO'].includes(record.status)) {
       throw new AgentResultContractError('Completed session has no valid persisted result', args.sessionId);
     }
     if (record.status === 'FAILED' || record.status === 'ABORTED') {
@@ -1344,7 +1344,7 @@ export class OpenCodeAgentRunner implements AgentRunner {
         'Task from issue-orchestrator:',
         userTurn,
         '',
-        `Machine result contract: before finishing, write exactly one JSON object to the absolute path ${JSON.stringify(resultFile)} with required fields status (DONE, BLOCKED or CHANGES_REQUIRED), summary, changed_files (string[]), commands (string[]), acceptance (string[]), blocked_reason (string or null), evidence_dir (string or null), and verdict. For BLOCKED, put the concise question or blocker in blocked_reason. Never invoke a question tool.`,
+        `Machine result contract: before finishing, write exactly one JSON object to the absolute path ${JSON.stringify(resultFile)} with required fields status (DONE, BLOCKED, CHANGES_REQUIRED or NEEDS_INFO), summary, changed_files (string[]), commands (string[]), acceptance (string[]), blocked_reason (string or null), evidence_dir (string or null), and verdict. Optionally include references as an array of up to 20 objects shaped {kind:"pull_request"|"checks",url:"https://github.com/<same-owner>/<same-repo>/pull/<number>"}, {kind:"checks",url:"https://github.com/<same-owner>/<same-repo>/pull/<number>/checks"}, or {kind:"checks",url:"https://github.com/<same-owner>/<same-repo>/actions/runs/<id>"}. Only report links provided by the selected integration; this bridge does not verify their existence or CI state. For BLOCKED or NEEDS_INFO, put the concise question or blocker in blocked_reason. Never invoke a question tool.`,
       ].join('\n');
       const argv = [
         'run', '--standalone', '--session', record.externalSessionId,

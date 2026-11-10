@@ -33,14 +33,15 @@ valuable host secrets.
 | Evidence exfiltration | Builder container has `--network=none`; no host provider CLI or credential mounts; evidence is validated and published by the CLI. | OpenCode control plane may communicate with its configured model provider. Never send customer data/secrets without approval. |
 | Credential leakage | Environment scrubbing, private agent HOME/XDG paths, private logs with token redaction, gitleaks CI. | Redaction is pattern-based and cannot identify every secret format or prevent encoding/transforming data. Do not treat logs as a secret-safe sink. |
 
-## Adopted V1 bridge boundary (migration pending)
+## V1 ticket-to-agent boundary
 
-The controls above describe the current full-workflow implementation. The
-adopted V1 target in [issue #53](https://github.com/all-the-rest/issue-orchestrator/issues/53)
-is narrower: the bridge reads structured GitHub issues/comments and sends them
-to a project-selected agent integration. It does not inspect CI, edit source,
-manage PRs, or call merge APIs. The selected agent/project integration owns
-those operations and their provider CLI.
+The controls above describe the retained legacy `run --once` workflow. The V1
+`goal` path, adopted in
+[issue #53](https://github.com/all-the-rest/issue-orchestrator/issues/53),
+reads structured GitHub issues/comments and sends them to a project-selected
+agent integration. It does not inspect CI, edit source, manage PRs, or call
+merge APIs. The selected agent/project integration owns those operations and
+its provider CLI.
 
 Ticket bodies, comments, updates, and final acceptance criteria remain untrusted
 data and are never executable authority. The bridge does not put credentials in
@@ -53,31 +54,29 @@ short-lived permissions required.
 Every condition that must prevent an agent-side merge must be enforced outside
 prompt text: protected branches/rulesets, required CI checks that encode all
 merge hard-denies, and no agent bypass actors. Do not grant administrators or
-the agent a bypass path for those checks. The default permits agent merge only
-after provider-required checks pass; manual mode must be enforced by provider
-permissions or an equivalent rule that withholds merge authority, not merely by
-asking the agent not to merge. This differs from the current CLI-owned
-`auto_merge` and native-approval gates documented below. These target controls
-are not implemented by the current runtime yet.
+the agent a bypass path for those checks. Manual mode must be enforced by
+provider permissions or an equivalent rule that withholds merge authority, not
+merely by asking the agent not to merge. The legacy `run --once` path still has
+its distinct CLI-owned `auto_merge` and native-approval gates below.
 
 ## Effects, merge, and server controls
 
-The builder may modify and locally commit in its job worktree. It must not push,
-call tracker write APIs, label, comment, create a PR, or merge. Those are CLI
-operations. Auto-merge defaults to true for enabled projects; `auto_merge: false`
-is the explicit opt-out. This default is not a safety boundary: configure
-server-side branch protection/rulesets with required CI and trusted
-human approval. The CLI checks observed approvals/checks but cannot enforce or
-replace server-side protection, prevent administrator overrides, or guarantee
-branch protection is enabled, and the CLI does not assume that it is. Binary evidence and
-anything containing customer data must be inspected by a human before
-publication.
+In the legacy `run --once` path the builder may modify and locally commit in its
+job worktree but must not push, call tracker write APIs, create a PR, or merge;
+those are CLI operations. In the V1 `goal` path the selected agent integration
+has the project-level authority assigned by the operator and provider. This
+bridge cannot sandbox or narrow that authority. Configure server-side branch
+protection/rulesets with required CI and trusted human approval as needed; the
+integration and CLI cannot guarantee that server-side protection is enabled or
+prevent administrator overrides. Binary evidence and anything containing
+customer data must be inspected by a human before publication.
 
 ## Residual risks, non-goals, and operating requirements
 
-- This is not a dedicated-user or hostile-kernel sandbox for OpenCode. Full
-  host-process isolation is not implemented; unattended use must be gated to a
-  disposable/dedicated host or externally managed container until it exists.
+- The V1 ticket bridge does not provide a dedicated-user or hostile-kernel
+  sandbox for the selected integration. Agent execution may inherit the
+  project's configured CLI authority; use a disposable/dedicated OS identity
+  and least-privilege credentials.
 - Prompts, trusted-author lists, regex scanning, and model review do not prevent
   compromise.
 - This project does not protect against host root, compromised container

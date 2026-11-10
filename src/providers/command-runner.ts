@@ -128,12 +128,18 @@ function hasToken(pid: number, token: string) {
 }
 function verifiedMembers(identity: { pid: number; pgid: number; startTicks: string; token: string }, verifyToken = false) {
   const leader = processInfo(identity.pid);
-  if (leader && (leader.pgid !== identity.pgid || leader.start !== identity.startTicks)) throw new Error('persisted process identity changed or PID was reused');
-  const live = processMembers(identity.pgid).filter((p) => !/^[ZX]/i.test(p.state));
+  if (leader && !/^[ZX]/i.test(leader.state) && (leader.pgid !== identity.pgid || leader.start !== identity.startTicks)) throw new Error('persisted process identity changed or PID was reused');
+  const members = processMembers(identity.pgid).filter((p) => !/^[ZX]/i.test(p.state));
+  const live: ProcessIdentity[] = [];
   let tokenAnchorFound = false;
-  for (const p of live) {
+  for (const p of members) {
     const again = processInfo(p.pid);
-    if (!again || again.pgid !== identity.pgid || again.start !== p.start) throw new Error('process changed during identity verification');
+    // A member may exit between the group snapshot and the per-PID check. It
+    // is then safe to omit it; a live PID with a changed identity still fails
+    // closed before any stop request is sent.
+    if (!again || /^[ZX]/i.test(again.state)) continue;
+    if (again.pgid !== identity.pgid || again.start !== p.start) throw new Error('process changed during identity verification');
+    live.push(again);
     // The guardian normally anchors the group. If it exited while a child
     // survived, require the unguessable token inherited by that child before
     // signaling the numeric PGID; group membership alone is vulnerable to

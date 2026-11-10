@@ -12,7 +12,7 @@ const GUARDED = new Set([
 
 const [command = 'help', ...rest] = process.argv.slice(2);
 let pendingSignal: NodeJS.Signals | null = null;
-if (command === 'run') {
+if (command === 'run' || command === 'goal') {
   for (const signal of ['SIGTERM', 'SIGINT'] as const) {
     process.once(signal, () => {
       pendingSignal = signal;
@@ -51,6 +51,12 @@ async function main(): Promise<number> {
   if (command === 'run') {
     // Reconciliation remains globally serialized, but never hold the global
     // mutation guard for the lifetime of an agent workflow.
+    opts.reconciliation = withMutationGuard(() => reconcilePendingSideEffects(opts));
+    return await handler(opts) ?? 0;
+  }
+  if (command === 'goal') {
+    // Serialize startup reconciliation, but do not hold the global guard while
+    // the selected agent works on the ticket.
     opts.reconciliation = withMutationGuard(() => reconcilePendingSideEffects(opts));
     return await handler(opts) ?? 0;
   }

@@ -1,0 +1,31 @@
+{
+  // Synthetic GitHub-only V1 example. Store provider credentials with `gh auth login`.
+  "model": "openai/example-model",
+  "agent_runner": "opencode",
+  "accounts": ["example-bot"],
+  "tool_authors": ["example-agent-bot"],
+  "labels": {
+    "auto_implement": "agent:auto-implement"
+  },
+  "repos": {
+    "example-org/sample-project": {
+      "enabled": false,
+      "account": "example-bot",
+      "tracker": "github",
+      "code_host": "github",
+      "auto_merge": false,
+      "dod": {
+        "commands": {
+          "build": null,
+          "test": null,
+          "lint": null,
+          "typecheck": null,
+          "security": null
+        },
+        "required_checks": ["CI"],
+        "evidence_class": "docs",
+        "acceptance_source": "issue_body"
+      }
+    }
+  }
+}
