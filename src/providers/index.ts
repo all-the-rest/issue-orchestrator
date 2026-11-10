@@ -1,6 +1,7 @@
 import { githubTracker } from './github-tracker.js';
 import { githubCodeHost } from './github-codehost.js';
 import { OpenCodeAgentRunner } from './opencode-runner.js';
+import { CommandAgentRunner, type CommandRunnerOptions } from './command-runner.js';
 import { getRuntimeStore } from '../core/persistence.js';
 import { codeHostStub, trackerStub } from './stubs.js';
 import type { AgentRunner, CodeHost, Tracker } from './ports.js';
@@ -17,6 +18,7 @@ const codeHosts: Record<string, CodeHost> = {
 };
 const agentRunners: Record<string, AgentRunner> = {
   opencode: new OpenCodeAgentRunner({ storeProvider: getRuntimeStore }),
+  command: new CommandAgentRunner({ executable: 'unconfigured-command-runner', storeProvider: getRuntimeStore }),
 };
 
 export const providerCapabilities = Object.freeze({
@@ -41,7 +43,11 @@ export function getCodeHost(name = 'github') {
   return resolve(codeHosts, 'code host', name);
 }
 
-export function getAgentRunner(name = 'opencode') {
+export function getAgentRunner(name = 'opencode', commandOptions?: CommandRunnerOptions) {
+  if (name === 'command') {
+    if (!commandOptions) throw new Error('command agent runner requires trusted command_runner configuration');
+    return new CommandAgentRunner({ ...commandOptions, storeProvider: getRuntimeStore });
+  }
   return resolve(agentRunners, 'agent runner', name);
 }
 

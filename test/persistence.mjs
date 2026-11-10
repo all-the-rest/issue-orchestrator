@@ -128,7 +128,7 @@ try {
      'input_tokens', 'output_tokens', 'reasoning_tokens', 'cache_read_tokens', 'cache_write_tokens',
      'cost_usd', 'result_json', 'ndjson_path', 'stderr_path', 'branch', 'base_sha', 'head_sha',
     'change_number', 'evidence_commit', 'error_class', 'execution_owner', 'execution_lease_until',
-     'execution_pid', 'execution_pgid', 'execution_start_ticks', 'execution_token', 'oci_identity',
+    'execution_pid', 'execution_pgid', 'execution_start_ticks', 'execution_token', 'oci_identity', 'runner_name',
   ]) {
     assert.ok(columns('agent_sessions').has(column), `agent_sessions should store ${column}`);
   }
@@ -138,13 +138,13 @@ try {
   assert.equal(Number(store.rows('PRAGMA foreign_keys')[0].foreign_keys), 1);
   assert.equal(store.rows('PRAGMA journal_mode')[0].journal_mode, 'wal');
   assert.equal(Number(store.rows('PRAGMA busy_timeout')[0].timeout), 5000);
-  assert.equal(store.rows('SELECT version FROM schema_migrations').length, 7);
+  assert.equal(store.rows('SELECT version FROM schema_migrations').length, 8);
   assert.ok(columns('jobs').has('lease_pid'), 'jobs should record the OS process that owns its lease');
   assert.ok(columns('jobs').has('lease_start_ticks'), 'jobs should record process identity to detect PID reuse');
   assert.ok(tables.has('job_resource_locks') && tables.has('scheduler_global_limit'));
   store.close();
   store = new SQLiteStore(migrationFile);
-  assert.equal(store.rows('SELECT version FROM schema_migrations').length, 7, 'reopening must not reapply migrations');
+  assert.equal(store.rows('SELECT version FROM schema_migrations').length, 8, 'reopening must not reapply migrations');
   store.close();
   ok('empty database receives all schema migrations with WAL/foreign keys, and restart is idempotent');
 
@@ -182,6 +182,7 @@ try {
     ALTER TABLE agent_sessions DROP COLUMN execution_start_ticks;
     ALTER TABLE agent_sessions DROP COLUMN execution_token;
     ALTER TABLE agent_sessions DROP COLUMN oci_identity;
+    ALTER TABLE agent_sessions DROP COLUMN runner_name;
     DROP INDEX jobs_one_active_owner_per_work_item;
     DROP TABLE job_resource_locks;
     DROP TABLE scheduler_config;
@@ -190,12 +191,12 @@ try {
     DROP TABLE scheduler_project_limit;
     ALTER TABLE jobs DROP COLUMN lease_pid;
     ALTER TABLE jobs DROP COLUMN lease_start_ticks;
-    DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7);
+    DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8);
   `);
   store.close();
   store = new SQLiteStore(upgradeFile);
   assert.equal(store.rows('SELECT workflow_state FROM jobs WHERE id=?', upgradeJob.id)[0].workflow_state, 'EVIDENCE_PUBLISHED');
-  assert.equal(store.rows('SELECT MAX(version) AS version FROM schema_migrations')[0].version, 7);
+  assert.equal(store.rows('SELECT MAX(version) AS version FROM schema_migrations')[0].version, 8);
   store.close();
   ok('v1 jobs retain their workflow meaning when the additive migration is applied');
 
@@ -203,11 +204,11 @@ try {
   fs.mkdirSync(path.dirname(futureSchema), { recursive: true });
   const futureDb = new DatabaseSync(futureSchema);
   futureDb.exec('CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)');
-  futureDb.prepare('INSERT INTO schema_migrations(version, applied_at) VALUES (8, ?)').run(new Date().toISOString());
+  futureDb.prepare('INSERT INTO schema_migrations(version, applied_at) VALUES (9, ?)').run(new Date().toISOString());
   futureDb.close();
   assert.throws(() => new SQLiteStore(futureSchema), /newer than supported version/);
   const stillFutureDb = new DatabaseSync(futureSchema);
-  assert.equal(Number(stillFutureDb.prepare('SELECT MAX(version) AS version FROM schema_migrations').get().version), 8);
+  assert.equal(Number(stillFutureDb.prepare('SELECT MAX(version) AS version FROM schema_migrations').get().version), 9);
   stillFutureDb.close();
   ok('a database with a newer schema version is rejected without being downgraded');
 

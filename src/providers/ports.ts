@@ -146,6 +146,7 @@ export interface AgentResult {
 export type AgentSessionStatus = AgentResultStatus | 'CREATED' | 'RUNNING' | 'FAILED' | 'ABORTED';
 
 export interface AgentSession {
+  runner: string;
   externalSessionId: string;
   jobId: number;
   role: AgentRole;
@@ -165,7 +166,14 @@ export interface CreateAgentSessionArgs {
 
 export interface RunAgentSessionArgs {
   sessionId: string;
-  prompt: string;
+  /** Legacy user prompt; retained for existing workflows. */
+  prompt?: string;
+  /** Stable instructions are separate from untrusted structured ticket data. */
+  systemPrompt?: string;
+  /** Structured ticket/goal/update handoff; never interpolate into systemPrompt. */
+  input?: unknown;
+  /** Explicit V1 follow-up only: continue an already completed conversation. */
+  continueCompleted?: boolean;
   timeoutMs?: number;
 }
 

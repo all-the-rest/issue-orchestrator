@@ -27,6 +27,8 @@ import {
   type CreateAgentSessionArgs,
   type RunAgentSessionArgs,
 } from './ports.js';
+import { AgentResultContractError, AgentRunnerError, validateAgentResult } from './agent-result.js';
+export { AgentResultContractError, AgentRunnerError, validateAgentResult } from './agent-result.js';
 
 const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000;
 const DEFAULT_TERMINATION_GRACE_MS = 1000;
@@ -61,25 +63,6 @@ type FailureCode =
   | 'AGENT_EXECUTION_LEASE_LOST'
   | 'AGENT_SPAWN_FAILED'
   | 'AGENT_PROCESS_FAILED';
-
-export class AgentRunnerError extends Error {
-  readonly code: FailureCode;
-  readonly sessionId?: string;
-
-  constructor(code: FailureCode, message: string, sessionId?: string, cause?: unknown) {
-    super(message, cause === undefined ? undefined : { cause });
-    this.name = 'AgentRunnerError';
-    this.code = code;
-    this.sessionId = sessionId;
-  }
-}
-
-export class AgentResultContractError extends AgentRunnerError {
-  constructor(message: string, sessionId?: string, cause?: unknown) {
-    super('INVALID_AGENT_RESULT', message, sessionId, cause);
-    this.name = 'AgentResultContractError';
-  }
-}
 
 interface RunnerOptions {
   executable?: string;
@@ -118,69 +101,14 @@ interface ActiveRun {
   terminate: () => void;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return !!value && typeof value === 'object' && !Array.isArray(value);
-}
-
-function requireNonEmptyString(value: unknown, field: string): string {
-  if (typeof value !== 'string' || value.trim().length === 0) {
-    throw new AgentResultContractError(`result.json field "${field}" must be a non-empty string`);
-  }
-  return value;
-}
-
-/** Validate the only agent-authored success contract accepted by the runner. */
-export function validateAgentResult(value: unknown): AgentResult {
-  if (!isRecord(value)) throw new AgentResultContractError('result.json must contain a JSON object');
-  const expected = [
-    'status', 'summary', 'changed_files', 'commands', 'acceptance',
-    'blocked_reason', 'evidence_dir', 'verdict',
-  ];
-  const keys = Object.keys(value).sort();
-  if (keys.length !== expected.length || keys.some((key, index) => key !== [...expected].sort()[index])) {
-    throw new AgentResultContractError(`result.json must contain exactly: ${expected.join(', ')}`);
-  }
-  if (!['DONE', 'BLOCKED', 'CHANGES_REQUIRED'].includes(String(value.status))) {
-    throw new AgentResultContractError('result.json status must be DONE, BLOCKED or CHANGES_REQUIRED');
-  }
-  const stringList = (field: string) => {
-    const list = value[field];
-    if (!Array.isArray(list) || list.some((item) => typeof item !== 'string' || item.trim().length === 0)) {
-      throw new AgentResultContractError(`result.json field "${field}" must be an array of non-empty strings`);
-    }
-    return [...list] as string[];
-  };
-  const status = value.status as AgentResultStatus;
-  const blockedReason = value.blocked_reason;
-  if (blockedReason !== null && (typeof blockedReason !== 'string' || blockedReason.trim().length === 0)) {
-    throw new AgentResultContractError('result.json field "blocked_reason" must be a non-empty string or null');
-  }
-  if (status === 'BLOCKED' && blockedReason === null) {
-    throw new AgentResultContractError('BLOCKED result requires blocked_reason (put questions here; do not ask)');
-  }
-  if (status !== 'BLOCKED' && blockedReason !== null) {
-    throw new AgentResultContractError('blocked_reason must be null unless status is BLOCKED');
-  }
-  const evidenceDir = value.evidence_dir;
-  if (evidenceDir !== null && (typeof evidenceDir !== 'string' || evidenceDir.trim().length === 0)) {
-    throw new AgentResultContractError('result.json field "evidence_dir" must be a non-empty string or null');
-  }
-  return {
-    status,
-    summary: requireNonEmptyString(value.summary, 'summary'),
-    changed_files: stringList('changed_files'),
-    commands: stringList('commands'),
-    acceptance: stringList('acceptance'),
-    blocked_reason: blockedReason as string | null,
-    evidence_dir: evidenceDir as string | null,
-    verdict: requireNonEmptyString(value.verdict, 'verdict'),
-  };
-}
-
 function assertRole(role: string): asserts role is AgentRole {
   if (!SUPPORTED_ROLES.has(role as AgentRole)) {
     throw new AgentRunnerError('INVALID_AGENT_SESSION', `Unsupported agent role "${role}"`);
   }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
 }
 
 function agentPermissions(role: AgentRole, worktree: string) {
@@ -213,7 +141,7 @@ function agentPermissions(role: AgentRole, worktree: string) {
   ];
 }
 
-function agentConfig(role: AgentRole, agentName: string, worktree: string, shellWrapper?: string) {
+function agentConfig(role: AgentRole, agentName: string, worktree: string, shellWrapper?: string, trustedSystemPrompt?: string) {
   const resultFile = path.join(worktree, RESULT_RELATIVE_PATH);
   const descriptions: Record<AgentRole, string> = {
     triage: 'Classify a trusted issue and identify acceptance criteria without editing files.',
@@ -236,7 +164,7 @@ function agentConfig(role: AgentRole, agentName: string, worktree: string, shell
       [agentName]: {
         description: descriptions[role],
         mode: 'primary',
-        system: systems[role],
+        system: trustedSystemPrompt === undefined ? systems[role] : `${systems[role]}\n\nAdditional trusted system instructions:\n${trustedSystemPrompt}`,
         permissions: agentPermissions(role, worktree),
       },
     },
@@ -590,6 +518,7 @@ function readAgentResult(worktree: string, sessionId: string): AgentResult {
 
 function sessionValue(record: PersistedAgentSession): AgentSession {
   return {
+    runner: record.runner,
     externalSessionId: record.externalSessionId,
     jobId: record.jobId,
     role: record.role as AgentRole,
@@ -1127,6 +1056,7 @@ export class OpenCodeAgentRunner implements AgentRunner {
     const sessionDirectory = ensurePrivateDirectory(path.join(sessions, safeId));
     ensurePrivateDirectory(path.join(sessionDirectory, 'cwd'));
     const record = this.store().createAgentSession({
+      runner: this.name,
       jobId: args.jobId,
       externalSessionId,
       role: args.role,
@@ -1196,13 +1126,20 @@ export class OpenCodeAgentRunner implements AgentRunner {
     if (!sessionId) throw new AgentRunnerError('INVALID_AGENT_SESSION', 'sessionId is required');
     const record = this.store().getAgentSession(sessionId);
     if (!record) throw new AgentRunnerError('INVALID_AGENT_SESSION', `Unknown agent session ${sessionId}`, sessionId);
+    if (record.runner !== this.name) {
+      throw new AgentRunnerError('AGENT_RECOVERY_UNSAFE', `Session belongs to runner "${record.runner}", not "${this.name}"`, sessionId);
+    }
     assertRole(record.role);
     return record;
   }
 
   private async execute(args: RunAgentSessionArgs, resume: boolean): Promise<AgentResult> {
     const record = this.requireSession(args.sessionId);
-    if (typeof args.prompt !== 'string' || args.prompt.trim().length === 0) {
+    const structured = args.input !== undefined;
+    if (structured && (typeof args.systemPrompt !== 'string' || !args.systemPrompt.trim())) {
+      throw new AgentRunnerError('INVALID_AGENT_SESSION', 'structured handoff requires a trusted non-empty systemPrompt', args.sessionId);
+    }
+    if (!structured && (typeof args.prompt !== 'string' || args.prompt.trim().length === 0)) {
       throw new AgentRunnerError('INVALID_AGENT_SESSION', 'run requires a non-empty prompt', args.sessionId);
     }
     if (this.activeRuns.has(args.sessionId)) {
@@ -1214,7 +1151,7 @@ export class OpenCodeAgentRunner implements AgentRunner {
     if (!resume && record.status !== 'CREATED') {
       throw new AgentRunnerError('INVALID_AGENT_SESSION', `run requires CREATED status; found ${record.status}`, args.sessionId);
     }
-    if (resume && record.status === 'DONE') {
+    if (resume && record.status === 'DONE' && args.continueCompleted !== true) {
       throw new AgentRunnerError('INVALID_AGENT_SESSION', 'A DONE agent session cannot be resumed', args.sessionId);
     }
     const timeoutMs = args.timeoutMs ?? this.timeoutMs;
@@ -1262,6 +1199,7 @@ export class OpenCodeAgentRunner implements AgentRunner {
       owner,
       leaseUntil: leaseExpiry(),
       resume,
+      continueCompleted: args.continueCompleted,
     });
     if (claim.acquired === false) {
       if (claim.reason === 'BUSY') {
@@ -1396,14 +1334,15 @@ export class OpenCodeAgentRunner implements AgentRunner {
         shellWrapper = generatedWrapper.file;
         gitHooksDirectory = generatedWrapper.gitHooksDirectory;
       }
-      fs.writeFileSync(configFile, JSON.stringify(agentConfig(role, agentName, worktree, shellWrapper)), {
+      fs.writeFileSync(configFile, JSON.stringify(agentConfig(role, agentName, worktree, shellWrapper, structured ? args.systemPrompt : undefined)), {
         mode: 0o600,
         flag: 'wx',
       });
       const resultFile = path.join(worktree, RESULT_RELATIVE_PATH);
+      const userTurn = structured ? JSON.stringify(args.input) : args.prompt!.trim();
       const prompt = [
         'Task from issue-orchestrator:',
-        args.prompt.trim(),
+        userTurn,
         '',
         `Machine result contract: before finishing, write exactly one JSON object to the absolute path ${JSON.stringify(resultFile)} with required fields status (DONE, BLOCKED or CHANGES_REQUIRED), summary, changed_files (string[]), commands (string[]), acceptance (string[]), blocked_reason (string or null), evidence_dir (string or null), and verdict. For BLOCKED, put the concise question or blocker in blocked_reason. Never invoke a question tool.`,
       ].join('\n');

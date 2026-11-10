@@ -182,6 +182,7 @@ interface AgentSessionRow extends SqlRow {
   job_id: number | bigint;
   session_id: string;
   external_session_id: string | null;
+  runner_name: string | null;
   role: string | null;
   model: string | null;
   worktree: string | null;
@@ -234,6 +235,7 @@ export interface PersistedAgentSession {
   jobId: number;
   sessionId: string;
   externalSessionId: string;
+  runner: string;
   role: string;
   model: string;
   worktree: string;
@@ -716,6 +718,9 @@ const MIGRATIONS = [
   `,
   `
     ALTER TABLE agent_sessions ADD COLUMN oci_identity TEXT;
+  `,
+  `
+    ALTER TABLE agent_sessions ADD COLUMN runner_name TEXT NOT NULL DEFAULT 'opencode';
   `,
 ];
 
@@ -1572,6 +1577,7 @@ export class SQLiteStore {
   }
 
   createAgentSession(input: {
+    runner?: string;
     jobId: number;
     externalSessionId: string;
     role: string;
@@ -1588,10 +1594,10 @@ export class SQLiteStore {
     const stamp = nowIso();
     this.transaction(() => {
       this.db.prepare(`
-        INSERT INTO agent_sessions(job_id, session_id, external_session_id, role, model, worktree, oci_identity,
+        INSERT INTO agent_sessions(job_id, session_id, external_session_id, runner_name, role, model, worktree, oci_identity,
           status, started_at, ndjson_path, stderr_path, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'CREATED', ?, ?, ?, ?, ?)
-      `).run(input.jobId, input.externalSessionId, input.externalSessionId, input.role, input.model,
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'CREATED', ?, ?, ?, ?, ?)
+      `).run(input.jobId, input.externalSessionId, input.externalSessionId, input.runner ?? 'opencode', input.role, input.model,
         input.worktree, input.ociIdentity ?? null, stamp, input.ndjsonPath, input.stderrPath, stamp, stamp);
     });
     const created = this.getAgentSession(input.externalSessionId);
@@ -1614,6 +1620,7 @@ export class SQLiteStore {
       jobId: Number(row.job_id),
       sessionId: row.session_id,
       externalSessionId: row.external_session_id,
+      runner: typeof row.runner_name === 'string' ? row.runner_name : 'opencode',
       role: row.role,
       model: row.model,
       worktree: row.worktree,
@@ -1660,6 +1667,7 @@ export class SQLiteStore {
     owner: string;
     leaseUntil: string;
     resume: boolean;
+    continueCompleted?: boolean;
   }): AgentSessionClaim {
     const stamp = nowIso();
     return this.transaction(() => {
@@ -1694,7 +1702,10 @@ export class SQLiteStore {
         return { acquired: true, recovering: true, previousProcess };
       }
 
-      if ((!input.resume && row.status !== 'CREATED') || (input.resume && row.status === 'DONE')) {
+      const completedContinuation = input.resume && input.continueCompleted === true &&
+        ['DONE', 'BLOCKED', 'CHANGES_REQUIRED'].includes(row.status);
+      if ((!input.resume && row.status !== 'CREATED') || (input.resume && row.status === 'DONE' && !completedContinuation) ||
+          (input.resume && ['BLOCKED', 'CHANGES_REQUIRED'].includes(row.status) && !completedContinuation)) {
         return { acquired: false, reason: 'INVALID_STATE', status: row.status };
       }
       this.db.prepare(`

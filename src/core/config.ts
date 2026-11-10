@@ -126,6 +126,24 @@ function validateConfig(cfg, file) {
   if (typeof cfg.model !== 'string' || !/^[^\s/]+\/[^\s/]+$/.test(cfg.model)) {
     throw new Error(`${file}: "model" must be a provider/model string`);
   }
+  const supportedAgentRunners = ['opencode', 'command'];
+  const validateAgentRunner = (value, name) => {
+    if (value !== undefined && (typeof value !== 'string' || !supportedAgentRunners.includes(value))) {
+      throw new Error(`${file}: unsupported ${name} "${value}" (registered: ${supportedAgentRunners.join(', ')})`);
+    }
+  };
+  validateAgentRunner(cfg.agent_runner, 'agent_runner');
+  validateAgentRunner(cfg.defaults?.agent_runner, 'defaults.agent_runner');
+  const validateCommand = (value, label) => {
+    if (value === undefined) return;
+    if (!value || typeof value !== 'object' || Array.isArray(value) || typeof value.executable !== 'string' || !value.executable.trim() || value.executable.includes('\0') ||
+        (value.args !== undefined && (!Array.isArray(value.args) || value.args.some((arg) => typeof arg !== 'string' || arg.includes('\0')))) ||
+        (value.timeout_ms !== undefined && (!Number.isSafeInteger(value.timeout_ms) || value.timeout_ms < 1 || value.timeout_ms > 3_600_000))) {
+      throw new Error(`${file}: ${label} must contain a trusted executable, optional argv array and bounded timeout_ms`);
+    }
+  };
+  validateCommand(cfg.command_runner, 'command_runner');
+  validateCommand(cfg.defaults?.command_runner, 'defaults.command_runner');
   const accounts = cfg.accounts ?? [];
   if (!Array.isArray(accounts) || accounts.some((account) => typeof account !== 'string' || !account)) {
     throw new Error(`${file}: "accounts" must be an array of non-empty account names`);
@@ -171,6 +189,12 @@ function validateConfig(cfg, file) {
     }
     if (!repo || typeof repo !== 'object' || Array.isArray(repo)) {
       throw new Error(`${file}: repo "${project}" must be an object`);
+    }
+    validateAgentRunner(repo.agent_runner, `repos.${project}.agent_runner`);
+    validateCommand(repo.command_runner, `repos.${project}.command_runner`);
+    if ((repo.agent_runner ?? cfg.agent_runner ?? defaults.agent_runner ?? 'opencode') === 'command' &&
+        !(repo.command_runner ?? cfg.command_runner ?? defaults.command_runner)) {
+      throw new Error(`${file}: command runner selection for ${project} requires command_runner config`);
     }
     if (repo.max_concurrency !== undefined) {
       positiveInteger(repo.max_concurrency, `repos.${project}.max_concurrency`);
@@ -297,6 +321,8 @@ export function repoConfig(cfg, project) {
     provider: tracker === codeHost ? tracker : `${tracker}+${codeHost}`,
     tracker,
     code_host: codeHost,
+    agent_runner: own.agent_runner ?? cfg.agent_runner ?? defaults.agent_runner ?? 'opencode',
+    command_runner: own.command_runner ?? cfg.command_runner ?? defaults.command_runner,
     code_host_project: own.code_host_project ?? project,
     account,
     tracker_account: own.tracker_account ?? account,
