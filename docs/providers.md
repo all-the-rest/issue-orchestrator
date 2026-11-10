@@ -80,7 +80,8 @@ Those adapters belong to the older broad workflow; V1 ticket intake is GitHub-on
 ## V1 ticket-to-agent path
 
 `issue-orchestrator goal --project <owner/repo> --issue <number> --goal-file
-<private-path|->` reads a GitHub issue through the `Ticket` port. It provides the
+<private-path|-> [--retry-blocked]` reads a GitHub issue through the `Ticket`
+port. It provides the
 normalized title, body, author, labels, state, URL, human comments, and exact
 operator-supplied final acceptance criteria as structured input, separate from
 the stable system prompt. Credentials and host-private paths are redacted or
@@ -95,6 +96,9 @@ are persisted as follow-up turns on the same agent conversation. The selected
 agent integration owns source edits, PRs, CI, and merge; the orchestrator does
 not add Ticket-adjacent source or CI provider ports. Manual merge enforcement is
 by provider permissions and branch protection, not prompt wording.
+Terminal `BLOCKED` results are retried only with the explicit
+`--retry-blocked` option after local remediation; the original goal and agent
+conversation are preserved.
 
 The GitHub Ticket adapter lists/reads issue fields, paginates comments, uses a
 comment ID cursor, and publishes bounded status comments with stable markers so
@@ -209,23 +213,35 @@ that their adapters can run the workflow.
 `AgentRunner` is an asynchronous port: `createSession`, `run`, `resume`,
 `abort`, and `getResult` return promises. The OpenCode adapter invokes the
 v2.2.6 CLI directly with `spawn` (no shell), `--standalone`,
-`--format json`, `--auto`, a role-specific agent and the supplied model. Its
+`--format json`, `--auto`, the configured default agent, and the supplied model. Its
 working directory, generated config, and captured NDJSON/stderr live in private
 per-session directories beside the orchestrator runtime database, outside the
 worktree. Those directories are forced to mode `0700`, log files to `0600`, and
 log opens reject symlinks. The process gets private `HOME` and XDG directories.
-For configured default models, only the operator's OpenCode `auth.json` is
-copied into that session's private XDG data directory after checking that it is
-a private, regular, owned file; the host data path is not exposed. The copied
-provider credentials remain in the private session directory for crash resume,
-and their values are redacted from persisted logs. Use a dedicated/disposable
-operator account with least-privilege model-provider credentials. User config is
-isolated with a private `XDG_CONFIG_HOME`, and the CLI starts outside the
-repository so project config/plugins are not discovered. The generated agent config disables
+The operator's OpenCode `auth.json` must be a private, regular, owned file.
+Legacy provider maps are copied into the session data directory; OpenCode V2
+`auth export` arrays are narrowed to the active credential for the selected
+model provider and imported with `opencode auth import` into that session's
+private SQLite database. The host data path is not exposed. Provider
+credentials remain in the private session directory for crash resume, and their
+values are redacted from persisted logs. For V2, provision only the selected
+provider, for example by redirecting `opencode --standalone auth export openai`
+into the private `$XDG_DATA_HOME/opencode/auth.json` used by the orchestrator
+(do not set that `XDG_DATA_HOME` on the export command unless it points to the
+authenticated OpenCode database). Keep the directory mode `0700` and file mode
+`0600`. Use a dedicated/disposable operator account with least-privilege
+model-provider credentials. User config is isolated with a private
+`XDG_CONFIG_HOME`, and the CLI starts outside the repository so project
+config/plugins are not discovered. The generated agent config disables
 configured plugins and MCP, and agent file access is restricted to the
-worktree. Any machine-managed OpenCode configuration is administrator-owned and
-must be trusted. Verifier shell is denied; builder shell runs in the OCI
-sandbox without host home/data mounts or provider credentials.
+worktree. OpenCode is started without a CLI `--agent`: the runner uses the
+configured `default_agent`, falling back to OpenCode's built-in `build`, then
+overlays the role's system instructions and permissions on that agent. It keeps
+other selected-agent settings, but forces primary mode and replaces permissions
+with the runner's role boundary. Any machine-managed OpenCode configuration is
+administrator-owned and must be trusted. Verifier shell is denied; builder
+shell runs in the OCI sandbox without host home/data mounts or provider
+credentials.
 
 Each completed agent must write `.issue-orchestrator/result.json` with exactly
 these required fields: `status` (`DONE`, `BLOCKED`, `CHANGES_REQUIRED`, or
@@ -233,7 +249,9 @@ these required fields: `status` (`DONE`, `BLOCKED`, `CHANGES_REQUIRED`, or
 `summary`, string arrays `changed_files`, `commands`, and `acceptance`,
 `blocked_reason` (string or null), `evidence_dir` (string or null), and a
 non-empty `verdict`. `BLOCKED` and `NEEDS_INFO` require a reason; other statuses
-require a null reason. An optional `references` array may contain up to 20
+require a null reason. After validation, the runner removes this transient
+result file so it does not become an extra repository change. An optional
+`references` array may contain up to 20
 structured same-repository GitHub pull-request or checks URLs. The bridge
 validates their host, path shape, and repository before including at most five
 in a status comment; it labels them agent-provided and does not verify their

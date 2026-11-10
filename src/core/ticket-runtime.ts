@@ -27,6 +27,7 @@ interface TicketTurn extends StatusTurn {
   changedFields: string[];
   statusMode: TicketAgentMode;
   dispatched: boolean;
+  operatorRetry?: boolean;
   finalized?: boolean;
   result: AgentResult | null;
   summary: string;
@@ -80,6 +81,7 @@ export interface TicketRuntimePolicy {
   goal: string;
   mergePolicy: TicketMergePolicy;
   autoImplementLabel: string;
+  retryBlocked?: boolean;
   toolAuthors?: string[];
   summarize?: (result: AgentResult) => string;
 }
@@ -290,54 +292,57 @@ export async function runTicketHandoff(args: {
       if (!state.initialDispatched) {
         // Continue below into the first (real) agent dispatch.
       } else {
-      if (current.mode !== 'auto-implement') {
-        if (!changed && !updates.length) {
+        if (current.mode !== 'auto-implement') {
+          if (!changed && !updates.length) {
+            if (batch.nextCursor !== state.cursor) { state.cursor = batch.nextCursor; save(); }
+            return pendingTerminal();
+          }
+          const changedFields = changedTicketFields(current, state.ticket);
+          const deferred = new Map<string, TicketComment>();
+          for (const comment of [...(state.deferredUpdates ?? []), ...updates]) deferred.set(comment.id, comment);
+          state.deferredUpdates = [...deferred.values()];
+          state.deferredFields = [...new Set([...(state.deferredFields ?? []), ...changedFields])];
+          state.ticket = current; state.cursor = batch.nextCursor ?? state.cursor;
+          state.state = 'REVIEW'; state.terminal = true;
+          state.statusKeys = { started: randomUUID(), finished: randomUUID() }; state.statusIds = {};
+          state.finalStatusBody = 'Agent outcome REVIEW (human-directed): The opt-in label is absent, so no follow-up agent turn was started. Next action: add the configured auto-implementation label to resume this ticket conversation.';
+          save();
+          const held = { statusKeys: state.statusKeys, statusIds: state.statusIds, finalStatusBody: state.finalStatusBody };
+          await publish(held, 'started', 'Ticket update recorded (human-directed); no agent turn started.');
+          const pending = await finishStatus(held);
+          return publicOutcome(jobId, state, pending);
+        }
+        const retryBlocked = policy.retryBlocked === true && !changed && !updates.length &&
+          state.result?.status === 'BLOCKED' && !!state.sessionId;
+        if (!changed && !updates.length && !retryBlocked) {
           if (batch.nextCursor !== state.cursor) { state.cursor = batch.nextCursor; save(); }
+          if (!state.terminal) {
+            state.state = state.result.status;
+            state.terminal = true;
+            state.summary = safeSummary(state.result, policy.summarize);
+            const next = `${nextAction(state.result, state.mergePolicy)}${referenceText(state.result, project)}`;
+            state.finalStatusBody = `Agent outcome ${displayedStatus(state.result.status)} (${state.ticket.mode}): ${state.summary} ${next}`;
+            save();
+          }
           return pendingTerminal();
         }
-        const changedFields = changedTicketFields(current, state.ticket);
+        const changedFields = retryBlocked ? [] : changedTicketFields(current, state.ticket);
+        const turnId = randomUUID();
         const deferred = new Map<string, TicketComment>();
         for (const comment of [...(state.deferredUpdates ?? []), ...updates]) deferred.set(comment.id, comment);
-        state.deferredUpdates = [...deferred.values()];
-        state.deferredFields = [...new Set([...(state.deferredFields ?? []), ...changedFields])];
-        state.ticket = current; state.cursor = batch.nextCursor ?? state.cursor;
-        state.state = 'REVIEW'; state.terminal = true;
-        state.statusKeys = { started: randomUUID(), finished: randomUUID() }; state.statusIds = {};
-        state.finalStatusBody = 'Agent outcome REVIEW (human-directed): The opt-in label is absent, so no follow-up agent turn was started. Next action: add the configured auto-implementation label to resume this ticket conversation.';
-        save();
-        const held = { statusKeys: state.statusKeys, statusIds: state.statusIds, finalStatusBody: state.finalStatusBody };
-        await publish(held, 'started', 'Ticket update recorded (human-directed); no agent turn started.');
-        const pending = await finishStatus(held);
-        return publicOutcome(jobId, state, pending);
-      }
-      if (!changed && !updates.length) {
-        if (batch.nextCursor !== state.cursor) { state.cursor = batch.nextCursor; save(); }
-        if (!state.terminal) {
-          state.state = state.result.status;
-          state.terminal = true;
-          state.summary = safeSummary(state.result, policy.summarize);
-          const next = `${nextAction(state.result, state.mergePolicy)}${referenceText(state.result, project)}`;
-          state.finalStatusBody = `Agent outcome ${displayedStatus(state.result.status)} (${state.ticket.mode}): ${state.summary} ${next}`;
-          save();
+        const allChangedFields = [...new Set([...(state.deferredFields ?? []), ...changedFields])];
+        state.pendingTurn = { id: turnId, message: updateMessage(current, goal, state.mergePolicy, [...deferred.values()], allChangedFields), sessionId: state.sessionId,
+          ticket: current, cursor: batch.nextCursor ?? state.cursor, changedFields,
+          statusKeys: { started: randomUUID(), finished: randomUUID() }, statusIds: {}, statusMode: current.mode,
+          ...(retryBlocked ? { operatorRetry: true } : {}),
+          dispatched: false, result: null, summary: '', finalStatusBody: '' };
+        if (state.result && !state.turns.some((turn) => turn.id === state.pendingTurn?.id)) {
+          state.turns.push({ id: `result-before-${turnId}`, result: state.result, summary: state.summary });
         }
-        return pendingTerminal();
-      }
-      const changedFields = changedTicketFields(current, state.ticket);
-      const turnId = randomUUID();
-      const deferred = new Map<string, TicketComment>();
-      for (const comment of [...(state.deferredUpdates ?? []), ...updates]) deferred.set(comment.id, comment);
-      const allChangedFields = [...new Set([...(state.deferredFields ?? []), ...changedFields])];
-      state.pendingTurn = { id: turnId, message: updateMessage(current, goal, state.mergePolicy, [...deferred.values()], allChangedFields), sessionId: state.sessionId,
-        ticket: current, cursor: batch.nextCursor ?? state.cursor, changedFields,
-        statusKeys: { started: randomUUID(), finished: randomUUID() }, statusIds: {}, statusMode: current.mode,
-        dispatched: false, result: null, summary: '', finalStatusBody: '' };
-      if (state.result && !state.turns.some((turn) => turn.id === state.pendingTurn?.id)) {
-        state.turns.push({ id: `result-before-${turnId}`, result: state.result, summary: state.summary });
-      }
-      // Ticket context and cursor intent are durable before any external effect.
-      state.terminal = false;
-      state.deferredUpdates = []; state.deferredFields = [];
-      save();
+        // Ticket context and cursor intent are durable before any external effect.
+        state.terminal = false;
+        state.deferredUpdates = []; state.deferredFields = [];
+        save();
       }
     }
 
@@ -413,7 +418,10 @@ export async function runTicketHandoff(args: {
       }
       if (!turn.statusIds[turn.statusKeys.started]) await publish(turn, 'started', `Agent follow-up started (${turn.statusMode}).`);
       if (!turn.dispatched) {
-        const response = await dispatch({ handoffId: jobId, sessionId: turn.sessionId, bootstrap: TICKET_AGENT_SYSTEM_PROMPT,
+        const bootstrap = turn.operatorRetry
+          ? `${TICKET_AGENT_SYSTEM_PROMPT}\nThis is an explicit operator retry after local runner/tooling remediation. Preserve the original exact acceptance criteria and continue this persisted conversation. If OpenCode edit/patch tools are denied, use the isolated shell tool with the host worktree as its workdir and repository-relative paths inside shell commands.`
+          : TICKET_AGENT_SYSTEM_PROMPT;
+        const response = await dispatch({ handoffId: jobId, sessionId: turn.sessionId, bootstrap,
           message: turn.message, continueCompleted: true, turnId: turn.id });
          if (!response || response.sessionId !== turn.sessionId || !validateResult(response.result, project)) throw new Error('invalid update dispatch result');
         turn.result = response.result; turn.dispatched = true;
