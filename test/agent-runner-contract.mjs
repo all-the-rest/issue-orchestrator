@@ -34,7 +34,7 @@ class MemoryReferenceRunner {
   name = 'memory-reference';
   sessions = new Map();
   async createSession(args) {
-    assert.ok(['triage', 'builder', 'verifier', 'reviewer'].includes(args.role));
+    assert.ok(['triage', 'builder', 'ticket-agent', 'verifier', 'reviewer'].includes(args.role));
     const session = { runner: this.name, externalSessionId: `memory-${this.sessions.size + 1}`,
       jobId: args.jobId, role: args.role, model: args.model, worktree: args.worktree,
       status: 'CREATED', startedAt: new Date().toISOString(), endedAt: null };

@@ -1,52 +1,96 @@
-# V1 ticket-to-agent boundary
+# V1 ticket-agent boundary
 
-**Decision:** Keep the V1 tool focused on structured GitHub ticket intake and
-agent handoff. This decision is tracked by
-[issue #53](https://github.com/all-the-rest/issue-orchestrator/issues/53).
+**Decision:** Treat the V1 ticket path as a trusted GitHub-event router that
+assigns each issue and its pull-request follow-ups to one persistent OpenCode
+chat. Scope and acceptance are tracked in
+[issues #61–#64](https://github.com/all-the-rest/issue-orchestrator/issues/61).
 
 ## Responsibilities
 
-- The provider-facing V1 port reads/selects GitHub issues and their comments or
-  updates. The existing AgentRunner boundary starts the configured agent.
-- Project configuration selects the agent/CLI integration. This tool does not
-  add separate CI-observer or source-code provider ports for V1.
-- The selected agent/project integration owns repository edits, PR lifecycle, CI
-  observation, and merge. The bridge must not claim it checked CI or authorized
-  a merge.
-- GitHub is the only V1 tracker. Jira, GitLab, remote runners, and optional event
-  ingress are outside this release.
+- The router selects routing metadata, filters authors, persists ticket-to-chat
+  identity and provider cursors, deduplicates events, then forwards stable IDs
+  and GitHub URLs. It does not include copied issue/comment bodies or write
+  source, commit, push, create/update PRs, post status/question comments, or
+  claim it observed CI or merge state.
+- Only configured `trusted_authors` can start or resume a ticket chat. The
+  authenticated bot and configured tool accounts are ignored. Missing trusted
+  author configuration fails closed.
+- The agent reads the issue, comments, PR and review context itself through the
+  existing `gh` login. It owns repository edits, commits, pushes, PRs, comments,
+  and linked follow-up issues when scope expands.
+- Each ticket uses its own persistent detached Git worktree inside the runtime
+  container so separate chats do not share a checkout; the agent creates and
+  publishes its own branch.
+- Ticket agents run directly in the existing `code-dev` container. This
+  container is the isolation boundary; no nested OCI builder sandbox or Docker
+  host socket is added. Only the ticket-agent role receives a private copy of
+  the configured GitHub CLI auth, narrowed to the `github.com` host block, and a
+  private Git credential helper.
+- A ticket agent may delegate bounded implementation work to the dedicated
+  `build-worker` subagent. It uses the ticket session's configured model and
+  cannot launch further subagents. The worker is **not** a separate security
+  sandbox: it runs in the same worktree and container and shares the parent's
+  trusted shell, network, `gh`, and Git credential authority. Shell permission
+  patterns and result-file edit rules are defense in depth, not isolation, and
+  an instruction not to publish is not an enforced boundary. Delegate only work
+  the parent could perform itself.
+- The OpenCode `question` tool remains denied on the ticket agent and on every
+  delegated subagent. If blocked on a decision, the agent posts one concrete
+  question as a GitHub comment and stops. A trusted reply resumes the same
+  persistent chat.
+- The legacy `run --once` OCI-isolated builder and its gates remain unchanged.
 
-## Conversation and ticket updates
+## Events and conversation
 
-Start each agent conversation with a minimal, stable system prompt explaining
-the agent's role, the structured ticket/goal input, how later ticket updates are
-delivered, and the structured-result contract. Keep workflow prose out of that
-prompt. Issue bodies, comments, updates, and final acceptance criteria are
-separate structured, untrusted data, never executable authority.
+`tickets poll` discovers open issues authored by configured trusted authors in
+enabled repositories. Later trusted ticket comments and trusted conversation,
+inline-review, and submitted-review activity on the PR reported by that ticket
+agent resume the same chat. PR association comes from agent-reported structured
+references or GitHub association data, never from ticket text alone. Event
+payloads contain the repository, issue/PR/comment identities, event kind and
+URLs; the agent fetches full context itself.
 
-Auto-implement mode is indicated by a configured GitHub issue label, not a title
-prefix. Initial and terminal status comments identify the selected mode. Ignore
-comments authored by the orchestrator/agent when building later agent inputs so
-the tool cannot trigger itself in a loop. New human issue comments are delivered
-as structured follow-up messages. V1 does not poll PR review comments directly;
-review feedback copied into the ticket thread can trigger a follow-up turn.
+Configure `tickets.bootstrap` as the ordered list of turns. Its length is the
+message count, and the same sequence is used for new and update turns in the
+same session. The default first turn reads the issue, project guidance and
+build-verify instructions, then reports a plan. The second implements, verifies,
+and publishes the work through the agent's GitHub login. If scope expands, the
+agent creates a linked follow-up issue and manages related-ticket state rather
+than silently expanding scope.
 
-`/goal` supplies the final acceptance criteria for the ticket. Persist the exact
-goal with the job and reuse it across retries/recovery rather than silently
-substituting newer issue text.
+Follow-up event bursts are coalesced per issue for `tickets.quiet_period_ms`
+(default 60 seconds). The durable batch records each distinct event identity,
+its cursor, and the deadline; a new event on the same issue extends the
+deadline. A batch is delivered only after the deadline and while one of
+`tickets.max_concurrency` global session slots is free. The cap value is
+persisted and enforced in SQLite across overlapping pollers and survives
+restarts; a poller with a conflicting cap fails closed. Distinct issues can run
+in parallel, but a busy session never causes two runs of the same issue chat,
+including GitHub project spelling aliases. Session ownership is a
+heartbeat-renewed durable lease with owner-CAS writes, not PID identity alone,
+so a look-alike PID in another container cannot steal it. Capacity pressure
+defers the batch without dropping or truncating events.
 
-## Merge and security boundary
+Delivery is at-least-once: event identity, cursor and deadline are committed
+before dispatch, but a crash after the agent starts and before its result is
+persisted can replay that turn. Handoff/turn identities support recovery;
+agent-side external effects must be idempotent.
 
-Autonomous merge is the default agent/project policy after required CI passes;
-manual merge remains an explicit opt-out. The project/provider integration is
-the enforcement boundary: protected branches and required status checks must
-encode every merge hard-deny and provide no agent bypass. Manual mode must be
-enforced by provider permissions or an equivalent control, not prompt wording
-alone. The bridge still gates trusted ticket dispatch, treats all ticket content
-as untrusted, and never puts credentials in agent payloads.
+PR association fails closed without failing an otherwise valid turn. Multiple
+agent-reported PR references for one issue are not associated, and a transient
+verification failure or a replacement PR while the previous association is
+still open defers association until a later poll. Issue events still complete
+their turn; the router never silently switches the polled PR conversation.
 
-## Runtime distinction
+`goal --goal-file` remains a manual entry point to the same persistent ticket
+chat. Its optional private operator acceptance criteria are separate from
+GitHub event data; issue and comment bodies are still read by the agent.
 
-`goal` is the V1 entry point and follows the bridge boundary above. The older
-`run --once` workflow remains separate for compatibility; it retains its
-CLI-owned source, CI, evidence, and merge gates and is not called by `/goal`.
+## Security and recovery
+
+The ticket-agent runner validates ownership and mode on the copied `gh` auth
+configuration, keeps it in private per-session XDG storage, and sets a private
+per-session Git credential helper. It never passes host `HOME` or mutates host
+Git/GitHub configuration. Missing or unsafe auth fails closed. Session identity,
+event cursors, bootstrap progress, and pending turns survive restart; concurrent
+polls cannot dispatch the same ticket twice.

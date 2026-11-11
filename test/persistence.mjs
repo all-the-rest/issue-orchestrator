@@ -68,6 +68,43 @@ function runResumeWorker(db, configFile) {
   });
 }
 
+function runTicketSlotWorker(db, id) {
+  const code = `
+    import { SQLiteStore } from ${JSON.stringify(SOURCE)};
+    const store = new SQLiteStore(process.env.TEST_DB);
+    const claim = store.tryClaimTicketHandoff(process.env.TEST_ID, 'slot-child', { maxConcurrency: 1 });
+    console.log(JSON.stringify(claim));
+    if (claim.acquired) await new Promise((resolve) => setTimeout(resolve, 5000));
+    store.close();
+  `;
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ['--input-type=module', '-e', code], {
+      env: { ...process.env, TEST_DB: db, TEST_ID: id },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let out = '';
+    let err = '';
+    let claimed;
+    child.stdout.on('data', (part) => {
+      out += part;
+      const line = out.split(/\r?\n/).find((entry) => entry.trim());
+      if (claimed || !line) return;
+      claimed = JSON.parse(line);
+      resolve({ child, claim: claimed, stderr: () => err });
+    });
+    child.stderr.on('data', (part) => { err += part; });
+    child.on('error', reject);
+    child.on('exit', (exitCode) => {
+      if (!claimed) reject(new Error(`ticket slot worker exited ${exitCode}: ${err}`));
+    });
+  });
+}
+
+function waitForClose(child) {
+  if (child.exitCode !== null) return Promise.resolve();
+  return new Promise((resolve) => child.once('close', resolve));
+}
+
 function runOpen(db) {
   const code = `
     import { SQLiteStore } from ${JSON.stringify(SOURCE)};
@@ -138,13 +175,18 @@ try {
   assert.equal(Number(store.rows('PRAGMA foreign_keys')[0].foreign_keys), 1);
   assert.equal(store.rows('PRAGMA journal_mode')[0].journal_mode, 'wal');
   assert.equal(Number(store.rows('PRAGMA busy_timeout')[0].timeout), 5000);
-  assert.equal(store.rows('SELECT version FROM schema_migrations').length, 9);
+  assert.equal(store.rows('SELECT version FROM schema_migrations').length, 11);
   assert.ok(columns('jobs').has('lease_pid'), 'jobs should record the OS process that owns its lease');
   assert.ok(columns('jobs').has('lease_start_ticks'), 'jobs should record process identity to detect PID reuse');
   assert.ok(tables.has('job_resource_locks') && tables.has('scheduler_global_limit'));
+  for (const column of ['active_lease_until', 'active_heartbeat_at', 'active_namespace']) {
+    assert.ok(columns('ticket_handoffs').has(column), `ticket_handoffs should store ${column}`);
+  }
+  assert.ok(tables.has('ticket_scheduler_global_limit'), 'the global ticket cap must be durable');
+  assert.ok(tables.has('ticket_delivery_state'), 'the global ticket delivery cooldown must be durable');
   store.close();
   store = new SQLiteStore(migrationFile);
-  assert.equal(store.rows('SELECT version FROM schema_migrations').length, 9, 'reopening must not reapply migrations');
+  assert.equal(store.rows('SELECT version FROM schema_migrations').length, 11, 'reopening must not reapply migrations');
   store.close();
   ok('empty database receives all schema migrations with WAL/foreign keys, and restart is idempotent');
 
@@ -192,12 +234,12 @@ try {
     ALTER TABLE jobs DROP COLUMN lease_pid;
     ALTER TABLE jobs DROP COLUMN lease_start_ticks;
     DROP TABLE ticket_handoffs;
-    DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9);
+    DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11);
   `);
   store.close();
   store = new SQLiteStore(upgradeFile);
   assert.equal(store.rows('SELECT workflow_state FROM jobs WHERE id=?', upgradeJob.id)[0].workflow_state, 'EVIDENCE_PUBLISHED');
-  assert.equal(store.rows('SELECT MAX(version) AS version FROM schema_migrations')[0].version, 9);
+  assert.equal(store.rows('SELECT MAX(version) AS version FROM schema_migrations')[0].version, 11);
   store.close();
   ok('v1 jobs retain their workflow meaning when the additive migration is applied');
 
@@ -205,11 +247,11 @@ try {
   fs.mkdirSync(path.dirname(futureSchema), { recursive: true });
   const futureDb = new DatabaseSync(futureSchema);
   futureDb.exec('CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)');
-  futureDb.prepare('INSERT INTO schema_migrations(version, applied_at) VALUES (10, ?)').run(new Date().toISOString());
+  futureDb.prepare('INSERT INTO schema_migrations(version, applied_at) VALUES (12, ?)').run(new Date().toISOString());
   futureDb.close();
   assert.throws(() => new SQLiteStore(futureSchema), /newer than supported version/);
   const stillFutureDb = new DatabaseSync(futureSchema);
-  assert.equal(Number(stillFutureDb.prepare('SELECT MAX(version) AS version FROM schema_migrations').get().version), 10);
+  assert.equal(Number(stillFutureDb.prepare('SELECT MAX(version) AS version FROM schema_migrations').get().version), 12);
   stillFutureDb.close();
   ok('a database with a newer schema version is rejected without being downgraded');
 
@@ -886,7 +928,291 @@ try {
   assert.equal(anchorSession.jobId, anchorJobId);
   assert.equal(ticketAnchor.rows('SELECT state,workflow_state FROM jobs WHERE id=?', anchorJobId)[0].state, 'DONE');
   ticketAnchor.close();
+
+  const aliasAnchor = storeAt('ticket-alias-anchor');
+  const aliasHandoff = 'b'.repeat(64);
+  const aliasJob = aliasAnchor.ensureTicketAgentJob({
+    handoffId: aliasHandoff, project: 'Owner/Repo', issue: 106,
+    configFile: path.join(TMP, 'ticket-config.jsonc'),
+  });
+  const aliasSession = aliasAnchor.createAgentSession({ jobId: aliasJob, externalSessionId: 'alias-ticket-session',
+    role: 'ticket-agent', model: 'test/model', worktree: TMP,
+    ndjsonPath: path.join(TMP, 'alias-events.ndjson'), stderrPath: path.join(TMP, 'alias-stderr.log') });
+  assert.equal(aliasAnchor.ensureTicketAgentJob({ handoffId: aliasHandoff, project: 'owner/repo', issue: 106 }), aliasJob,
+    'a project spelling alias must reuse the existing ticket-agent job anchor');
+  const resumedAlias = aliasAnchor.getAgentSession(aliasSession.externalSessionId);
+  assert.equal(resumedAlias?.jobId, aliasJob, 'the persisted agent session remains resumable by the alias');
+  aliasAnchor.close();
   ok('ticket agent sessions have a stable terminal job anchor without occupying queue capacity');
+
+  const ticketWorkflowStore = storeAt('ticket-workflows');
+  const routeWorkflowHandoff = ticketWorkflowStore.getOrCreateTicketHandoff({
+    id: 'a1'.repeat(32), project: 'owner/repo', issue: 88, goalHash: 'c1'.repeat(32),
+    goal: 'Route GitHub ticket owner/repo#88', state: { terminal: false, workflow: 'route-only' },
+  });
+  assert.throws(() => ticketWorkflowStore.getOrCreateTicketHandoff({
+    id: 'b2'.repeat(32), project: 'owner/repo', issue: 88, goalHash: 'd3'.repeat(32),
+    goal: 'Legacy goal acceptance criteria', state: { terminal: false, workflow: 'goal' },
+  }), /active handoff/, 'goal and route-only handoffs must not coexist on one issue/worktree');
+  ticketWorkflowStore.updateTicketHandoff(routeWorkflowHandoff.id, { terminal: true, workflow: 'route-only' });
+  const legacyGoalHandoff = ticketWorkflowStore.getOrCreateTicketHandoff({
+    id: 'b2'.repeat(32), project: 'owner/repo', issue: 88, goalHash: 'd3'.repeat(32),
+    goal: 'Legacy goal acceptance criteria', state: { terminal: false, workflow: 'goal' },
+  });
+  assert.equal(legacyGoalHandoff.id, 'b2'.repeat(32));
+  const listedHandoffs = ticketWorkflowStore.listTicketHandoffs('OWNER/REPO');
+  assert.deepEqual(listedHandoffs.map((entry) => entry.issue).sort((a, b) => a - b), [88, 88],
+    'closed-issue discovery lists persisted handoffs by case-insensitive project');
+  assert.ok(listedHandoffs.every((entry) => typeof entry.updatedAt === 'string' && entry.updatedAt));
+  assert.deepEqual(ticketWorkflowStore.listTicketHandoffs('other/repo'), []);
+  assert.throws(() => ticketWorkflowStore.listTicketHandoffs('owner/repo', 0), /limit/);
+
+  // Claims also guard the legacy case where two workflow handoffs already exist.
+  const stamp = new Date().toISOString();
+  const insertHandoff = ticketWorkflowStore.db.prepare(`INSERT INTO ticket_handoffs
+    (id,project,issue,goal_hash,goal_json,state_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)`);
+  insertHandoff.run('e4'.repeat(32), 'owner/repo', 89, 'f5'.repeat(32), JSON.stringify('one'),
+    JSON.stringify({ terminal: false, workflow: 'goal' }), stamp, stamp);
+  insertHandoff.run('a6'.repeat(32), 'owner/repo', 89, 'b7'.repeat(32), JSON.stringify('two'),
+    JSON.stringify({ terminal: false, workflow: 'route-only' }), stamp, stamp);
+  assert.equal(ticketWorkflowStore.claimTicketHandoff('e4'.repeat(32), 'owner-one'), true);
+  assert.equal(ticketWorkflowStore.claimTicketHandoff('a6'.repeat(32), 'owner-two'), false,
+    'a concurrent goal and route-only claim on one issue is rejected');
+  ticketWorkflowStore.releaseTicketHandoff('e4'.repeat(32), 'owner-one');
+  assert.equal(ticketWorkflowStore.claimTicketHandoff('a6'.repeat(32), 'owner-two'), true,
+    'the second workflow can claim once the first owner is released');
+  ticketWorkflowStore.releaseTicketHandoff('a6'.repeat(32), 'owner-two');
+  ticketWorkflowStore.close();
+  ok('goal and route-only ticket handoffs cannot overlap on one issue/worktree');
+
+  // Global ticket-session admission is one transaction shared by every poller.
+  const slotStore = storeAt('ticket-session-slots');
+  const slotInsert = slotStore.db.prepare(`INSERT INTO ticket_handoffs
+    (id,project,issue,goal_hash,goal_json,state_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)`);
+  const addSlot = (id, issue, state) => slotInsert.run(id, 'owner/repo', issue, `${id.slice(0, 32)}`,
+    JSON.stringify(`Route GitHub ticket owner/repo#${issue}`), JSON.stringify(state), stamp, stamp);
+  const slotA = 'a1'.repeat(32);
+  const slotB = 'b2'.repeat(32);
+  const slotC = 'c3'.repeat(32);
+  const slotD = 'd4'.repeat(32);
+  for (const [id, issue] of [[slotA, 90], [slotB, 91], [slotC, 92], [slotD, 93]]) {
+    addSlot(id, issue, { terminal: false, workflow: 'route-only' });
+  }
+  const slotPeer = storeAt('ticket-session-slots');
+  assert.equal(slotStore.tryClaimTicketHandoff(slotA, 'slot-owner-a', { maxConcurrency: 2 }).acquired, true);
+  assert.equal(slotPeer.tryClaimTicketHandoff(slotB, 'slot-owner-b', { maxConcurrency: 2 }).acquired, true,
+    'concurrent pollers share one durable admission counter');
+  assert.deepEqual(slotStore.tryClaimTicketHandoff(slotC, 'slot-owner-c', { maxConcurrency: 2 }),
+    { acquired: false, reason: 'CAPACITY', activeCount: 2 },
+    'a third issue is deferred without starting another session');
+  slotStore.releaseTicketHandoff(slotA, 'slot-owner-a');
+  assert.equal(slotStore.tryClaimTicketHandoff(slotC, 'slot-owner-c', { maxConcurrency: 2 }).acquired, true,
+    'releasing a live session admits the next issue');
+
+  // A durable pending batch owns its issue across workflow keys even while no
+  // worker is executing it. This prevents goal and route-only chats from racing.
+  slotStore.releaseTicketHandoff(slotB, 'slot-owner-b');
+  slotStore.releaseTicketHandoff(slotC, 'slot-owner-c');
+  slotStore.updateTicketHandoff(slotC, {
+    terminal: true, workflow: 'route-only', quietUntil: Date.now() + 60_000,
+    deferredUpdates: [{ id: '1', author: 'human', body: 'pending', createdAt: '2026-03-01', source: 'ticket' }],
+    deferredFields: [],
+  });
+  const slotSameIssue = 'f6'.repeat(32);
+  addSlot(slotSameIssue, 92, { terminal: true, workflow: 'goal' });
+  assert.deepEqual(slotStore.tryClaimTicketHandoff(slotSameIssue, 'slot-owner-same', { maxConcurrency: 1 }),
+    { acquired: false, reason: 'BUSY' },
+    'a pending quiet-period batch blocks another workflow on the same issue');
+  slotStore.updateTicketHandoff(slotC, { terminal: true, workflow: 'route-only', quietUntil: null,
+    deferredUpdates: [], deferredFields: [] });
+  assert.equal(slotStore.tryClaimTicketHandoff(slotSameIssue, 'slot-owner-same', { maxConcurrency: 1 }).acquired, true);
+  slotStore.releaseTicketHandoff(slotSameIssue, 'slot-owner-same');
+  assert.equal(slotStore.tryClaimTicketHandoff(slotD, 'slot-owner-d', { maxConcurrency: 1 }).acquired, true);
+  slotStore.releaseTicketHandoff(slotD, 'slot-owner-d');
+
+  // A worker killed after claiming must not leak a slot forever.
+  slotStore.db.prepare('UPDATE ticket_handoffs SET active_owner=?,active_pid=?,active_start_ticks=? WHERE id=?')
+    .run('dead-owner', 99_999_999, null, slotA);
+  const slotE = 'e5'.repeat(32);
+  addSlot(slotE, 94, { terminal: false, workflow: 'route-only' });
+  assert.equal(slotStore.tryClaimTicketHandoff(slotE, 'slot-owner-e', { maxConcurrency: 1 }).acquired, true,
+    'dead owners are reclaimed so restart recovery can admit new work');
+  slotStore.releaseTicketHandoff(slotE, 'slot-owner-e');
+
+  // Real processes: a child poller holds the slot while the parent is refused.
+  const slotF = 'f7'.repeat(32);
+  addSlot(slotF, 95, { terminal: false, workflow: 'route-only' });
+  const worker = await runTicketSlotWorker(path.join(TMP, 'ticket-session-slots', 'orchestrator.sqlite3'), slotE);
+  assert.equal(worker.claim.acquired, true);
+  assert.deepEqual(slotStore.tryClaimTicketHandoff(slotF, 'slot-owner-parent', { maxConcurrency: 1 }),
+    { acquired: false, reason: 'CAPACITY', activeCount: 1 },
+    'a live worker in another process occupies the global session slot');
+  worker.child.kill('SIGTERM');
+  await waitForClose(worker.child);
+  assert.equal(slotStore.tryClaimTicketHandoff(slotF, 'slot-owner-parent', { maxConcurrency: 1 }).acquired, true,
+    'a crashed or stopped worker no longer occupies the slot');
+  slotStore.releaseTicketHandoff(slotF, 'slot-owner-parent');
+
+  // Leases, not PIDs alone, authorize ownership. A look-alike PID in a foreign
+  // namespace cannot steal a valid lease, and an expired lease is reclaimable.
+  const leaseId = 'aa'.repeat(32);
+  addSlot(leaseId, 96, { terminal: false, workflow: 'route-only' });
+  assert.equal(slotStore.tryClaimTicketHandoff(leaseId, 'lease-owner', { leaseMs: 60_000 }).acquired, true);
+  slotStore.db.prepare('UPDATE ticket_handoffs SET active_namespace=?,active_pid=?,active_lease_until=? WHERE id=?')
+    .run('pid:foreign-namespace', process.pid, new Date(Date.now() + 60_000).toISOString(), leaseId);
+  assert.deepEqual(slotStore.tryClaimTicketHandoff(leaseId, 'lookalike-owner', { leaseMs: 60_000 }),
+    { acquired: false, reason: 'BUSY' },
+    'a look-alike PID in another namespace cannot steal a live lease');
+  assert.equal(slotStore.heartbeatTicketHandoff(leaseId, 'lease-owner', 60_000), true);
+  assert.equal(slotStore.heartbeatTicketHandoff(leaseId, 'wrong-owner', 60_000), false,
+    'only the current owner can renew a lease');
+  slotStore.db.prepare('UPDATE ticket_handoffs SET active_lease_until=? WHERE id=?')
+    .run(new Date(Date.now() - 1_000).toISOString(), leaseId);
+  assert.equal(slotStore.tryClaimTicketHandoff(leaseId, 'expired-owner', { leaseMs: 60_000 }).acquired, true,
+    'an expired durable lease is reclaimable even when the old PID number is alive');
+  assert.throws(() => slotStore.updateTicketHandoff(leaseId, { terminal: true }, 'stale-owner-write'),
+    /ownership was lost/, 'owner-CAS prevents a stale worker from overwriting newer state');
+
+  // GitHub project case aliases share one issue/worktree.
+  const aliasA = 'a8'.repeat(32);
+  const aliasB = 'b9'.repeat(32);
+  const aliasInsert = slotStore.db.prepare(`INSERT INTO ticket_handoffs
+    (id,project,issue,goal_hash,goal_json,state_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)`);
+  aliasInsert.run(aliasA, 'Owner/Repo', 97, '18'.repeat(32), JSON.stringify('one'),
+    JSON.stringify({ terminal: true, workflow: 'goal' }), stamp, stamp);
+  aliasInsert.run(aliasB, 'owner/repo', 97, '29'.repeat(32), JSON.stringify('two'),
+    JSON.stringify({ terminal: true, workflow: 'route-only' }), stamp, stamp);
+  assert.equal(slotStore.tryClaimTicketHandoff(aliasA, 'alias-owner', { leaseMs: 60_000 }).acquired, true);
+  assert.deepEqual(slotStore.tryClaimTicketHandoff(aliasB, 'alias-other', { leaseMs: 60_000 }),
+    { acquired: false, reason: 'BUSY' },
+    'GitHub project spelling variants cannot run one issue twice');
+  slotStore.releaseTicketHandoff(aliasA, 'alias-owner');
+  slotStore.close();
+  slotPeer.close();
+
+  // Conflicting poller caps are persisted and fail closed while work is active.
+  const capStore = storeAt('ticket-cap-mismatch');
+  const capInsert = capStore.db.prepare(`INSERT INTO ticket_handoffs
+    (id,project,issue,goal_hash,goal_json,state_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)`);
+  const addCap = (id, issue) => capInsert.run(id, 'owner/repo', issue, `${id.slice(0, 32)}`,
+    JSON.stringify(`Route GitHub ticket owner/repo#${issue}`), JSON.stringify({ terminal: false, workflow: 'route-only' }),
+    stamp, stamp);
+  const capA = 'c1'.repeat(32);
+  const capB = 'd2'.repeat(32);
+  const capC = 'e3'.repeat(32);
+  addCap(capA, 101);
+  addCap(capB, 102);
+  addCap(capC, 103);
+  assert.equal(capStore.tryClaimTicketHandoff(capA, 'cap-owner-a', { maxConcurrency: 1 }).acquired, true);
+  assert.deepEqual(capStore.tryClaimTicketHandoff(capB, 'cap-owner-b', { maxConcurrency: 2 }),
+    { acquired: false, reason: 'CONFIG_MISMATCH', activeCount: 1 },
+    'a poller cannot silently use a different cap while another session is active');
+  capStore.releaseTicketHandoff(capA, 'cap-owner-a');
+  assert.equal(capStore.tryClaimTicketHandoff(capB, 'cap-owner-b', { maxConcurrency: 2 }).acquired, true,
+    'a quiescent database may adopt the newly configured cap');
+  assert.deepEqual(capStore.tryClaimTicketHandoff(capC, 'cap-owner-c', { maxConcurrency: 1 }),
+    { acquired: false, reason: 'CONFIG_MISMATCH', activeCount: 1 });
+  capStore.releaseTicketHandoff(capB, 'cap-owner-b');
+  assert.equal(capStore.tryClaimTicketHandoff(capC, 'cap-owner-c', { maxConcurrency: 1 }).acquired, true);
+  capStore.releaseTicketHandoff(capC, 'cap-owner-c');
+
+  // Intake observation locks are a separate claim kind and never consume a
+  // global session slot, but they still own their issue against dispatch.
+  const intakeA = 'a4'.repeat(32);
+  const sessionB = 'b5'.repeat(32);
+  addCap(intakeA, 104);
+  addCap(sessionB, 105);
+  assert.equal(capStore.tryClaimTicketHandoff(intakeA, 'intake-owner', { kind: 'intake' }).acquired, true);
+  assert.equal(capStore.tryClaimTicketHandoff(sessionB, 'session-owner', { maxConcurrency: 1 }).acquired, true,
+    'an intake claim does not consume the global session slot');
+  assert.deepEqual(capStore.tryClaimTicketHandoff(intakeA, 'session-other', { maxConcurrency: 1 }),
+    { acquired: false, reason: 'BUSY' },
+    'an intake lock still protects its issue from a concurrent agent session');
+  capStore.releaseTicketHandoff(sessionB, 'session-owner');
+  capStore.releaseTicketHandoff(intakeA, 'intake-owner');
+  capStore.close();
+  ok('ticket session admission is atomic, DB-wide, lease-based, alias-safe and restart-safe');
+
+  // The global delivery cooldown is start-to-start, durable, and enforced in
+  // one SQLite transaction so competing pollers cannot both start a turn.
+  const deliveryPath = path.join(TMP, 'ticket-delivery', 'orchestrator.sqlite3');
+  let deliveryStore = new SQLiteStore(deliveryPath);
+  assert.equal(deliveryStore.readTicketDispatchStart(60_000), null);
+  assert.deepEqual(deliveryStore.claimTicketDispatchStart({ cooldownMs: 60_000, now: 1_000_000 }),
+    { acquired: true, lastStartedAt: 1_000_000, nextAllowedAt: null });
+  assert.deepEqual(deliveryStore.claimTicketDispatchStart({ cooldownMs: 60_000, now: 1_059_999 }),
+    { acquired: false, lastStartedAt: 1_000_000, nextAllowedAt: 1_060_000 });
+  assert.equal(deliveryStore.readTicketDispatchStart(60_000), 1_000_000);
+  assert.deepEqual(deliveryStore.claimTicketDispatchStart({ cooldownMs: 60_000, now: 1_060_000 }),
+    { acquired: true, lastStartedAt: 1_060_000, nextAllowedAt: null },
+    'the cooldown boundary is inclusive for the next start');
+  assert.throws(() => deliveryStore.readTicketDispatchStart(30_000), /must be identical/,
+    'a poller with a different cooldown fails closed');
+  assert.throws(() => deliveryStore.claimTicketDispatchStart({ cooldownMs: 30_000, now: 1_060_001 }),
+    /must be identical/);
+
+  // There is no refund path: an ambiguous dispatch failure conservatively
+  // keeps the claim, so the next start still waits for the full interval.
+  assert.equal(deliveryStore.readTicketDispatchStart(60_000), 1_060_000,
+    'a failed launch keeps its cooldown claim');
+  assert.deepEqual(deliveryStore.claimTicketDispatchStart({ cooldownMs: 60_000, now: 1_090_000 }),
+    { acquired: false, lastStartedAt: 1_060_000, nextAllowedAt: 1_120_000 },
+    'another issue cannot start early after a failed launch');
+
+  // Changing the cooldown is an explicit transition: the anchor is preserved,
+  // the new value applies to it immediately, and another live ticket lease must
+  // be stopped first.
+  const reconfigured = deliveryStore.reconfigureTicketDelivery({ cooldownMs: 120_000 });
+  assert.deepEqual(reconfigured, {
+    changed: true, previousCooldownMs: 60_000, cooldownMs: 120_000, lastStartedAt: 1_060_000,
+    nextAllowedAt: 1_180_000,
+  }, 'reconfiguration keeps the global last-start anchor and reports the new boundary');
+  assert.deepEqual(deliveryStore.claimTicketDispatchStart({ cooldownMs: 120_000, now: 1_100_000 }),
+    { acquired: false, lastStartedAt: 1_060_000, nextAllowedAt: 1_180_000 },
+    'the longer reconfigured cooldown applies from the existing anchor');
+  assert.equal(deliveryStore.claimTicketDispatchStart({ cooldownMs: 120_000, now: 1_180_000 }).acquired, true);
+  const lowered = deliveryStore.reconfigureTicketDelivery({ cooldownMs: 30_000 });
+  assert.equal(lowered.nextAllowedAt, 1_210_000,
+    'lowering the cooldown keeps the anchor but applies the new interval immediately');
+  assert.equal(deliveryStore.claimTicketDispatchStart({ cooldownMs: 30_000, now: 1_210_000 }).acquired, true,
+    'the lowered boundary is eligible as soon as the new interval has elapsed');
+  deliveryStore.close();
+  deliveryStore = new SQLiteStore(deliveryPath);
+  assert.equal(deliveryStore.readTicketDispatchStart(30_000), 1_210_000,
+    'the cooldown anchor survives a restart');
+  deliveryStore.close();
+
+  const reconfigurePath = path.join(TMP, 'ticket-delivery-reconfigure', 'orchestrator.sqlite3');
+  const reconfigureStore = new SQLiteStore(reconfigurePath);
+  reconfigureStore.getOrCreateTicketHandoff({ id: '7a'.repeat(32), project: 'owner/repo', issue: 106,
+    goalHash: '8b'.repeat(32), goal: 'Route GitHub ticket owner/repo#106',
+    state: { terminal: false, workflow: 'route-only' } });
+  assert.equal(reconfigureStore.tryClaimTicketHandoff('7a'.repeat(32), 'reconfigure-owner').acquired, true);
+  assert.throws(() => reconfigureStore.reconfigureTicketDelivery({ cooldownMs: 60_000 }),
+    /active ticket session and intake claim to stop/,
+    'a live ticket lease blocks a cooldown transition');
+  reconfigureStore.releaseTicketHandoff('7a'.repeat(32), 'reconfigure-owner');
+  const quiescent = reconfigureStore.reconfigureTicketDelivery({ cooldownMs: 60_000 });
+  assert.equal(quiescent.changed, true);
+  assert.equal(quiescent.lastStartedAt, null);
+  reconfigureStore.close();
+
+  const zeroPath = path.join(TMP, 'ticket-delivery-zero', 'orchestrator.sqlite3');
+  const zeroStore = new SQLiteStore(zeroPath);
+  assert.equal(zeroStore.claimTicketDispatchStart({ cooldownMs: 0, now: 2_000_000 }).acquired, true);
+  assert.equal(zeroStore.claimTicketDispatchStart({ cooldownMs: 0, now: 2_000_000 }).acquired, true,
+    'cooldown 0 is disabled and admits every turn');
+  zeroStore.close();
+
+  const peerPath = path.join(TMP, 'ticket-delivery-peer', 'orchestrator.sqlite3');
+  const peerA = new SQLiteStore(peerPath);
+  const peerB = new SQLiteStore(peerPath);
+  assert.equal(peerA.claimTicketDispatchStart({ cooldownMs: 60_000, now: 3_000_000 }).acquired, true);
+  assert.equal(peerB.claimTicketDispatchStart({ cooldownMs: 60_000, now: 3_000_000 }).acquired, false,
+    'two pollers sharing the database cannot both start at the same instant');
+  peerA.close();
+  peerB.close();
+  ok('ticket delivery cooldown is durable, transactional across pollers, restart-safe, conservatively consumed on failure, explicitly reconfigurable and config-matched');
 
   console.log(`\n${passed} persistence checks passed`);
 } finally {

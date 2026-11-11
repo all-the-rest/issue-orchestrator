@@ -1,30 +1,29 @@
 # issue-orchestrator
 
-GitHub-only issue-to-agent handoff. The orchestrator persists the configured
-ticket, human comments/updates, and exact operator-supplied final acceptance
-criteria as structured data; the selected project agent integration owns source
-changes, pull requests, CI, and merge.
+GitHub-only trusted-event router. The orchestrator filters configured authors,
+persists issue-to-chat identity and event cursors, and forwards event IDs/URLs;
+the ticket agent reads GitHub context itself and owns source changes, commits,
+pushes, pull requests, comments, and follow-up issues.
 
 OpenCode is the first intended agent backend, not a dependency of the core.
 
-> **Status:** early `v0.1`. V1 accepts GitHub issues only. Each issue stays
-> human-directed unless it has the configured `agent:auto-implement` label;
-> titles are never rewritten. The selected project agent owns execution and
-> provider permissions enforce any manual-merge restriction.
+> **Status:** early `v0.1`. V1 routes GitHub issue and PR activity only.
+> `trusted_authors` is a required allowlist for event routing; bot-authored and
+> non-trusted activity is ignored. Provider permissions enforce merge limits.
 
 ## Requirements
 
 - Node.js 24 or newer
 - pnpm 11.23.0 (`packageManager` is pinned in `package.json`)
-- `gh` authenticated to GitHub and able to read the configured repository's issues and write issue comments
-- the agent integration selected for the project; the built-in OpenCode runner also requires OpenCode CLI 2.2.6 and Docker or Podman with `issue-orchestrator-builder:node24-pnpm11.23.0` preloaded
+- `gh` authenticated to GitHub with the configured bot identity and permissions to read issues/PRs and perform the agent's intended GitHub work
+- OpenCode CLI 2.2.6 for ticket-agent sessions; the agent runs directly in the existing Docker container with a private per-session copy of the configured `gh` auth, narrowed to the `github.com` host. The retained legacy `run --once` builder additionally requires the preloaded `issue-orchestrator-builder:node24-pnpm11.23.0` image
 - `git` for source checkouts and the built-in OpenCode runner
 
 V1 ticket intake is GitHub-only. GitLab/Jira adapters are not V1 providers.
 The `command` AgentRunner is for a trusted installed executable implementing
 the protocol in [`docs/providers.md`](docs/providers.md); it is supported on
-Linux and macOS. Neither runner selection nor `/goal` installs or publishes an
-agent or CLI.
+Linux and macOS. Neither runner selection nor the `goal` command installs or
+publishes an agent or CLI.
 
 ## Source-checkout quick start
 
@@ -35,6 +34,7 @@ pnpm install --frozen-lockfile
 pnpm test
 pnpm build
 node dist/cli.js --help
+node dist/cli.js setup --print
 gh auth login --hostname github.com
 gh auth status --hostname github.com
 ```
@@ -56,21 +56,20 @@ ${EDITOR:-vi} "$HOME/.config/issue-orchestrator/config.jsonc"
 ```
 
 The configured `account` must match `gh auth status`; the account needs access
-to read issues and post issue comments. The example selects the built-in
-`opencode` runner. Configure its model-provider auth separately and meet its
-OpenCode/OCI prerequisites above. To use another project integration, select
-`agent_runner: "command"` and configure a trusted executable and argv; see the
-versioned protocol and credential boundary in
+to the configured project. Ticket-agent sessions require the built-in `opencode`
+runner. Configure model-provider auth separately; only the legacy `run --once`
+builder needs its OCI image. Other workflows may select `agent_runner:
+"command"` and configure a trusted executable and argv; see the protocol in
 [`docs/providers.md`](docs/providers.md#runner-selection). The command runs as
 the current OS user, so provider permissions and its credential setup are the
 operator's responsibility.
 
-Run `/goal` from a checkout of the configured target project: the CLI verifies
-that the current checkout's `origin` matches `--project` and gives that working
-tree to the selected integration. Use a dedicated branch/worktree, since an
-auto-implement agent can modify files there. The orchestrator source checkout
-and target project checkout can be different. For example, after cloning the
-configured target repository:
+Run `issue-orchestrator goal` or `issue-orchestrator tickets poll` from a
+checkout of the configured target project:
+the CLI verifies that the checkout's `origin` matches `--project` and gives
+that workspace to the ticket agent. Use a dedicated checkout/container for
+unattended work. The orchestrator source checkout and target project checkout
+can be different. For example, after cloning the configured target repository:
 
 ```sh
 ORCHESTRATOR_CHECKOUT="$HOME/src/issue-orchestrator"
@@ -85,18 +84,18 @@ node "$ORCHESTRATOR_CHECKOUT/dist/cli.js" goal \
   --goal-file "$goal_file"
 ```
 
-Replace the checkout, project, and issue with values in the config. Without the
-configured `agent:auto-implement` label, the tool records `REVIEW` and starts no
-agent. With the label, it hands the structured ticket and exact criteria to the
-selected runner. `/goal` does not edit source, observe CI, create PRs, or merge;
-the selected project integration owns those tasks. For manual mode, remove merge
-authority from the agent's provider credentials or enforce it with protected
-branch/ruleset policy—`auto_merge: false` and prompt text alone cannot restrict
-an external integration.
+Replace the checkout, project, and issue with values in the config. Ticket
+events are routed only for configured trusted authors. The `goal` command can
+add private operator acceptance criteria, but neither command fetches or copies
+ticket/comment bodies into the event payload. The agent reads issue and PR content itself, makes and
+publishes changes with `gh`, and asks via a GitHub comment if it needs a human
+decision; the router resumes it on a trusted reply. For manual mode, remove
+merge authority from the agent's provider credentials or enforce it with
+protected branch/ruleset policy—prompt text alone cannot restrict the agent.
 
-The runtime database contains private ticket text, acceptance criteria, and
-runner/session metadata. Protect the configured runtime home and use a
-dedicated OS identity and least-privilege credentials. See the
+The runtime database contains event identities/cursors, optional private
+operator acceptance criteria, and runner/session metadata. Protect the runtime
+home and use a dedicated OS identity and least-privilege credentials. See the
 [`threat model`](docs/threat-model.md#v1-ticket-to-agent-boundary) before
 enabling an agent on a real repository.
 
@@ -108,6 +107,7 @@ policy are documented in [`docs/quality-gates.md`](docs/quality-gates.md).
 ```sh
 issue-orchestrator status
 issue-orchestrator doctor --json
+issue-orchestrator setup --print
 issue-orchestrator jobs list --json
 issue-orchestrator jobs show <id> --json
 issue-orchestrator jobs retry <id>
@@ -117,6 +117,10 @@ issue-orchestrator project add <id> --from <existing>
 issue-orchestrator project pause|resume|remove <id>
 issue-orchestrator list
 issue-orchestrator goal --project <owner/repo> --issue <number> --goal-file <private-file|->
+issue-orchestrator tickets poll [--project <owner/repo>] [--dry-run] [--max <n>]
+  [--quiet-period-ms <n>] [--intake-poll-ms <n>] [--max-concurrency <n>]
+  [--delivery-timezone <IANA>] [--delivery-window <spec>] [--delivery-cooldown-ms <n>] [--delivery-24-7]
+  [--delivery-reconfigure]
 issue-orchestrator run --once [--project <owner/repo>] [--dry-run] # legacy workflow
 issue-orchestrator claim <project> <issue>
 issue-orchestrator checkpoint <stage> --owner-token <token>
@@ -137,29 +141,57 @@ and [`docs/threat-model.md`](docs/threat-model.md). A synthetic GitHub-only
 configuration and sample project are in [`examples/`](examples/).
 OpenCode V2 users can load the optional thin wrapper in
 `.opencode/skills/issue-orchestrator/SKILL.md`; the CLI remains the workflow implementation.
-The `/goal` command is a thin wrapper around the dedicated `goal` CLI command.
-Write the exact acceptance text to a private file (mode `0600`), then run
+Run `issue-orchestrator setup --print` for the agent-consumable setup checklist;
+it is static, reads no config, writes nothing, and does not install a skill or
+slash command.
+The project ships no OpenCode `/goal` slash-command override, so OpenCode's
+built-in `/goal` command keeps working unchanged. Use the dedicated
+`issue-orchestrator goal` CLI command instead: optionally write acceptance text
+to a private file (mode `0600`), then run
 `issue-orchestrator goal --project owner/repo --issue 123 --goal-file /private/path`.
-Use `-` to read the goal from stdin. The CLI bounds the input to 32 KiB and
-persists the exact text with the ticket handoff. Recovery must reuse the same
-goal; a different goal cannot replace an active handoff.
+Use `-` to read criteria from stdin. The CLI bounds input to 32 KiB; it is
+forwarded separately from GitHub event identities and bodies are still read by
+the agent.
 `capture` runs argv directly with `shell: false`, tees stdout/stderr to the
 terminal and a new output file, and writes a JSON sidecar with the exact argv and
 exit status; it uses Node streams and does not depend on platform-specific
 `script` flags.
 
-`goal` reads the configured GitHub issue and human comments, filters
-orchestrator-authored updates, and sends the ticket plus the exact final AC to
-the selected agent as structured input separate from its stable system prompt.
-The configured `labels.auto_implement` value (default `agent:auto-implement`)
-is the only opt-in to starting an agent. Without it, the CLI publishes a
-`REVIEW (human-directed)` status and does not create a runner session. Follow-up
-comments or meaningful issue-field/label changes resume the same completed
-agent conversation with a persisted turn identity. Status comments are
-sanitized and idempotent, including retryable failure outcomes.
+`tickets poll` discovers open issues authored by configured `trusted_authors`
+and routes trusted ticket comments plus PR conversation/review events to each
+issue's persistent OpenCode chat. The agent reads full context using `gh`; the
+router sends event IDs and URLs only, posts no status/question comments, and
+does not claim it observed CI. Configure `tickets.bootstrap` to select the
+ordered messages used for both initial and update turns. `tickets.delivery`
+optionally limits automated dispatches to weekly windows in an explicit IANA
+zone and adds a global start-to-start cooldown that gates every bootstrap and
+follow-up dispatch; there is no default window, so without it polling stays
+24/7 with cooldown disabled. A changed cooldown is adopted explicitly with
+`tickets poll --delivery-reconfigure` while no ticket session is active, which
+preserves the last-start anchor but applies the new interval immediately.
+`goal` intentionally bypasses both windows and the cooldown. Outside a window
+only metadata IDs/URLs, author/timestamps and per-category counts are persisted
+and delivered later; event bodies are never fetched for routing.
+The ticket agent may
+delegate bounded implementation work to one `build-worker` subagent; both the
+parent and the delegated worker keep the `question` tool denied. The worker
+shares the ticket agent's worktree, container, network, and GitHub credential
+authority, so it is not a separate sandbox. Question/reply cycles use GitHub
+comments and the same chat.
+Ticket sessions are bounded by the global `tickets.max_concurrency` (default
+`1`) and run in parallel across distinct issues. Follow-up events are grouped
+per issue for `tickets.quiet_period_ms` (default `60000`, `0` disables); the
+durable batch and deadline survive restarts, and capacity pressure defers work
+without losing events. Polling continues intake for other issues and newly
+opened tickets while a long turn runs; the running issue's exclusive lease defers
+its own intake until that turn and its pending turn are delivered, then collects
+from the same durable cursor. Delivery
+is at-least-once, so a crash after dispatch may replay a turn; agent-side effects
+must be idempotent.
 
 `run --once` is retained as a separate legacy orchestration workflow; it is not
-the implementation behind `/goal`. It atomically resumes a claim only after its recorded owner process is
+the implementation behind the `goal` command. It atomically resumes a claim
+only after its recorded owner process is
 no longer live, or selects one open issue from enabled repositories, ordered by
 configured severity and age, and skips issues without a configured trusted
 author. It isolates work in a private runtime Git worktree, runs triage,
@@ -210,7 +242,9 @@ check gates pass. Auto-merge defaults to true for enabled projects; set
 `auto_merge: false` to hand off for human review instead.
 
 For user-level launchd/systemd timers, Docker operation, persistence, and
-shutdown/recovery behavior, see [`docs/service.md`](docs/service.md).
+shutdown/recovery behavior, see [`docs/service.md`](docs/service.md). For a
+separate worker container or supervision inside an existing Docker `code-dev`
+container, see [`deploy/README.md`](deploy/README.md).
 The dispatcher topology and event-delivery idempotency contract are recorded in [`docs/agent-dispatch.md`](docs/agent-dispatch.md).
 For safe OpenCode context transfer between implementation sessions, see
 [`docs/session-handoff.md`](docs/session-handoff.md).

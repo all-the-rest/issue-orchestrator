@@ -2,20 +2,33 @@ services:
   worker:
     build: .
     restart: unless-stopped
+    init: true
+    user: "1000:1000"
     working_dir: /workspace
+    stop_grace_period: 5m
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     environment:
       ISSUE_ORCHESTRATOR_HOME: /var/lib/issue-orchestrator
       ISSUE_ORCHESTRATOR_CONFIG: /home/node/.config/issue-orchestrator/config.jsonc
       ISSUE_ORCHESTRATOR_REPO: /workspace
+      ISSUE_ORCHESTRATOR_MODE: ${ISSUE_ORCHESTRATOR_MODE:-router}
+      ISSUE_ORCHESTRATOR_PROJECT: ${ISSUE_ORCHESTRATOR_PROJECT:-}
+      ISSUE_ORCHESTRATOR_MAX: ${ISSUE_ORCHESTRATOR_MAX:-1000}
       ISSUE_ORCHESTRATOR_INTERVAL_SECONDS: ${ISSUE_ORCHESTRATOR_INTERVAL_SECONDS:-300}
       PATH: /opt/runtime/bin:/usr/local/bin:/usr/bin:/bin
     volumes:
       - orchestrator-home:/var/lib/issue-orchestrator
-      - ./:/workspace:rw
-      - ./config.jsonc:/home/node/.config/issue-orchestrator/config.jsonc:ro
+      - ${ISSUE_ORCHESTRATOR_WORKSPACE:-.}:/workspace:rw
+      - ${ISSUE_ORCHESTRATOR_CONFIG_FILE:-./config.jsonc}:/home/node/.config/issue-orchestrator/config.jsonc:ro
       - ${OPENCODE_CONFIG:?Set OPENCODE_CONFIG to a read-only OpenCode config path}:/home/node/.config/opencode/opencode.jsonc:ro
       - ${OPENCODE_DATA_DIR:?Set OPENCODE_DATA_DIR to the OpenCode data/auth directory}:/home/node/.local/share/opencode:ro
       - ${GH_CONFIG_DIR:?Set GH_CONFIG_DIR to a credential directory}:/home/node/.config/gh:ro
-      - ./runtime-bin:/opt/runtime/bin:ro
+      - ${ISSUE_ORCHESTRATOR_RUNTIME_BIN:-./runtime-bin}:/opt/runtime/bin:ro
 volumes:
   orchestrator-home:

@@ -1,11 +1,19 @@
 import { gh, ghJson } from './gh.js';
 import type { TicketComment, TicketIssue, TicketPort } from './ticket-port.js';
 
-type Driver = { json(args: string[]): unknown; run(args: string[]): unknown };
-const cli: Driver = { json: (args) => ghJson(args), run: (args) => gh(args) };
+type Driver = { json(args: string[]): unknown; run(args: string[]): unknown; raw?(args: string[]): string };
+const cli: Driver = { json: (args) => ghJson(args), run: (args) => gh(args), raw: (args) => gh(args).stdout };
+const issueCommentMetadata = '[.[] | (if type == "array" then .[] else . end) | {id,user,created_at,html_url}]';
+// Only fields that affect routing are requested. Reviews need `state` to skip
+// drafts; path/line are never carried into TicketComment, so they are not
+// fetched at all.
+const reviewMetadata = '[.[] | (if type == "array" then .[] else . end) | {id,user,created_at,submitted_at,html_url,state}]';
 const validProject = (p: string) => {
   if (typeof p !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(p)) throw new Error('project must be owner/repository');
 };
+/** GitHub's maximum page size; smaller defaults multiply request/rate usage. */
+const pagePath = (path: string) => `${path}${path.includes('?') ? '&' : '?'}per_page=100`;
+const MAX_PENDING_REVIEWS = 1_000;
 function record(v: unknown, name: string): Record<string, unknown> {
   if (!v || typeof v !== 'object' || Array.isArray(v)) throw new Error(`Invalid GitHub ${name} response`);
   return v as Record<string, unknown>;
@@ -28,6 +36,24 @@ function requiredString(value: unknown, name: string): string {
   if (typeof value !== 'string') throw new Error(`Invalid GitHub ${name}`);
   return value;
 }
+/** gh prints one jq result per page when --paginate is combined with --jq. */
+function jsonDocuments(text: string, name: string): unknown[] {
+  const values: unknown[] = [];
+  for (const line of text.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    try {
+      values.push(JSON.parse(line));
+    } catch {
+      throw new Error(`Invalid GitHub ${name} response`);
+    }
+  }
+  return values;
+}
+/** Normalize slurped pages, per-page jq documents, and already-flat test fixtures. */
+function responseValues(value: unknown, name: string): unknown[] {
+  if (!Array.isArray(value)) throw new Error(`Invalid GitHub ${name} response`);
+  return value.every(Array.isArray) ? value.flat() : value;
+}
 function nullableString(value: unknown, name: string): string | null {
   return value === null ? null : requiredString(value, name);
 }
@@ -39,12 +65,13 @@ function issueNumber(value: unknown, name: string): number {
   if (typeof value !== 'number' || !Number.isInteger(value) || value < 1) throw new Error(`Invalid GitHub ${name} number`);
   return value;
 }
-function comment(v: unknown): TicketComment {
+function comment(v: unknown, includeBody = true): TicketComment {
   const c = record(v, 'comment');
+  // GitHub reports null for a deleted author account; keep the event identity so
+  // the router can filter it by trusted-author policy instead of replaying it.
   const author = authorLogin(c.user, 'comment');
-  if (author === null) throw new Error('Invalid GitHub comment (stable id, body, author and timestamp required)');
   const id = stableId(c.id, 'comment');
-  const body = requiredString(c.body, 'comment body');
+  const body = includeBody ? requiredString(c.body, 'comment body') : '';
   const createdAt = requiredString(c.created_at, 'comment timestamp');
   return { id: String(id), body, author, createdAt, ...(typeof c.html_url === 'string' ? { url: c.html_url } : {}) };
 }
@@ -64,57 +91,280 @@ function issue(v: unknown): TicketIssue {
     id: String(id), number, title, body,
     author, labels,
     state, url, updatedAt,
-    comments: i.comments.map(comment),
+    comments: i.comments.map((entry) => comment(entry)),
   };
 }
 
 export function createGithubTicketPort(driver: Driver = cli): TicketPort {
-  const comments = (project: string, number: number) => {
-    const v = driver.json(['api', '--paginate', '--slurp', `repos/${project}/issues/${number}/comments`]);
-    if (!Array.isArray(v)) throw new Error('Invalid GitHub comments response');
-    const values = v.every(Array.isArray) ? v.flat() : v;
-    return values.map(comment);
+  const paginated = (path: string, name: string, expression: string) => {
+    // gh rejects --slurp together with --jq; without --slurp it applies the jq
+    // expression to every page and prints one JSON document per page. Ask for
+    // the largest supported page so a busy PR needs fewer requests, which is
+    // the main page/rate-limit safety lever available through the CLI.
+    const args = ['api', '--paginate', '--jq', expression, pagePath(path)];
+    const value = driver.raw ? jsonDocuments(driver.raw(args), name) : driver.json(args);
+    return responseValues(value, name);
+  };
+  const slurped = (path: string, name: string) => {
+    const value = driver.json(['api', '--paginate', '--slurp', pagePath(path)]);
+    return responseValues(value, name);
+  };
+  const comments = (project: string, number: number, includeBody = true) => {
+    const path = `repos/${project}/issues/${number}/comments`;
+    return (includeBody ? slurped(path, 'comments') : paginated(path, 'comments', issueCommentMetadata))
+      .map((value) => comment(value, includeBody));
+  };
+  /** Event ids repeat across GitHub collections; the type prefix keeps them distinct. */
+  const changeComment = (value: unknown, name: string, prefix: string,
+    timestamp: 'created' | 'submitted' = 'created'): TicketComment => {
+    const c = record(value, name);
+    const author = authorLogin(c.user, name);
+    const id = stableId(c.id, name);
+    const createdAt = timestamp === 'submitted'
+      // A review's event time is when it was submitted; created_at is only the
+      // draft start and would reorder late submissions incorrectly.
+      ? (typeof c.submitted_at === 'string' ? c.submitted_at
+        : typeof c.created_at === 'string' ? c.created_at : null)
+      : (typeof c.created_at === 'string' ? c.created_at
+        : typeof c.submitted_at === 'string' ? c.submitted_at : null);
+    if (!createdAt) throw new Error(`Invalid GitHub ${name} timestamp`);
+    return { id: `${prefix}:${String(id)}`, body: '', author, createdAt,
+      ...(typeof c.html_url === 'string' ? { url: c.html_url } : {}) };
+  };
+  const idOf = (c: TicketComment) => {
+    const match = /([0-9]+)$/.exec(c.id);
+    return match ? Number(match[1]) : 0;
   };
   return {
     async select(project, limit = 100) {
       validProject(project);
-      if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new Error('limit must be between 1 and 100');
-      const v = driver.json(['issue', 'list', '--repo', project, '--state', 'open', '--limit', String(limit), '--json', 'id,number,title,body,author,labels,state,url,updatedAt']);
+      if (!Number.isInteger(limit) || limit < 1 || limit > 1000) throw new Error('limit must be between 1 and 1000');
+      const v = driver.json(['issue', 'list', '--repo', project, '--state', 'open', '--limit', String(limit), '--json', 'id,number,author,state,url,updatedAt']);
       if (!Array.isArray(v)) throw new Error('Invalid GitHub issue list response');
       return v.map((x) => {
         const i = record(x, 'issue');
         const id = stableId(i.id, 'issue');
         const number = issueNumber(i.number, 'issue');
-        const title = requiredString(i.title, 'issue title');
-        const body = nullableString(i.body, 'issue body') ?? '';
         const author = authorLogin(i.author, 'issue');
-        const labels = labelNames(i.labels, 'issue');
         const state = requiredString(i.state, 'issue state');
         const url = requiredString(i.url, 'issue URL');
         const updatedAt = nullableString(i.updatedAt, 'issue update timestamp');
         return {
-          id: String(id), number, title, body,
-          author, labels,
+          id: String(id), number, title: '', body: '',
+          author, labels: [],
           state, url, updatedAt, comments: [],
         };
       });
+    },
+    async identity(project, number) {
+      validProject(project);
+      if (!Number.isInteger(number) || number < 1) throw new Error('issue number must be positive');
+      const v = record(driver.json(['issue', 'view', String(number), '--repo', project, '--json', 'number,author,state,url']), 'issue identity');
+      const actualNumber = issueNumber(v.number, 'issue');
+      if (actualNumber !== number) throw new Error('GitHub returned a mismatched issue identity');
+      return {
+        number: actualNumber,
+        author: authorLogin(v.author, 'issue'),
+        state: requiredString(v.state, 'issue state'),
+        url: requiredString(v.url, 'issue URL'),
+      };
     },
     async read(project, number) {
       validProject(project);
       if (!Number.isInteger(number) || number < 1) throw new Error('issue number must be positive');
       const v = record(driver.json(['issue', 'view', String(number), '--repo', project, '--json', 'id,number,title,body,author,labels,state,url,updatedAt']), 'issue');
       const base = issue({ ...v, html_url: v.url, comments: [] });
-      return { ...base, comments: comments(project, number) };
+      return { ...base, comments: comments(project, number, true) };
     },
     async updates(project, number, cursor) {
       validProject(project);
       if (cursor !== null && (typeof cursor !== 'string' || !cursor)) throw new Error('invalid update cursor');
-      const all = comments(project, number);
+      const all = comments(project, number, false);
       if (cursor === null) return { updates: all, nextCursor: all.at(-1)?.id ?? null };
       const at = all.findIndex((c) => c.id === cursor);
-      if (at < 0) throw new Error(`Stored update cursor ${cursor} is absent; refusing to skip updates`);
+      if (at < 0) {
+        // The cursor comment may have been deleted. Issue comment ids increase
+        // monotonically, so numeric ids above the deleted cursor are still
+        // exactly the not-yet-delivered events; never replay older history.
+        if (/^[0-9]+$/.test(cursor)) {
+          const floor = Number(cursor);
+          const updates = all.filter((c) => /^[0-9]+$/.test(c.id) && Number(c.id) > floor);
+          return { updates, nextCursor: updates.at(-1)?.id ?? cursor };
+        }
+        throw new Error(`Stored update cursor ${cursor} is absent; refusing to skip updates`);
+      }
       const updates = all.slice(at + 1);
       return { updates, nextCursor: updates.at(-1)?.id ?? cursor };
+    },
+    async verifyChange(project, number) {
+      validProject(project);
+      if (!Number.isInteger(number) || number < 1) throw new Error('change number must be positive');
+      const v = record(driver.json(['pr', 'view', String(number), '--repo', project, '--json', 'number,state,url']), 'change request');
+      const actualNumber = issueNumber(v.number, 'change request');
+      const state = requiredString(v.state, 'change request state');
+      const url = requiredString(v.url, 'change request URL');
+      if (actualNumber !== number || url.toLocaleLowerCase() !== `https://github.com/${project}/pull/${number}`.toLocaleLowerCase()) {
+        throw new Error('GitHub returned a mismatched change request identity');
+      }
+      return { number: actualNumber, state, url };
+    },
+    async changeUpdates(project, number, cursor) {
+      validProject(project);
+      if (!Number.isInteger(number) || number < 1) throw new Error('change number must be positive');
+      type ChangeCursor = {
+        conversation: number;
+        review: number;
+        reviewComment: number;
+        pendingReviews: number[];
+        /** undefined means a legacy cursor without a submission watermark. */
+        reviewSubmittedAt: string | null | undefined;
+        /** Ids already observed at exactly reviewSubmittedAt, when known. */
+        reviewSubmittedIds: number[];
+        reviewSubmittedIdsKnown: boolean;
+      };
+      const parseCursor = (): ChangeCursor => {
+        if (cursor === null) return {
+          conversation: 0, review: 0, reviewComment: 0, pendingReviews: [], reviewSubmittedAt: undefined,
+          reviewSubmittedIds: [], reviewSubmittedIdsKnown: false,
+        };
+        let value: unknown;
+        try { value = JSON.parse(cursor); } catch { throw new Error('invalid change update cursor'); }
+        const data = record(value, 'change cursor');
+        const part = (key: string) => {
+          const raw = data[key];
+          if (raw === undefined) return 0;
+          if (typeof raw !== 'number' || !Number.isInteger(raw) || raw < 0) throw new Error('invalid change update cursor');
+          return raw;
+        };
+        const idList = (raw: unknown): number[] => {
+          if (raw === undefined) return [];
+          if (!Array.isArray(raw) || raw.length > MAX_PENDING_REVIEWS) {
+            throw new Error('invalid change update cursor');
+          }
+          return raw.map((entry) => {
+            const parsed = typeof entry === 'number' ? entry
+              : typeof entry === 'string' && /^[1-9][0-9]*$/.test(entry) ? Number(entry) : NaN;
+            if (!Number.isSafeInteger(parsed) || parsed < 1) throw new Error('invalid change update cursor');
+            return parsed;
+          });
+        };
+        let reviewSubmittedAt: string | null | undefined;
+        if (data.reviewSubmittedAt === undefined) reviewSubmittedAt = undefined;
+        else if (data.reviewSubmittedAt === null) reviewSubmittedAt = null;
+        else if (typeof data.reviewSubmittedAt === 'string' && Number.isFinite(Date.parse(data.reviewSubmittedAt))) {
+          reviewSubmittedAt = data.reviewSubmittedAt;
+        } else throw new Error('invalid change update cursor');
+        return {
+          conversation: part('conversation'), review: part('review'), reviewComment: part('reviewComment'),
+          pendingReviews: idList(data.pendingReviews), reviewSubmittedAt,
+          reviewSubmittedIds: idList(data.reviewSubmittedIds),
+          reviewSubmittedIdsKnown: data.reviewSubmittedIds !== undefined,
+        };
+      };
+      const last = parseCursor();
+      const after = (list: TicketComment[], floor: number) => list.filter((c) => idOf(c) > floor);
+      const conversation = after(paginated(`repos/${project}/issues/${number}/comments`, 'change comments',
+        issueCommentMetadata).map((v) => changeComment(v, 'change comment', 'issue-comment')), last.conversation);
+      const reviewComment = after(paginated(`repos/${project}/pulls/${number}/comments`, 'review comments',
+        reviewMetadata).map((v) => changeComment(v, 'review comment', 'review-comment')), last.reviewComment);
+
+      // Review ids increase with creation order, but a draft review created
+      // before later submitted reviews can be submitted afterwards. Track the
+      // pending ids and a submitted_at watermark so a late submission whose id
+      // is below the numeric floor is still delivered exactly once.
+      const pendingIds = new Set<number>(last.pendingReviews);
+      const submittedReviews: Array<{ id: number; at: number; value: unknown }> = [];
+      let maximumReviewId = last.review;
+      let maximumSubmittedAt: string | null = null;
+      let maximumSubmittedMs: number | null = null;
+      for (const value of paginated(`repos/${project}/pulls/${number}/reviews`, 'reviews', reviewMetadata)) {
+        const row = record(value, 'review');
+        const rawId = stableId(row.id, 'review');
+        const id = Number(rawId);
+        if (!Number.isSafeInteger(id) || id < 1) throw new Error('Invalid GitHub review id');
+        maximumReviewId = Math.max(maximumReviewId, id);
+        const submittedAt = typeof row.submitted_at === 'string' ? row.submitted_at : null;
+        if (row.state === 'PENDING' || !submittedAt) {
+          pendingIds.add(id);
+          continue;
+        }
+        const at = Date.parse(submittedAt);
+        if (!Number.isFinite(at)) throw new Error('Invalid GitHub review timestamp');
+        submittedReviews.push({ id, at, value });
+        if (maximumSubmittedMs === null || at > maximumSubmittedMs) {
+          maximumSubmittedMs = at;
+          maximumSubmittedAt = submittedAt;
+        }
+      }
+      // Drop pending ids that are now submitted; keep any still unseen so a
+      // transiently missing page cannot permanently lose a late submission.
+      for (const review of submittedReviews) pendingIds.delete(review.id);
+      if (pendingIds.size > MAX_PENDING_REVIEWS) {
+        // Fail closed instead of silently dropping a tracked pending review.
+        throw new Error('too many pending GitHub reviews to track safely');
+      }
+      // Legacy cursors carry no watermark. Their numeric floor cannot reveal
+      // which lower-id draft reviews were skipped while pending, so replay
+      // submitted reviews once on upgrade; the new cursor prevents repeats.
+      const legacyCursor = last.reviewSubmittedAt === undefined;
+      const previousBoundary = new Set(last.reviewSubmittedIds);
+      const watermarkKnown = !legacyCursor && last.reviewSubmittedAt !== null;
+      const watermarkMs = watermarkKnown ? Date.parse(last.reviewSubmittedAt as string) : null;
+      const previousPending = new Set(last.pendingReviews);
+      const review = submittedReviews
+        .filter((entry) => {
+          if (!watermarkKnown) return true; // one-time replay with no baseline
+          if (entry.id > last.review || previousPending.has(entry.id)) return true;
+          if (entry.at > watermarkMs!) return true;
+          // A review submitted in the same second as the watermark is only
+          // already seen if its id is recorded at that boundary. If boundary
+          // ids are not known (cursor from an intermediate version), replay
+          // this second once rather than silently skipping an unseen review.
+          if (entry.at === watermarkMs) {
+            return !last.reviewSubmittedIdsKnown || !previousBoundary.has(entry.id);
+          }
+          return false;
+        })
+        .sort((a, b) => a.at - b.at || a.id - b.id)
+        .map((entry) => changeComment(entry.value, 'review', 'review', 'submitted'));
+
+      const updates = [...conversation, ...reviewComment, ...review]
+        .sort((a, b) => {
+          const byTime = a.createdAt.localeCompare(b.createdAt);
+          if (byTime) return byTime;
+          const left = idOf(a);
+          const right = idOf(b);
+          return left !== right ? left - right : a.id.localeCompare(b.id);
+        });
+      let nextWatermark = last.reviewSubmittedAt !== undefined ? last.reviewSubmittedAt : null;
+      if (maximumSubmittedAt &&
+          (nextWatermark === null || Date.parse(maximumSubmittedAt) > Date.parse(nextWatermark))) {
+        nextWatermark = maximumSubmittedAt;
+      }
+      const nextWatermarkMs = nextWatermark === null ? null : Date.parse(nextWatermark);
+      let nextSubmittedIds: number[] = [];
+      if (nextWatermarkMs !== null) {
+        const atBoundary = submittedReviews.filter((entry) => entry.at === nextWatermarkMs).map((entry) => entry.id);
+        // Keep already-known ids at an unchanged boundary so they are not
+        // redelivered; add every id observed at a new boundary.
+        nextSubmittedIds = watermarkKnown && nextWatermarkMs === watermarkMs
+          ? [...new Set([...last.reviewSubmittedIds, ...atBoundary])]
+          : [...new Set(atBoundary)];
+      }
+      if (nextSubmittedIds.length > MAX_PENDING_REVIEWS) {
+        throw new Error('too many GitHub reviews at the submission boundary to track safely');
+      }
+      const next = {
+        conversation: conversation.reduce((max, c) => Math.max(max, idOf(c)), last.conversation),
+        // The floor includes pending ids; a later submission is recovered via
+        // the pending set or watermark instead of the numeric floor.
+        review: maximumReviewId,
+        reviewComment: reviewComment.reduce((max, c) => Math.max(max, idOf(c)), last.reviewComment),
+        pendingReviews: [...pendingIds].sort((a, b) => a - b),
+        reviewSubmittedAt: nextWatermark,
+        reviewSubmittedIds: nextSubmittedIds.sort((a, b) => a - b),
+      };
+      return { updates, nextCursor: JSON.stringify(next) };
     },
     async publishStatus(project, number, key, body) {
       validProject(project);

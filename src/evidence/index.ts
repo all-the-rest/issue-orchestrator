@@ -127,7 +127,7 @@ export function reconcileEvidenceBranch({ project, codeHostProject = project, is
     manifestText = git(['show', `${remoteSha}:manifest.json`], { cwd: root });
     manifest = JSON.parse(manifestText);
   } catch (error) {
-    throw new Error(`existing evidence branch has no valid manifest: ${(error as Error).message}`);
+    throw new Error(`existing evidence branch has no valid manifest: ${(error as Error).message}`, { cause: error });
   }
   if (manifest.schema !== 2 || manifest.project !== project || Number(manifest.issue) !== Number(issue) ||
       Number(manifest.change) !== Number(change) || manifest.head !== head.toLowerCase() ||

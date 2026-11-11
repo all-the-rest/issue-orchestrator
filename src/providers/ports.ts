@@ -128,7 +128,7 @@ export interface CodeHost {
   publishComment(args: { project: string; number: number; body: string }): unknown;
 }
 
-export type AgentRole = 'triage' | 'builder' | 'verifier' | 'reviewer';
+export type AgentRole = 'triage' | 'builder' | 'ticket-agent' | 'verifier' | 'reviewer';
 
 export type AgentResultStatus = 'DONE' | 'BLOCKED' | 'CHANGES_REQUIRED' | 'NEEDS_INFO';
 
@@ -181,6 +181,11 @@ export interface RunAgentSessionArgs {
   input?: Record<string, unknown>;
   /** Explicitly resume a completed conversation for a persisted ticket update turn. */
   continueCompleted?: true;
+  /**
+   * Correlation identifier for a persisted ticket turn. It is not a
+   * deduplication key: a crash after dispatch can replay the same turn, which is
+   * why delivery is documented as at-least-once.
+   */
   turnId?: string;
   timeoutMs?: number;
 }

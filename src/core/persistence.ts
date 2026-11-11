@@ -90,14 +90,6 @@ interface IdRow extends SqlRow {
   id: number | bigint;
 }
 
-interface ActiveIdRow extends IdRow {
-  owner_token: string;
-}
-
-interface LegacyJobRow extends IdRow {
-  external_id?: string;
-}
-
 interface RuntimeStateRow extends SqlRow {
   active_job_id: number | bigint | null;
   last_run: string | null;
@@ -120,13 +112,7 @@ interface EventWorkItemRow extends IdRow {
   state: string;
 }
 
-interface EventIdRow extends IdRow {}
-
-interface EventJobRow extends IdRow {}
-
-interface WorkItemRow extends IdRow {
-  state: string;
-}
+type EventIdRow = IdRow;
 
 interface ClaimJobRow extends IdRow {
   project_id: string;
@@ -160,10 +146,6 @@ interface CountRow extends SqlRow {
 
 interface EventStateRow extends SqlRow {
   id: number | bigint;
-  state: string;
-}
-
-interface JobStateRow extends IdRow {
   state: string;
 }
 
@@ -318,6 +300,16 @@ function processStartTicks(pid: number): string | null {
   }
 }
 
+const PROCESS_NAMESPACE = (() => {
+  try {
+    return `pid:${fs.readlinkSync('/proc/self/ns/pid')}`;
+  } catch {
+    // No PID namespaces (for example macOS) or an unreadable procfs. The host
+    // name still separates distinct containers when procfs is unavailable.
+    return `host:${os.hostname()}`;
+  }
+})();
+
 function processOwnerAlive(pid: number, startTicks: unknown): boolean | null {
   if (!Number.isSafeInteger(pid) || pid <= 0) return null;
   try { process.kill(pid, 0); }
@@ -328,6 +320,52 @@ function processOwnerAlive(pid: number, startTicks: unknown): boolean | null {
   if (typeof startTicks === 'string' && currentStart !== null) return startTicks === currentStart;
   // On platforms without a process-start identity, a live PID is ambiguous;
   // fail closed instead of risking a lease theft after PID reuse.
+  return true;
+}
+
+interface TicketOwnerRow extends SqlRow {
+  id: string;
+  state_json: SQLOutputValue;
+  active_pid: number | bigint | null;
+  active_start_ticks: string | null;
+  active_namespace: string | null;
+  active_lease_until: string | null;
+  active_kind: string | null;
+}
+
+function ticketStateHasPendingBatch(stateJson: SQLOutputValue): boolean {
+  try {
+    const state = JSON.parse(String(stateJson)) as Record<string, unknown>;
+    return !!state.pendingTurn ||
+      (Array.isArray(state.deferredUpdates) && state.deferredUpdates.length > 0);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * A ticket handoff owner is alive only while its durable lease is valid. Same
+ * namespace PID checks may shorten the wait after a crash; a foreign/unknown
+ * PID namespace never authorizes early takeover, so a slow container cannot
+ * lose ownership to a look-alike PID.
+ */
+function ticketOwnerAlive(row: TicketOwnerRow, nowMs = Date.now()): boolean {
+  const lease = Date.parse(row.active_lease_until ?? '');
+  if (Number.isFinite(lease) && lease > nowMs) {
+    if (row.active_namespace === PROCESS_NAMESPACE && row.active_pid != null &&
+        processOwnerAlive(Number(row.active_pid), row.active_start_ticks) === false) {
+      return false;
+    }
+    return true;
+  }
+  if (row.active_lease_until) return false;
+  // Legacy/ticket rows written before leases existed.
+  if (row.active_pid == null) return false;
+  const alive = processOwnerAlive(Number(row.active_pid), row.active_start_ticks);
+  if (alive === false) return false;
+  // Same namespace can trust a live PID. A foreign or unknown namespace without
+  // a lease cannot be proven stale, so fail closed rather than stealing it.
+  if (row.active_namespace === PROCESS_NAMESPACE) return alive === true;
   return true;
 }
 
@@ -739,6 +777,30 @@ const MIGRATIONS = [
     ALTER TABLE ticket_handoffs ADD COLUMN active_pid INTEGER;
     ALTER TABLE ticket_handoffs ADD COLUMN active_start_ticks TEXT;
   `,
+  `
+    ALTER TABLE ticket_handoffs ADD COLUMN active_lease_until TEXT;
+    ALTER TABLE ticket_handoffs ADD COLUMN active_heartbeat_at TEXT;
+    ALTER TABLE ticket_handoffs ADD COLUMN active_namespace TEXT;
+    ALTER TABLE ticket_handoffs ADD COLUMN active_kind TEXT
+      CHECK (active_kind IS NULL OR active_kind IN ('session', 'intake'));
+    UPDATE ticket_handoffs SET active_kind='session' WHERE active_owner IS NOT NULL;
+    CREATE TABLE IF NOT EXISTS ticket_scheduler_global_limit (
+      singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+      max_concurrency INTEGER NOT NULL CHECK(max_concurrency > 0)
+    );
+    -- Existing active ticket handoffs get one bounded grace lease instead of
+    -- becoming immortal or being mistaken for a reclaimable look-alike PID.
+    UPDATE ticket_handoffs
+      SET active_lease_until=strftime('%Y-%m-%dT%H:%M:%fZ','now','+15 minutes')
+      WHERE active_owner IS NOT NULL AND active_lease_until IS NULL;
+  `,
+  `
+    CREATE TABLE IF NOT EXISTS ticket_delivery_state (
+      singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+      cooldown_ms INTEGER NOT NULL CHECK(cooldown_ms >= 0),
+      last_started_ms INTEGER
+    );
+  `,
 ];
 
 export interface TicketHandoffRecord {
@@ -749,6 +811,12 @@ export interface TicketHandoffRecord {
   goal: string;
   state: Record<string, unknown>;
 }
+
+export type TicketHandoffClaim =
+  | { acquired: true }
+  | { acquired: false; reason: 'BUSY' | 'CAPACITY' | 'CONFIG_MISMATCH'; activeCount?: number };
+
+export const DEFAULT_TICKET_LEASE_MS = 60 * 1000;
 
 export class SQLiteStore {
   readonly db: DatabaseSync;
@@ -774,19 +842,29 @@ export class SQLiteStore {
     this.db.close();
   }
 
-  /** Get or atomically create durable ticket handoff state. */
+  /** Get or atomically create durable ticket handoff state for a workflow key. */
   getOrCreateTicketHandoff(input: Omit<TicketHandoffRecord, 'id'> & { id: string }): TicketHandoffRecord {
     return this.transaction(() => {
-      const existing = asSqlRow<{ id: string; goal_json: string; state_json: string }>(this.db.prepare(
-        'SELECT id, goal_json, state_json FROM ticket_handoffs WHERE project=? AND issue=? AND goal_hash=?',
-      ).get(input.project, input.issue, input.goalHash));
+      // GitHub project ids are case-insensitive; one issue must never get two
+      // worktree owners merely because a poller spelled the repository differently.
+      const rows = this.db.prepare(
+        'SELECT id,goal_hash,goal_json,state_json FROM ticket_handoffs WHERE lower(project)=lower(?) AND issue=? ORDER BY updated_at DESC,created_at DESC',
+      ).all(input.project, input.issue) as Array<{ id: string; goal_hash: string; goal_json: string; state_json: string }>;
+      const existing = rows.find((row) => row.goal_hash === input.goalHash);
       if (existing) {
-        if (existing.goal_json !== JSON.stringify(input.goal)) throw new Error('persisted ticket goal does not match its digest');
-        return { ...input, id: existing.id, state: JSON.parse(existing.state_json) as Record<string, unknown> };
+        if (existing.goal_json !== JSON.stringify(input.goal)) {
+          throw new Error('persisted ticket goal does not match its digest');
+        }
+        return { ...input, id: existing.id, goalHash: existing.goal_hash,
+          goal: JSON.parse(existing.goal_json) as string,
+          state: JSON.parse(existing.state_json) as Record<string, unknown> };
       }
-      const active = asSqlRow<{ id: string; goal_json: string }>(this.db.prepare(
-        "SELECT id, goal_json FROM ticket_handoffs WHERE project=? AND issue=? AND json_extract(state_json,'$.terminal')=0 LIMIT 1",
-      ).get(input.project, input.issue));
+      // A ticket shares one worktree across workflows. Never start a goal and a
+      // route-only handoff on the same issue concurrently.
+      const active = rows.find((row) => {
+        const state = JSON.parse(row.state_json) as Record<string, unknown>;
+        return !state.terminal;
+      });
       if (active) throw new Error('ticket already has an active handoff with a different goal');
       const now = nowIso();
       this.db.prepare('INSERT INTO ticket_handoffs(id,project,issue,goal_hash,goal_json,state_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)')
@@ -801,35 +879,242 @@ export class SQLiteStore {
     return row ? { id: row.id, project: row.project, issue: Number(row.issue), goalHash: row.goal_hash, goal: JSON.parse(row.goal_json) as string, state: JSON.parse(row.state_json) as Record<string, unknown> } : null;
   }
 
-  updateTicketHandoff(id: string, state: Record<string, unknown>): void {
+  /**
+   * List persisted ticket handoffs, newest first. Pollers use this to keep
+   * draining known associations after the GitHub issue itself closes, when the
+   * open-issue listing no longer returns it. Read-only: no migration or write.
+   */
+  listTicketHandoffs(project?: string, limit = 1000): Array<TicketHandoffRecord & { updatedAt: string }> {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 5000) {
+      throw new Error('ticket handoff list limit must be an integer from 1 to 5000');
+    }
+    type Row = { id: string; project: string; issue: number; goal_hash: string; goal_json: string; state_json: string;
+      updated_at: string };
+    const rows = asSqlRows<Row>(project
+      ? this.db.prepare(`SELECT id,project,issue,goal_hash,goal_json,state_json,updated_at
+          FROM ticket_handoffs WHERE lower(project)=lower(?) ORDER BY updated_at DESC, created_at DESC LIMIT ?`)
+        .all(project, limit)
+      : this.db.prepare(`SELECT id,project,issue,goal_hash,goal_json,state_json,updated_at
+          FROM ticket_handoffs ORDER BY updated_at DESC, created_at DESC LIMIT ?`).all(limit));
+    return rows.map((row) => ({
+      id: row.id, project: row.project, issue: Number(row.issue), goalHash: row.goal_hash,
+      goal: JSON.parse(row.goal_json) as string, state: JSON.parse(row.state_json) as Record<string, unknown>,
+      updatedAt: row.updated_at,
+    }));
+  }
+
+  /** Persist state; with an owner this is a compare-and-swap against a stolen lease. */
+  updateTicketHandoff(id: string, state: Record<string, unknown>, owner?: string): void {
     this.transaction(() => {
-      const result = this.db.prepare('UPDATE ticket_handoffs SET state_json=?,updated_at=? WHERE id=?')
-        .run(JSON.stringify(state), nowIso(), id);
-      if (Number(result.changes) !== 1) throw new Error('ticket handoff not found');
+      const result = owner
+        ? this.db.prepare('UPDATE ticket_handoffs SET state_json=?,updated_at=? WHERE id=? AND active_owner=?')
+          .run(JSON.stringify(state), nowIso(), id, owner)
+        : this.db.prepare('UPDATE ticket_handoffs SET state_json=?,updated_at=? WHERE id=?')
+          .run(JSON.stringify(state), nowIso(), id);
+      if (Number(result.changes) !== 1) {
+        throw new Error(owner
+          ? 'ticket handoff ownership was lost; refusing to overwrite newer state'
+          : 'ticket handoff not found');
+      }
     });
   }
 
   /** Claim one ticket handoff so concurrent CLI retries cannot duplicate its external effects. */
   claimTicketHandoff(id: string, owner: string): boolean {
+    return this.tryClaimTicketHandoff(id, owner).acquired;
+  }
+
+  /**
+   * Atomically claim one ticket handoff and, optionally, one global session
+   * slot. Dead owners are ignored so a restart can reclaim their slot.
+   */
+  tryClaimTicketHandoff(id: string, owner: string,
+    options: { maxConcurrency?: number; leaseMs?: number; kind?: 'session' | 'intake' } = {}): TicketHandoffClaim {
     if (!id || !owner) throw new Error('ticket handoff claim requires an id and owner');
+    const maxConcurrency = options.maxConcurrency;
+    const leaseMs = options.leaseMs ?? DEFAULT_TICKET_LEASE_MS;
+    const kind = options.kind ?? 'session';
+    if (kind !== 'session' && kind !== 'intake') throw new Error('invalid ticket claim kind');
+    if (maxConcurrency !== undefined &&
+        (!Number.isSafeInteger(maxConcurrency) || maxConcurrency < 1)) {
+      throw new Error('ticket session max_concurrency must be a positive integer');
+    }
+    if (!Number.isSafeInteger(leaseMs) || leaseMs < 1) throw new Error('ticket lease must be a positive integer');
     return this.transaction(() => {
-      const row = asSqlRow<{ active_owner: string | null; active_pid: number | bigint | null; active_start_ticks: string | null }>(
-        this.db.prepare('SELECT active_owner,active_pid,active_start_ticks FROM ticket_handoffs WHERE id=?').get(id));
-      if (!row) return false;
-      if (row.active_owner && row.active_owner !== owner &&
-          processOwnerAlive(Number(row.active_pid), row.active_start_ticks) !== false) return false;
+      const row = asSqlRow<TicketOwnerRow & { project: string; issue: number | bigint; active_owner: string | null }>(
+        this.db.prepare(`SELECT id,project,issue,active_owner,state_json,active_pid,active_start_ticks,
+          active_namespace,active_lease_until,active_kind FROM ticket_handoffs WHERE id=?`).get(id));
+      if (!row) return { acquired: false, reason: 'BUSY' };
+      // Goal and route-only handoffs may exist from different workflow keys but
+      // share the issue worktree; only one may execute at a time. A durable
+      // pending batch in either workflow also owns the issue. GitHub project ids
+      // are case-insensitive, so aliases must not open a second worktree.
+      const others = this.db.prepare(`SELECT id,state_json,active_pid,active_start_ticks,active_namespace,active_lease_until,active_kind
+        FROM ticket_handoffs WHERE lower(project)=lower(?) AND issue=? AND id<>?`)
+        .all(row.project, row.issue, id) as unknown as TicketOwnerRow[];
+      if (others.some((other) => ticketOwnerAlive(other) || ticketStateHasPendingBatch(other.state_json))) {
+        return { acquired: false, reason: 'BUSY' };
+      }
+      if (row.active_owner && row.active_owner !== owner && ticketOwnerAlive(row)) {
+        return { acquired: false, reason: 'BUSY' };
+      }
+      if (maxConcurrency !== undefined) {
+        const handoffs = this.db.prepare(`SELECT id,state_json,active_pid,active_start_ticks,active_namespace,active_lease_until,active_kind
+          FROM ticket_handoffs WHERE id<>?`).all(id) as unknown as TicketOwnerRow[];
+        const logicalActive = handoffs.filter((other) =>
+          ticketOwnerAlive(other) || ticketStateHasPendingBatch(other.state_json)).length;
+        const stored = asSqlRow<SqlRow>(
+          this.db.prepare('SELECT max_concurrency FROM ticket_scheduler_global_limit WHERE singleton=1').get());
+        if (stored && Number(stored.max_concurrency) !== maxConcurrency) {
+          // Conflicting pollers must not each enforce their own private cap.
+          if (logicalActive > 0) {
+            return { acquired: false, reason: 'CONFIG_MISMATCH', activeCount: logicalActive };
+          }
+          this.db.prepare('UPDATE ticket_scheduler_global_limit SET max_concurrency=? WHERE singleton=1')
+            .run(maxConcurrency);
+        } else if (!stored) {
+          this.db.prepare('INSERT INTO ticket_scheduler_global_limit(singleton,max_concurrency) VALUES (1,?)')
+            .run(maxConcurrency);
+        }
+        // Intake claims are short observation locks, not agent sessions; they
+        // must never consume one of the configured global session slots.
+        const activeCount = handoffs.filter((other) =>
+          other.active_kind !== 'intake' && ticketOwnerAlive(other)).length;
+        if (activeCount >= maxConcurrency) return { acquired: false, reason: 'CAPACITY', activeCount };
+      }
+      const now = Date.now();
       const result = this.db.prepare(`
-        UPDATE ticket_handoffs SET active_owner=?,active_pid=?,active_start_ticks=?,updated_at=?
+        UPDATE ticket_handoffs SET active_owner=?,active_pid=?,active_start_ticks=?,active_namespace=?,
+          active_heartbeat_at=?,active_lease_until=?,active_kind=?,updated_at=?
         WHERE id=? AND active_owner IS ? AND active_pid IS ? AND active_start_ticks IS ?
-      `).run(owner, process.pid, processStartTicks(process.pid), nowIso(), id,
+      `).run(owner, process.pid, processStartTicks(process.pid), PROCESS_NAMESPACE,
+        new Date(now).toISOString(), new Date(now + leaseMs).toISOString(), kind, nowIso(), id,
         row.active_owner, row.active_pid ?? null, row.active_start_ticks ?? null);
-      return Number(result.changes) === 1;
+      return Number(result.changes) === 1 ? { acquired: true } : { acquired: false, reason: 'BUSY' };
     });
   }
 
+  /** Renew one owner's durable ticket lease; a lost/foreign owner cannot renew. */
+  heartbeatTicketHandoff(id: string, owner: string, leaseMs = DEFAULT_TICKET_LEASE_MS): boolean {
+    if (!id || !owner) throw new Error('ticket heartbeat requires an id and owner');
+    if (!Number.isSafeInteger(leaseMs) || leaseMs < 1) throw new Error('ticket lease must be a positive integer');
+    const now = Date.now();
+    const result = this.db.prepare(`UPDATE ticket_handoffs SET active_heartbeat_at=?,active_lease_until=?,updated_at=?
+      WHERE id=? AND active_owner=?`).run(new Date(now).toISOString(),
+      new Date(now + leaseMs).toISOString(), nowIso(), id, owner);
+    return Number(result.changes) === 1;
+  }
+
+  /**
+   * Read the durable global dispatch cooldown anchor. When `cooldownMs` is
+   * supplied, a stored value from another poller must match exactly; otherwise
+   * this fails closed instead of letting pollers enforce private limits.
+   */
+  readTicketDispatchStart(cooldownMs?: number): number | null {
+    if (cooldownMs !== undefined && (!Number.isSafeInteger(cooldownMs) || cooldownMs < 0)) {
+      throw new Error('ticket delivery cooldown must be a non-negative integer');
+    }
+    const row = asSqlRow<SqlRow>(this.db.prepare(
+      'SELECT cooldown_ms,last_started_ms FROM ticket_delivery_state WHERE singleton=1').get());
+    if (!row) return null;
+    if (cooldownMs !== undefined && Number(row.cooldown_ms) !== cooldownMs) {
+      throw new Error('ticket delivery cooldown must be identical for every poller sharing the runtime database');
+    }
+    return row.last_started_ms == null ? null : Number(row.last_started_ms);
+  }
+
+  /**
+   * Atomically claim the start of one automated ticket turn. The cooldown is
+   * start-to-start and shared by every poller using this database: two pollers
+   * racing after the same window opening cannot both start a turn.
+   *
+   * A successful claim is consumed immediately. If the dispatch then throws,
+   * the anchor is deliberately retained: the agent may already have started and
+   * an ambiguous failure must never refund time on the global schedule.
+   */
+  claimTicketDispatchStart(options: { cooldownMs: number; now?: number }): {
+    acquired: boolean;
+    lastStartedAt: number | null;
+    nextAllowedAt: number | null;
+  } {
+    const cooldownMs = options.cooldownMs;
+    if (!Number.isSafeInteger(cooldownMs) || cooldownMs < 0) {
+      throw new Error('ticket delivery cooldown must be a non-negative integer');
+    }
+    const now = options.now ?? Date.now();
+    if (!Number.isSafeInteger(now) || now < 0) throw new Error('ticket dispatch timestamp must be a non-negative integer');
+    return this.transaction(() => {
+      const row = asSqlRow<SqlRow>(this.db.prepare(
+        'SELECT cooldown_ms,last_started_ms FROM ticket_delivery_state WHERE singleton=1').get());
+      if (row && Number(row.cooldown_ms) !== cooldownMs) {
+        throw new Error('ticket delivery cooldown must be identical for every poller sharing the runtime database');
+      }
+      const lastStartedAt = row?.last_started_ms == null ? null : Number(row.last_started_ms);
+      if (lastStartedAt !== null && now < lastStartedAt + cooldownMs) {
+        return { acquired: false, lastStartedAt, nextAllowedAt: lastStartedAt + cooldownMs };
+      }
+      if (!row) {
+        this.db.prepare('INSERT INTO ticket_delivery_state(singleton,cooldown_ms,last_started_ms) VALUES (1,?,?)')
+          .run(cooldownMs, now);
+      } else {
+        this.db.prepare('UPDATE ticket_delivery_state SET last_started_ms=? WHERE singleton=1').run(now);
+      }
+      return { acquired: true, lastStartedAt: now, nextAllowedAt: null };
+    });
+  }
+
+  /**
+   * Explicit operator transition to a new global cooldown. The durable
+   * last-start anchor is preserved and the new cooldown applies to it
+   * immediately: lowering the cooldown can make the next dispatch eligible at
+   * `last_started_ms + new_cooldown`, which may already be in the past. The
+   * result reports that boundary so the operator sees the effect. Refusing
+   * while a live ticket lease exists makes the transition deliberate; a poller
+   * still running with the old value fails closed on its next read or claim.
+   */
+  reconfigureTicketDelivery(options: { cooldownMs: number }): {
+    changed: boolean;
+    previousCooldownMs: number | null;
+    cooldownMs: number;
+    lastStartedAt: number | null;
+    nextAllowedAt: number | null;
+  } {
+    const cooldownMs = options.cooldownMs;
+    if (!Number.isSafeInteger(cooldownMs) || cooldownMs < 0) {
+      throw new Error('ticket delivery cooldown must be a non-negative integer');
+    }
+    return this.transaction(() => {
+      const active = this.db.prepare(`SELECT id,state_json,active_pid,active_start_ticks,
+        active_namespace,active_lease_until,active_kind FROM ticket_handoffs WHERE active_owner IS NOT NULL`)
+        .all() as unknown as TicketOwnerRow[];
+      if (active.some((row) => ticketOwnerAlive(row))) {
+        throw new Error('ticket delivery reconfiguration requires every active ticket session and intake claim to stop first');
+      }
+      const row = asSqlRow<SqlRow>(this.db.prepare(
+        'SELECT cooldown_ms,last_started_ms FROM ticket_delivery_state WHERE singleton=1').get());
+      const previousCooldownMs = row ? Number(row.cooldown_ms) : null;
+      const lastStartedAt = row?.last_started_ms == null ? null : Number(row.last_started_ms);
+      if (!row) {
+        this.db.prepare('INSERT INTO ticket_delivery_state(singleton,cooldown_ms,last_started_ms) VALUES (1,?,NULL)')
+          .run(cooldownMs);
+      } else {
+        this.db.prepare('UPDATE ticket_delivery_state SET cooldown_ms=? WHERE singleton=1').run(cooldownMs);
+      }
+      return {
+        changed: previousCooldownMs !== cooldownMs,
+        previousCooldownMs,
+        cooldownMs,
+        lastStartedAt,
+        nextAllowedAt: lastStartedAt === null ? null : lastStartedAt + cooldownMs,
+      };
+    });
+  }
+
+
   releaseTicketHandoff(id: string, owner: string): void {
     this.transaction(() => {
-      this.db.prepare(`UPDATE ticket_handoffs SET active_owner=NULL,active_pid=NULL,active_start_ticks=NULL,updated_at=?
+      this.db.prepare(`UPDATE ticket_handoffs SET active_owner=NULL,active_pid=NULL,active_start_ticks=NULL,
+        active_namespace=NULL,active_heartbeat_at=NULL,active_lease_until=NULL,active_kind=NULL,updated_at=?
         WHERE id=? AND active_owner=?`).run(nowIso(), id, owner);
     });
   }
@@ -925,7 +1210,7 @@ export class SQLiteStore {
       try {
         if (sourceExists) value = JSON.parse(fs.readFileSync(absolute, 'utf8'));
       } catch (error) {
-        throw new Error(`Legacy ${isLockFile ? 'lock' : 'state'} is corrupt: ${absolute} (${(error as Error).message})`);
+        throw new Error(`Legacy ${isLockFile ? 'lock' : 'state'} is corrupt: ${absolute} (${(error as Error).message})`, { cause: error });
       }
       const legacyLock = isValidLegacyLock(value) ? value : null;
       if (sourceExists && isLockFile && !legacyLock) {
@@ -1071,7 +1356,6 @@ export class SQLiteStore {
   }
 
   private clearProjectCapacityIfIdle(project: string, provider: string) {
-    const projectPredicate = githubProjectPredicate('project_id', provider);
     const jobPredicate = githubProjectPredicate('j.project_id', provider);
     const trackerPredicate = trackerProviderPredicate('j', provider);
     const active = this.db.prepare(`SELECT 1 FROM jobs j WHERE ${jobPredicate} AND ${trackerPredicate} AND j.state IN ('CLAIMED','RUNNING') LIMIT 1`).get(project);
@@ -1702,9 +1986,11 @@ export class SQLiteStore {
     }
     return this.transaction(() => {
       const externalId = `ticket-handoff:${input.handoffId}`;
+      // GitHub project ids are case-insensitive. An alias must find the original
+      // job anchor so its persisted agent session remains resumable.
       const prior = asSqlRow<{ id: number }>(this.db.prepare(`
         SELECT j.id FROM jobs j JOIN work_items w ON w.id=j.work_item_id
-        WHERE j.project_id=? AND w.external_id=? AND j.provider='github' ORDER BY j.id LIMIT 1
+        WHERE lower(j.project_id)=lower(?) AND w.external_id=? AND j.provider='github' ORDER BY j.id LIMIT 1
       `).get(input.project, externalId));
       if (prior) return Number(prior.id);
 

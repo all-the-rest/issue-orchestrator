@@ -5,6 +5,11 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
+// Deployment/autostart checks run before the service-template checks so the
+// same `pnpm test` entry point covers the container contract.
+await import('./docker-deployment.mjs');
+await import('./code-dev-deployment.mjs');
+
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const cli = path.join(root, 'dist/cli.js');
 const oddCwd = fs.mkdtempSync(path.join(os.tmpdir(), 'service path "quoted" '));

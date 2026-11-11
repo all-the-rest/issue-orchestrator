@@ -12,7 +12,7 @@ const GUARDED = new Set([
 
 const [command = 'help', ...rest] = process.argv.slice(2);
 let pendingSignal: NodeJS.Signals | null = null;
-if (command === 'run' || command === 'goal') {
+if (command === 'run' || command === 'goal' || command === 'tickets') {
   for (const signal of ['SIGTERM', 'SIGINT'] as const) {
     process.once(signal, () => {
       pendingSignal = signal;
@@ -42,19 +42,20 @@ async function main(): Promise<number> {
   const handler = COMMANDS[command];
   if (!handler) throw new CliError(`Unknown command "${command}"\n\n${HELP}`);
 
-  // Printing service templates is intentionally config/state-free.
-  if (command === 'service') return await handler(opts) ?? 0;
+  // Printing service templates and setup guidance is intentionally
+  // config/state-free.
+  if (command === 'service' || command === 'setup') return await handler(opts) ?? 0;
 
-  // run --dry-run is deliberately outside the guard and does not reconcile or
-  // open SQLite. The dod command stays guarded for its complete execution.
-  if (command === 'run' && opts['dry-run']) return await handler(opts) ?? 0;
+  // Dry-run is deliberately outside the guard and does not reconcile or open
+  // SQLite. The dod command stays guarded for its complete execution.
+  if ((command === 'run' || command === 'tickets') && opts['dry-run']) return await handler(opts) ?? 0;
   if (command === 'run') {
     // Reconciliation remains globally serialized, but never hold the global
     // mutation guard for the lifetime of an agent workflow.
     opts.reconciliation = withMutationGuard(() => reconcilePendingSideEffects(opts));
     return await handler(opts) ?? 0;
   }
-  if (command === 'goal') {
+  if (command === 'goal' || command === 'tickets') {
     // Serialize startup reconciliation, but do not hold the global guard while
     // the selected agent works on the ticket.
     opts.reconciliation = withMutationGuard(() => reconcilePendingSideEffects(opts));

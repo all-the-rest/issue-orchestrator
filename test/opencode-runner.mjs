@@ -153,6 +153,19 @@ const configFile = process.env.OPENCODE_CONFIG;
 const prompt = args.at(-1) || '';
 const resultMatch = /absolute path ("[^"]+") with required fields/.exec(prompt);
 const resultFile = resultMatch ? JSON.parse(resultMatch[1]) : path.join(process.cwd(), '.issue-orchestrator', 'result.json');
+const ghAuthFile = process.env.GH_CONFIG_DIR ? path.join(process.env.GH_CONFIG_DIR, 'hosts.yml') : null;
+const ghStatus = process.env.GH_CONFIG_DIR
+  ? spawnSync('gh', ['auth', 'status'], { encoding: 'utf8', stdio: 'ignore' }).status
+  : null;
+const gitConfigGlobal = process.env.GIT_CONFIG_GLOBAL ?? null;
+const gitConfigContents = gitConfigGlobal && fs.existsSync(gitConfigGlobal)
+  ? fs.readFileSync(gitConfigGlobal, 'utf8')
+  : '';
+const gitCredentialFill = process.env.GH_CONFIG_DIR && gitConfigGlobal
+  ? spawnSync('git', ['credential', 'fill'], {
+    encoding: 'utf8', input: 'protocol=https\\nhost=github.com\\n\\n', stdio: ['pipe', 'pipe', 'ignore'],
+  })
+  : null;
 const nodeEval = (code, args = []) => 'node -e ' + String.fromCharCode(34) + code + String.fromCharCode(34) +
   args.map((arg) => ' ' + arg).join('');
 const report = {
@@ -166,7 +179,14 @@ const report = {
   providerAuth: process.env.XDG_DATA_HOME && fs.existsSync(path.join(process.env.XDG_DATA_HOME, 'opencode', 'auth.json'))
     ? JSON.parse(fs.readFileSync(path.join(process.env.XDG_DATA_HOME, 'opencode', 'auth.json'), 'utf8'))
     : null,
-  gitConfigGlobal: process.env.GIT_CONFIG_GLOBAL ?? null,
+  gitConfigGlobal,
+  gitCredentialHelperConfigured: gitConfigContents.includes('!gh auth git-credential'),
+  gitConfigMode: gitConfigGlobal && fs.existsSync(gitConfigGlobal) ? fs.statSync(gitConfigGlobal).mode & 0o777 : null,
+  gitCredentialFillWorks: gitCredentialFill?.status === 0 && /username=/.test(gitCredentialFill.stdout) && /password=/.test(gitCredentialFill.stdout),
+  ghConfigDir: process.env.GH_CONFIG_DIR ?? null,
+  ghAuthFileExists: ghAuthFile ? fs.existsSync(ghAuthFile) : false,
+  ghAuthFileMode: ghAuthFile && fs.existsSync(ghAuthFile) ? fs.statSync(ghAuthFile).mode & 0o777 : null,
+  ghStatus,
   sshAuthSock: process.env.SSH_AUTH_SOCK ?? null,
   awsProfile: process.env.AWS_PROFILE ?? null,
   httpsProxy: process.env.HTTPS_PROXY ?? null,
@@ -200,6 +220,12 @@ if (mode === 'question') {
   if (mode === 'auth-export-log') {
     process.stderr.write('access_token=integration-');
     setTimeout(() => process.stderr.write('openai-access-secret' + String.fromCharCode(10)), 10);
+  }
+  if (mode === 'ticket-auth-log') {
+    const auth = fs.readFileSync(ghAuthFile, 'utf8');
+    const token = /^\\s*oauth_token:\\s*(.+)$/m.exec(auth)?.[1]?.trim();
+    process.stdout.write(JSON.stringify({ type: 'diagnostic', message: token }) + String.fromCharCode(10));
+    process.stderr.write(token + String.fromCharCode(10));
   }
   if (mode.startsWith('builder')) {
     const command = mode === 'builder-hang'
@@ -350,9 +376,12 @@ try {
     const reportFile = path.join(TMP, 'success-report.json');
     const providerBin = path.join(TMP, 'provider-bin');
     const trustedData = path.join(TMP, 'trusted-opencode-data');
+    const ghConfig = path.join(TMP, 'host-gh-config-for-verifier');
     fs.mkdirSync(providerBin);
+    fs.mkdirSync(ghConfig, { mode: 0o700 });
     fs.mkdirSync(path.join(trustedData, 'opencode'), { recursive: true });
     fs.writeFileSync(path.join(trustedData, 'opencode', 'auth.json'), JSON.stringify({ openai: { type: 'api', key: 'test saved OpenCode auth' } }), { mode: 0o600 });
+    fs.writeFileSync(path.join(ghConfig, 'hosts.yml'), 'github.com:\n  user: reisi007-jr\n  oauth_token: verifier-must-not-receive-this\n', { mode: 0o600 });
     fs.writeFileSync(path.join(providerBin, 'gh'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
     const runner = runnerFor(store, { environment: {
       FAKE_OPENCODE_REPORT: reportFile,
@@ -360,6 +389,7 @@ try {
       ISSUE_ORCHESTRATOR_OWNER_TOKEN: 'must-not-pass',
       HOME: os.homedir(), XDG_CONFIG_HOME: path.join(os.homedir(), '.config'),
       XDG_DATA_HOME: trustedData,
+      GH_CONFIG_DIR: ghConfig,
       OPENCODE_CONFIG_CONTENT: '{}',
       GIT_CONFIG_GLOBAL: path.join(os.homedir(), '.gitconfig'), SSH_AUTH_SOCK: '/tmp/host-agent.sock',
       AWS_PROFILE: 'host-profile', HTTPS_PROXY: 'http://host-user:host-password@proxy.example.invalid:8080',
@@ -388,6 +418,10 @@ try {
     const profile = Object.values(report.config.agents)[0];
     assert.equal(report.githubToken, null);
     assert.equal(report.ghToken, null);
+    assert.equal(report.ghConfigDir, null, 'non-ticket roles must not receive GH_CONFIG_DIR');
+    assert.equal(report.ghStatus, null);
+    assert.equal(fs.existsSync(path.join(report.xdgConfigHome, 'gh', 'hosts.yml')), false,
+      'non-ticket roles must not receive a private copy of GitHub CLI credentials');
     assert.equal(report.ownerToken, null);
     assert.notEqual(report.xdgConfigHome, path.join(os.homedir(), '.config'));
     assert.notEqual(report.home, os.homedir(), 'agent process must not inherit the operator home');
@@ -419,6 +453,9 @@ try {
       rule.action === 'shell' && rule.resource === '*' && rule.effect === 'deny'
     )), 'verifier shell requests, including pnpm test/build, must be rejected');
     assert.ok(!profile.permissions.some((rule) => rule.action === 'shell' && rule.effect === 'allow'));
+    assert.ok(!profile.permissions.some((rule) => rule.action === 'subagent' && rule.effect === 'allow'),
+      'non-ticket roles cannot delegate to OpenCode subagents');
+    assert.equal(report.config.experimental, undefined, 'only the ticket-agent role enables subagent delegation');
     assert.ok(!record.ndjsonPath.startsWith(`${worktree}${path.sep}`), 'captured logs must live outside the agent-controlled worktree');
     assert.equal(fs.statSync(path.dirname(record.ndjsonPath)).mode & 0o777, 0o700);
     assert.equal(fs.statSync(record.ndjsonPath).mode & 0o777, 0o600);
@@ -427,6 +464,291 @@ try {
     await assert.rejects(runner.getResult({ sessionId: session.externalSessionId }), /belongs to runner/);
     store.close();
     ok('OpenCode captures NDJSON privately, rejects verifier shell requests, isolates credentials, and refuses mismatched-runner recovery');
+  }
+
+  // Routed tickets use a direct OpenCode session with only a session-private
+  // GitHub CLI config and Git credential helper; no OCI runtime is required.
+  {
+    fs.rmSync(OCI_TRACE, { force: true });
+    const worktree = createWorktree('ticket-agent');
+    const store = new SQLiteStore(path.join(TMP, 'ticket-agent.sqlite3'));
+    const reportFile = path.join(TMP, 'ticket-agent-report.json');
+    const sourceGhConfig = path.join(TMP, 'ticket-agent-source-gh');
+    const providerBin = path.join(TMP, 'ticket-agent-provider-bin');
+    const hostGitConfig = path.join(TMP, 'ticket-agent-host.gitconfig');
+    const secret = 'ticket_auth_secret_material_for_test';
+    fs.mkdirSync(sourceGhConfig, { mode: 0o700 });
+    fs.mkdirSync(providerBin);
+    fs.writeFileSync(path.join(sourceGhConfig, 'hosts.yml'),
+      'ghe.example.invalid:\n  user: enterprise-user\n  oauth_token: enterprise_must_not_be_copied\n' +
+      `github.com:\n  user: reisi007-jr\n  oauth_token: ${secret}\n  git_protocol: https\n`, { mode: 0o600 });
+    fs.writeFileSync(hostGitConfig, '[user]\n\tname = host-only-config\n', { mode: 0o600 });
+    fs.writeFileSync(path.join(providerBin, 'gh'), `#!/bin/sh
+[ -s "$GH_CONFIG_DIR/hosts.yml" ] || exit 1
+if [ "$1" = "auth" ] && [ "$2" = "status" ]; then exit 0; fi
+if [ "$1" = "auth" ] && [ "$2" = "git-credential" ] && [ "$3" = "get" ]; then
+  token=$(awk -F': ' '/oauth_token:/ { print $2; exit }' "$GH_CONFIG_DIR/hosts.yml")
+  [ -n "$token" ] || exit 1
+  printf 'username=reisi007-jr\\npassword=%s\\n' "$token"
+  exit 0
+fi
+exit 1
+`, { mode: 0o755 });
+    const runner = runnerFor(store, {
+      containerRuntime: path.join(TMP, 'ticket-agent-no-oci-runtime'),
+      environment: {
+        FAKE_OPENCODE_MODE: 'ticket-auth-log',
+        FAKE_OPENCODE_REPORT: reportFile,
+        GH_CONFIG_DIR: sourceGhConfig,
+        GIT_CONFIG_GLOBAL: hostGitConfig,
+        HOME: os.homedir(),
+        PATH: `${providerBin}${path.delimiter}${process.env.PATH}`,
+      },
+    });
+    const session = await runner.createSession({
+      jobId: makeJob(store, 596), role: 'ticket-agent', model: 'openai/gpt-6-luna#xhigh', worktree,
+    });
+    assert.equal(session.role, 'ticket-agent');
+    const persistedSession = store.getAgentSession(session.externalSessionId);
+    const persistedWorktree = persistedSession.worktree;
+    assert.equal(persistedSession.ociIdentity, null);
+    const ticketInput = {
+      issueUrl: 'https://github.com/example/project/issues/596',
+      eventUrl: 'https://github.com/example/project/pull/37#issuecomment-1',
+      actor: 'reisi007-jr',
+    };
+    const result = await runner.run({
+      sessionId: session.externalSessionId,
+      systemPrompt: 'Additional ticket-specific trusted instruction.',
+      input: ticketInput,
+    });
+    assert.equal(result.status, 'DONE');
+    assert.deepEqual(runner.capabilities.capabilities.roles, ['triage', 'builder', 'ticket-agent', 'verifier', 'reviewer']);
+    assert.deepEqual(readOciTrace(), [], 'ticket-agent must not inspect or start an OCI runtime');
+
+    const report = readReport(reportFile);
+    const profile = Object.values(report.config.agents)[0];
+    const permissions = profile.permissions;
+    assert.ok(permissions.some((rule) => rule.action === 'read' && rule.resource === `${persistedWorktree}/**` && rule.effect === 'allow'));
+    assert.ok(permissions.some((rule) => rule.action === 'edit' && rule.resource === `${persistedWorktree}/**` && rule.effect === 'allow'));
+    assert.ok(permissions.some((rule) => rule.action === 'shell' && rule.resource === '*' && rule.effect === 'allow'));
+    assert.ok(permissions.some((rule) => rule.action === 'shell' && rule.resource === '*gh*' && rule.effect === 'allow'));
+    assert.ok(permissions.some((rule) => rule.action === 'shell' && rule.resource === '*git push*' && rule.effect === 'allow'));
+    assert.ok(permissions.some((rule) => rule.action === 'question' && rule.resource === '*' && rule.effect === 'deny'));
+    assert.ok(permissions.some((rule) => (
+      rule.action === 'subagent' && rule.resource === '*' && rule.effect === 'deny'
+    )), 'ticket-agent must deny every unlisted subagent');
+    assert.ok(permissions.some((rule) => (
+      rule.action === 'subagent' && rule.resource === 'build-worker' && rule.effect === 'allow'
+    )), 'ticket-agent may delegate only to the dedicated build worker');
+    assert.equal(permissions.filter((rule) => rule.action === 'subagent').at(-1)?.resource, 'build-worker');
+    assert.equal(permissions.filter((rule) => rule.action === 'question').at(-1)?.effect, 'deny',
+      'the last matching question rule must deny the parent');
+    assert.equal(report.config.experimental.subagent_depth, 1,
+      'delegated build workers must not start further subagents');
+    assert.equal(profile.mode, 'primary');
+    assert.deepEqual(Object.keys(report.config.agents), ['build', 'build-worker']);
+    const worker = report.config.agents['build-worker'];
+    assert.ok(worker, 'ticket-agent config includes the delegated build worker');
+    assert.equal(worker.mode, 'subagent');
+    assert.equal(worker.model, 'openai/gpt-6-luna#xhigh',
+      'delegated work uses the configured ticket model and variant');
+    assert.ok(worker.permissions.some((rule) => (
+      rule.action === 'question' && rule.resource === '*' && rule.effect === 'deny'
+    )), 'delegated build workers must not ask questions');
+    assert.equal(worker.permissions.filter((rule) => rule.action === 'question').at(-1)?.effect, 'deny',
+      'the last matching question rule must deny the delegated worker');
+    assert.ok(worker.permissions.some((rule) => (
+      rule.action === 'subagent' && rule.resource === '*' && rule.effect === 'deny'
+    )), 'delegated build workers must not launch further subagents');
+    assert.equal(worker.permissions.filter((rule) => rule.action === 'subagent').at(-1)?.effect, 'deny');
+    assert.ok(worker.permissions.some((rule) => rule.action === 'shell' && rule.resource === '*gh*' && rule.effect === 'allow'),
+      'the delegated worker shares the parent ticket authority; shell globs are not isolation');
+    assert.ok(worker.permissions.some((rule) => rule.action === 'shell' && rule.resource === '*git push*' && rule.effect === 'allow'));
+    assert.ok(worker.system.includes('share the parent ticket agent\'s trusted authority'));
+    assert.ok(worker.system.includes('Never invoke a question tool'));
+    assert.ok(profile.system.includes('You may delegate bounded implementation work to the build-worker subagent'));
+    assert.ok(profile.system.includes('shares your trusted worktree, container, network, and GitHub CLI authority'));
+    assert.ok(profile.system.includes('You remain responsible for final publication and the machine result contract'));
+    assert.ok(profile.system.includes('Read the issue, its relevant comments, and the supplied event URLs yourself with gh'));
+    assert.ok(profile.system.includes('create or update the appropriate pull request and any follow-up issues with gh'));
+    assert.ok(profile.system.includes('post one concise question as a GitHub issue comment with gh'));
+    assert.ok(profile.system.includes('Never invoke a question tool'));
+    assert.ok(profile.system.includes('Do not claim that the router verified CI'));
+    assert.ok(profile.system.includes('Additional ticket-specific trusted instruction.'));
+    assert.ok(!profile.system.includes(ticketInput.issueUrl), 'ticket data remains user input, not trusted system text');
+    assert.ok(report.args.at(-1).includes(JSON.stringify(ticketInput)));
+
+    assert.notEqual(report.home, os.homedir());
+    assert.notEqual(report.xdgConfigHome, path.dirname(sourceGhConfig));
+    assert.equal(report.ghConfigDir, path.join(report.xdgConfigHome, 'gh'));
+    assert.notEqual(report.ghConfigDir, sourceGhConfig);
+    assert.equal(report.ghAuthFileExists, true);
+    assert.equal(report.ghAuthFileMode, 0o600);
+    const privateGhConfig = fs.readFileSync(path.join(report.ghConfigDir, 'hosts.yml'), 'utf8');
+    assert.match(privateGhConfig, /^github\.com:/m);
+    assert.doesNotMatch(privateGhConfig, /ghe\.example\.invalid|enterprise_must_not_be_copied/,
+      'only the github.com host block is copied into the private session config');
+    assert.match(fs.readFileSync(path.join(sourceGhConfig, 'hosts.yml'), 'utf8'), /enterprise_must_not_be_copied/,
+      'the host GitHub CLI config is read but not modified');
+    assert.equal(fs.statSync(report.ghConfigDir).mode & 0o777, 0o700);
+    assert.equal(report.ghStatus, 0, 'gh is on the role trusted PATH and sees only the private auth config');
+    assert.equal(report.path.split(path.delimiter).length, 1, 'only the curated private runner bin directory is on PATH');
+    assert.ok(!report.path.split(path.delimiter).includes(providerBin));
+    assert.equal(report.gitConfigGlobal, path.join(path.dirname(store.getAgentSession(session.externalSessionId).ndjsonPath), 'gitconfig'));
+    assert.equal(report.gitConfigMode, 0o600);
+    assert.equal(report.gitCredentialHelperConfigured, true);
+    assert.equal(report.gitCredentialFillWorks, true, 'Git invokes gh auth git-credential for HTTPS credentials');
+    assert.equal(fs.readFileSync(hostGitConfig, 'utf8'), '[user]\n\tname = host-only-config\n', 'host Git config is not modified');
+    assert.equal(report.githubToken, null);
+    assert.equal(report.ghToken, null);
+
+    const record = store.getAgentSession(session.externalSessionId);
+    const capturedLogs = fs.readFileSync(record.ndjsonPath, 'utf8') + fs.readFileSync(record.stderrPath, 'utf8');
+    assert.doesNotMatch(capturedLogs, new RegExp(secret));
+    assert.match(capturedLogs, /\[REDACTED\]/);
+    store.close();
+    ok('ticket-agent runs directly without OCI, has private gh/Git push auth, and keeps question denied');
+  }
+
+  // A non-build configured default agent still receives the dedicated
+  // delegated build worker. That worker uses the configured ticket model and
+  // keeps the question denial, while sharing the parent's trusted authority
+  // rather than pretending that shell globs isolate credentials or GitHub.
+  {
+    const worktree = createWorktree('ticket-agent-delegated-build');
+    const store = new SQLiteStore(path.join(TMP, 'ticket-agent-delegated-build.sqlite3'));
+    const reportFile = path.join(TMP, 'ticket-agent-delegated-build-report.json');
+    const sourceGhConfig = path.join(TMP, 'ticket-agent-delegated-build-gh');
+    const providerBin = path.join(TMP, 'ticket-agent-delegated-build-bin');
+    const configFile = path.join(TMP, 'ticket-agent-delegated-build-config.jsonc');
+    const model = 'openai/gpt-6-luna#xhigh';
+    fs.mkdirSync(sourceGhConfig, { mode: 0o700 });
+    fs.mkdirSync(providerBin);
+    fs.writeFileSync(path.join(sourceGhConfig, 'hosts.yml'),
+      'github.com:\n  user: reisi007-jr\n  oauth_token: delegated-build-fixture-token\n', { mode: 0o600 });
+    fs.writeFileSync(path.join(providerBin, 'gh'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    fs.writeFileSync(configFile, JSON.stringify({
+      default_agent: 'ticket-main',
+      agents: { 'ticket-main': { system: 'Keep the configured ticket persona.' } },
+    }));
+    const environment = {
+      FAKE_OPENCODE_REPORT: reportFile,
+      GH_CONFIG_DIR: sourceGhConfig,
+      OPENCODE_CONFIG: configFile,
+      OPENCODE_CONFIG_CONTENT: undefined,
+      HOME: os.homedir(),
+      PATH: `${providerBin}${path.delimiter}${process.env.PATH}`,
+    };
+    const runner = runnerFor(store, { environment });
+    const session = await runner.createSession({
+      jobId: makeJob(store, 623), role: 'ticket-agent', model, worktree,
+    });
+    const result = await runner.run({ sessionId: session.externalSessionId, prompt: 'Delegate a bounded change.' });
+    assert.equal(result.status, 'DONE');
+
+    const report = readReport(reportFile);
+    const parent = report.config.agents['ticket-main'];
+    const worker = report.config.agents['build-worker'];
+    assert.equal(report.config.default_agent, 'ticket-main');
+    assert.deepEqual(Object.keys(report.config.agents).sort(), ['build-worker', 'ticket-main']);
+    assert.equal(report.config.experimental.subagent_depth, 1);
+    assert.equal(parent.mode, 'primary');
+    assert.equal(parent.model, undefined, 'the configured default keeps the session-selected model');
+    assert.ok(parent.system.includes('Keep the configured ticket persona.'));
+    assert.ok(parent.permissions.some((rule) => (
+      rule.action === 'subagent' && rule.resource === '*' && rule.effect === 'deny'
+    )));
+    assert.ok(parent.permissions.some((rule) => (
+      rule.action === 'subagent' && rule.resource === 'build-worker' && rule.effect === 'allow'
+    )));
+    assert.equal(parent.permissions.filter((rule) => rule.action === 'subagent').at(-1)?.resource, 'build-worker');
+    assert.ok(parent.permissions.some((rule) => rule.action === 'question' && rule.resource === '*' && rule.effect === 'deny'));
+    assert.equal(parent.permissions.filter((rule) => rule.action === 'question').at(-1)?.effect, 'deny');
+    assert.equal(worker.mode, 'subagent');
+    assert.equal(worker.model, model, 'the delegated worker uses the configured model and #variant');
+    assert.ok(worker.system.includes('share the parent ticket agent\'s trusted authority'));
+    assert.ok(worker.system.includes('Never invoke a question tool'));
+    assert.ok(worker.permissions.some((rule) => (
+      rule.action === 'question' && rule.resource === '*' && rule.effect === 'deny'
+    )), 'delegated subagents must not ask questions');
+    assert.equal(worker.permissions.filter((rule) => rule.action === 'question').at(-1)?.effect, 'deny');
+    assert.ok(worker.permissions.some((rule) => (
+      rule.action === 'subagent' && rule.resource === '*' && rule.effect === 'deny'
+    )), 'delegated subagents must not launch further subagents');
+    assert.equal(worker.permissions.filter((rule) => rule.action === 'subagent').at(-1)?.effect, 'deny');
+    assert.ok(worker.permissions.some((rule) => rule.action === 'shell' && rule.resource === '*gh*' && rule.effect === 'allow'),
+      'delegated workers share the parent gh authority; the rule is not an isolation boundary');
+    assert.ok(worker.permissions.some((rule) => rule.action === 'shell' && rule.resource === '*git push*' && rule.effect === 'allow'));
+    assert.ok(worker.permissions.some((rule) => (
+      rule.action === 'external_directory' && rule.resource === '*' && rule.effect === 'deny'
+    )));
+    assert.ok(worker.permissions.some((rule) => (
+      rule.action === 'edit' && rule.resource === `${fs.realpathSync(worktree)}/**` && rule.effect === 'allow'
+    )));
+
+    // The runtime question-tool guard still fails the parent ticket turn even
+    // though the configuration already denies the tool.
+    const questionStore = new SQLiteStore(path.join(TMP, 'ticket-agent-delegated-build-question.sqlite3'));
+    const questionRunner = runnerFor(questionStore, {
+      environment: { ...environment, FAKE_OPENCODE_MODE: 'question' },
+    });
+    const questionSession = await questionRunner.createSession({
+      jobId: makeJob(questionStore, 624), role: 'ticket-agent', model, worktree,
+    });
+    await assert.rejects(
+      questionRunner.run({ sessionId: questionSession.externalSessionId, prompt: 'Attempt to ask a question.' }),
+      (error) => error instanceof AgentRunnerError && error.code === 'AGENT_QUESTION_DENIED',
+    );
+    assert.equal(questionStore.getAgentSession(questionSession.externalSessionId).status, 'FAILED');
+    questionStore.close();
+    store.close();
+    ok('ticket-agent delegates to a separate build worker with the configured model and question denied for parent and child');
+  }
+
+  // Ticket sessions fail closed before OpenCode starts when gh auth is absent,
+  // too broadly readable, or over the configured bounded size.
+  {
+    for (const [name, prepare] of [
+      ['missing', (directory) => {}],
+      ['unsafe-mode', (directory) => {
+        fs.writeFileSync(path.join(directory, 'hosts.yml'), 'github.com:\n  oauth_token: unsafe-fixture-token\n', { mode: 0o644 });
+        fs.chmodSync(path.join(directory, 'hosts.yml'), 0o644);
+      }],
+      ['oversized', (directory) => {
+        fs.writeFileSync(path.join(directory, 'hosts.yml'), Buffer.alloc(1024 * 1024 + 1, 97), { mode: 0o600 });
+      }],
+      ['wrong-host', (directory) => {
+        fs.writeFileSync(path.join(directory, 'hosts.yml'),
+          'ghe.example.invalid:\n  oauth_token: enterprise-only-fixture-token\n', { mode: 0o600 });
+      }],
+    ]) {
+      const worktree = createWorktree(`ticket-agent-${name}`);
+      const store = new SQLiteStore(path.join(TMP, `ticket-agent-${name}.sqlite3`));
+      const sourceGhConfig = path.join(TMP, `ticket-agent-${name}-gh`);
+      const reportFile = path.join(TMP, `ticket-agent-${name}-report.json`);
+      const spawnLog = path.join(TMP, `ticket-agent-${name}-spawns.txt`);
+      fs.mkdirSync(sourceGhConfig, { mode: 0o700 });
+      prepare(sourceGhConfig);
+      const runner = runnerFor(store, { environment: {
+        GH_CONFIG_DIR: sourceGhConfig,
+        FAKE_OPENCODE_REPORT: reportFile,
+        FAKE_OPENCODE_SPAWN_LOG: spawnLog,
+      } });
+      const session = await runner.createSession({
+        jobId: makeJob(store, 620 + ['missing', 'unsafe-mode', 'oversized', 'wrong-host'].indexOf(name)),
+        role: 'ticket-agent', model: 'test/model', worktree,
+      });
+      await assert.rejects(
+        runner.run({ sessionId: session.externalSessionId, prompt: 'Do not launch without safe gh auth.' }),
+        (error) => error instanceof AgentRunnerError && error.code === 'AGENT_SPAWN_FAILED',
+      );
+      assert.equal(store.getAgentSession(session.externalSessionId).status, 'CREATED');
+      assert.equal(fs.existsSync(reportFile), false, 'OpenCode must not start with absent or unsafe auth');
+      assert.equal(fs.existsSync(spawnLog), false);
+      store.close();
+    }
+    ok('ticket-agent refuses missing, unsafe-mode, oversized, and non-github.com gh auth before process launch');
   }
 
   // A user-selected default agent remains the selected identity while the

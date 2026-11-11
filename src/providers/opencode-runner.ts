@@ -14,7 +14,6 @@ import {
   cleanupOciContainers,
   prepareOciSandbox,
   writeOciShellWrapper,
-  type OciSandbox,
 } from './oci-sandbox.js';
 import { parseJsonc } from '../core/config.js';
 import {
@@ -24,7 +23,6 @@ import {
   type AgentRunner,
   type AgentSession,
   type AgentSessionStatus,
-  type AgentResultStatus,
   type CreateAgentSessionArgs,
   type RunAgentSessionArgs,
 } from './ports.js';
@@ -37,9 +35,11 @@ const EXECUTION_LEASE_MS = 60_000;
 const MAX_RESULT_BYTES = 1024 * 1024;
 const MAX_NDJSON_BYTES = 50 * 1024 * 1024;
 const MAX_STDERR_BYTES = 5 * 1024 * 1024;
+const MAX_GH_AUTH_BYTES = 1024 * 1024;
 const RESULT_RELATIVE_PATH = path.join('.issue-orchestrator', 'result.json');
-const SUPPORTED_ROLES = new Set<AgentRole>(['triage', 'builder', 'verifier', 'reviewer']);
+const SUPPORTED_ROLES = new Set<AgentRole>(['triage', 'builder', 'ticket-agent', 'verifier', 'reviewer']);
 const OPENCODE_BUILTIN_DEFAULT_AGENT = 'build';
+const TICKET_DELEGATED_AGENT = 'build-worker';
 
 const ZERO_USAGE: AgentUsage = {
   inputTokens: 0,
@@ -131,16 +131,55 @@ function agentPermissions(role: AgentRole, worktree: string) {
     { action: 'edit', resource: resultFile, effect: 'allow' },
     { action: 'question', resource: '*', effect: 'deny' },
   ];
-  if (role !== 'builder') return [...permissions, { action: 'shell', resource: '*', effect: 'deny' }];
-  return [
-    ...permissions,
-    { action: 'edit', resource: worktreeFiles, effect: 'allow' },
-    { action: 'shell', resource: '*', effect: 'allow' },
-    { action: 'shell', resource: '*git push*', effect: 'deny' },
-    { action: 'shell', resource: '*git merge*', effect: 'deny' },
-    { action: 'shell', resource: '*gh*', effect: 'deny' },
-    { action: 'shell', resource: '*glab*', effect: 'deny' },
-  ];
+  if (role === 'builder') {
+    return [
+      ...permissions,
+      { action: 'edit', resource: worktreeFiles, effect: 'allow' },
+      { action: 'shell', resource: '*', effect: 'allow' },
+      { action: 'shell', resource: '*git push*', effect: 'deny' },
+      { action: 'shell', resource: '*git merge*', effect: 'deny' },
+      { action: 'shell', resource: '*gh*', effect: 'deny' },
+      { action: 'shell', resource: '*glab*', effect: 'deny' },
+    ];
+  }
+  if (role === 'ticket-agent') {
+    return [
+      ...permissions,
+      { action: 'edit', resource: worktreeFiles, effect: 'allow' },
+      { action: 'shell', resource: '*', effect: 'allow' },
+      { action: 'shell', resource: '*gh*', effect: 'allow' },
+      { action: 'shell', resource: '*git push*', effect: 'allow' },
+      // The ticket agent may delegate bounded implementation work to the
+      // dedicated build worker. Every other subagent remains denied.
+      { action: 'subagent', resource: '*', effect: 'deny' },
+      { action: 'subagent', resource: TICKET_DELEGATED_AGENT, effect: 'allow' },
+    ];
+  }
+  return [...permissions, { action: 'shell', resource: '*', effect: 'deny' }];
+}
+
+function delegatedBuildAgent(worktree: string, model: string) {
+  return {
+    description: 'Implement delegated repository work in the ticket worktree. Shares the parent ticket agent\'s trusted worktree, container, network, and GitHub CLI authority.',
+    mode: 'subagent',
+    // Agent model selectors retain the configured #variant; the subagent uses
+    // the same configured model as the parent ticket session.
+    model,
+    system: `You are a delegated implementation worker for a routed GitHub ticket. Work only in the repository worktree ${JSON.stringify(worktree)}; use it for OpenCode file tools and as the shell tool's workdir. The existing code-dev Docker container is the isolation boundary; do not invoke a nested OCI builder sandbox. You share the parent ticket agent's trusted authority in that container, including shell, network, and the private GitHub CLI login. Inspect, implement, and test the requested change, then report your changes and evidence to the parent ticket agent. The parent remains responsible for final publication (commits, pushes, pull requests, comments, and follow-up issues) and for the machine result contract; do not take those publication steps or write the result contract unless the parent explicitly asks you to. Never invoke a question tool.`,
+    permissions: [
+      // A delegated worker has the same trusted authority as its parent. OpenCode
+      // shell permission globs are not an isolation boundary because shell has
+      // the same network, filesystem, and credential authority; the parent's
+      // gh/push allow rules therefore apply here too.
+      ...agentPermissions('ticket-agent', worktree),
+      // Enforced by OpenCode: no nested subagents. `subagent_depth: 1` also
+      // pins this limit in the generated config.
+      { action: 'subagent', resource: '*', effect: 'deny' },
+      // Repeated after the ticket-agent rules so the last matching rule denies
+      // the question tool for the worker as well.
+      { action: 'question', resource: '*', effect: 'deny' },
+    ],
+  };
 }
 
 function configuredDefaultAgent(source: NodeJS.ProcessEnv) {
@@ -179,6 +218,7 @@ function agentConfig(
   role: AgentRole,
   defaultAgent: { name: string; definition: Record<string, unknown> },
   worktree: string,
+  model: string,
   shellWrapper?: string,
   trustedSystemPrompt?: string,
 ) {
@@ -186,38 +226,48 @@ function agentConfig(
   const descriptions: Record<AgentRole, string> = {
     triage: 'Classify a trusted issue and identify acceptance criteria without editing files.',
     builder: 'Implement a change in the isolated workspace and report the structured result. Shell commands run in disposable network-disabled OCI containers.',
+    'ticket-agent': 'Work a routed GitHub ticket directly in its persisted worktree and publish the result through GitHub CLI.',
     verifier: 'Inspect the change read-only and report verification evidence without running commands or asking questions.',
     reviewer: 'Review the current change read-only and report findings without asking questions.',
   };
   const systems: Record<AgentRole, string> = {
     triage: `Triage only. Never ask a question. If required information is missing, return BLOCKED. Write the result contract to the absolute path ${JSON.stringify(resultFile)}.`,
     builder: `Implement only in the repository worktree. The host repository worktree is ${JSON.stringify(worktree)}. Use that path for OpenCode file tools and for the shell tool's workdir; never pass /workspace as an OpenCode tool path or workdir. The shell wrapper runs every shell command in a fresh, disposable OCI container with no network, no host home, no credentials, and no runtime socket. Inside shell commands, the repository is mounted at /workspace and the shell starts there; use repository-relative paths in commands. If an OpenCode edit or patch tool is denied, use the shell tool to make the requested change through the same isolated container. Never push, use gh/glab, comment, merge, or ask questions. Write the result contract to the absolute path ${JSON.stringify(resultFile)}.`,
+    'ticket-agent': `Work only in the persisted repository worktree ${JSON.stringify(worktree)}; use it for OpenCode file tools and as the shell tool's workdir. The existing code-dev Docker container is the isolation boundary; do not invoke a nested OCI builder sandbox. The router supplies filtered GitHub event URLs and identities, not verified issue contents or CI conclusions. Read the issue, its relevant comments, and the supplied event URLs yourself with gh; inspect repository state and relevant checks yourself. Implement and test the requested change, commit it, push the branch, and create or update the appropriate pull request and any follow-up issues with gh. You may delegate bounded implementation work to the build-worker subagent; it shares your trusted worktree, container, network, and GitHub CLI authority and must never ask questions. Delegate only work you would perform yourself. You remain responsible for final publication and the machine result contract. Do not claim that the router verified CI or that checks passed unless you inspected that evidence yourself. If clarification is required, post one concise question as a GitHub issue comment with gh, write BLOCKED or NEEDS_INFO with that question in the result contract, and stop. Never invoke a question tool. Write the result contract to the absolute path ${JSON.stringify(resultFile)}.`,
     verifier: `Verify only by read-only inspection. Do not edit or run shell commands. Never ask a question. Report blockers in the result file at ${JSON.stringify(resultFile)}.`,
     reviewer: `Review only. Do not edit or run shell commands. Never ask a question. Write the result contract to ${JSON.stringify(resultFile)}.`,
   };
+  const delegatesToBuild = role === 'ticket-agent';
+  const agents: Record<string, unknown> = {
+    [defaultAgent.name]: {
+      ...defaultAgent.definition,
+      description: descriptions[role],
+      mode: 'primary',
+      system: [
+        typeof defaultAgent.definition.system === 'string' ? defaultAgent.definition.system : undefined,
+        systems[role],
+        trustedSystemPrompt === undefined ? undefined : `Additional trusted system instructions:\n${trustedSystemPrompt}`,
+      ].filter(Boolean).join('\n\n'),
+      permissions: agentPermissions(role, worktree),
+    },
+  };
+  if (delegatesToBuild) {
+    agents[TICKET_DELEGATED_AGENT] = delegatedBuildAgent(worktree, model);
+  }
   return {
     $schema: 'https://opencode.ai/config.json',
     default_agent: defaultAgent.name,
     plugins: [],
     mcp: {},
     ...(role === 'builder' && shellWrapper ? { shell: shellWrapper } : {}),
-    agents: {
-      [defaultAgent.name]: {
-        ...defaultAgent.definition,
-        description: descriptions[role],
-        mode: 'primary',
-        system: [
-          typeof defaultAgent.definition.system === 'string' ? defaultAgent.definition.system : undefined,
-          systems[role],
-          trustedSystemPrompt === undefined ? undefined : `Additional trusted system instructions:\n${trustedSystemPrompt}`,
-        ].filter(Boolean).join('\n\n'),
-        permissions: agentPermissions(role, worktree),
-      },
-    },
+    // Pin OpenCode's experimental nesting limit so a delegated build worker
+    // cannot start further subagents even if the operator config allows it.
+    ...(delegatesToBuild ? { experimental: { subagent_depth: 1 } } : {}),
+    agents,
   };
 }
 
-function makeAgentPath(sourcePath: string | undefined, runDirectory: string) {
+function makeAgentPath(sourcePath: string | undefined, runDirectory: string, allowGh = false) {
   const binDirectory = path.join(runDirectory, 'bin');
   fs.mkdirSync(binDirectory, { mode: 0o700 });
   const seen = new Set<string>();
@@ -227,10 +277,8 @@ function makeAgentPath(sourcePath: string | undefined, runDirectory: string) {
     try { entries = fs.readdirSync(rawDirectory); } catch { continue; }
     for (const entry of entries) {
       const normalized = entry.toLowerCase();
-      if ([
-        'gh', 'gh.exe', 'gh.cmd', 'gh.bat',
-        'glab', 'glab.exe', 'glab.cmd', 'glab.bat',
-      ].includes(normalized) || seen.has(normalized)) continue;
+      if ((!allowGh && ['gh', 'gh.exe', 'gh.cmd', 'gh.bat'].includes(normalized)) ||
+          ['glab', 'glab.exe', 'glab.cmd', 'glab.bat'].includes(normalized) || seen.has(normalized)) continue;
       const candidate = path.join(rawDirectory, entry);
       try { fs.accessSync(candidate, process.platform === 'win32' ? fs.constants.F_OK : fs.constants.X_OK); }
       catch { continue; }
@@ -254,6 +302,9 @@ function makeAgentPath(sourcePath: string | undefined, runDirectory: string) {
       try { fs.copyFileSync(process.execPath, destination); }
       catch { throw new AgentRunnerError('AGENT_PROCESS_FAILED', 'Could not add the trusted Node runtime to the isolated agent PATH'); }
     }
+  }
+  if (allowGh && !['gh', 'gh.exe'].some((name) => seen.has(name))) {
+    throw new AgentRunnerError('AGENT_SPAWN_FAILED', 'GitHub CLI is not available on the ticket agent trusted PATH');
   }
   return binDirectory;
 }
@@ -367,6 +418,152 @@ function seedOpenCodeProviderAuth(source: NodeJS.ProcessEnv, privateDataHome: st
     throw new AgentRunnerError('AGENT_SPAWN_FAILED', 'Could not prepare private OpenCode provider credentials', undefined, error);
   }
   return { secrets: collectProviderAuthSecrets(selected), importFile: targetAuth };
+}
+
+function writePrivateFile(file: string, contents: string | Buffer, label: string) {
+  const noFollow = fs.constants.O_NOFOLLOW;
+  if (typeof noFollow !== 'number') {
+    throw new AgentRunnerError('AGENT_SPAWN_FAILED', `This platform cannot safely prepare ${label}`);
+  }
+  const temporary = `${file}.${randomUUID()}.tmp`;
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(temporary, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | noFollow, 0o600);
+    fs.fchmodSync(fd, 0o600);
+    fs.writeFileSync(fd, contents);
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = undefined;
+
+    const validate = (candidate: string) => {
+      const stats = fs.lstatSync(candidate);
+      if (!stats.isFile() || stats.isSymbolicLink() || !isOwnedByCurrentUser(stats) ||
+          (process.platform !== 'win32' && (stats.mode & 0o077) !== 0)) {
+        throw new Error('private file validation failed');
+      }
+    };
+    validate(temporary);
+    fs.renameSync(temporary, file);
+    validate(file);
+  } catch (error) {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch { /* already closed */ }
+    }
+    try { fs.unlinkSync(temporary); } catch { /* no temporary file remains */ }
+    throw new AgentRunnerError('AGENT_SPAWN_FAILED', `Could not securely prepare ${label}`, undefined, error);
+  }
+}
+
+function selectGitHubHostConfig(text: string) {
+  const blocks: Array<{ host: string; lines: string[] }> = [];
+  let current: { host: string; lines: string[] } | undefined;
+  for (const line of text.split(/\r?\n/)) {
+    // Comments are not needed in the narrowed session copy.
+    if (line.trimStart().startsWith('#')) continue;
+    const hostMatch = /^["']?([^\s#:"']+)["']?:(?:\s*(?:#.*)?)$/.exec(line);
+    if (hostMatch) {
+      if (current) blocks.push(current);
+      current = { host: hostMatch[1].trim(), lines: [line] };
+      continue;
+    }
+    if (!current) {
+      // Comments and blank lines are allowed before the first host block.
+      if (line.trim() === '' || line.trimStart().startsWith('#')) continue;
+      throw new AgentRunnerError('AGENT_SPAWN_FAILED', 'Configured GitHub CLI credentials are absent or unsafe');
+    }
+    if (/^\S/.test(line)) {
+      throw new AgentRunnerError('AGENT_SPAWN_FAILED', 'Configured GitHub CLI credentials are absent or unsafe');
+    }
+    current.lines.push(line);
+  }
+  if (current) blocks.push(current);
+  const github = blocks.find((block) => block.host.toLowerCase() === 'github.com');
+  if (!github) {
+    throw new AgentRunnerError('AGENT_SPAWN_FAILED', 'Configured GitHub CLI credentials contain no github.com host');
+  }
+  const contents = `${github.lines.join('\n').trimEnd()}\n`;
+  const secrets = [...contents.matchAll(/^\s*oauth_token:\s*(?:"([^"]*)"|'([^']*)'|([^#\s]+))/gm)]
+    .map((match) => match[1] ?? match[2] ?? match[3] ?? '')
+    .filter((value) => value.length >= 4);
+  if (secrets.length === 0) {
+    throw new AgentRunnerError('AGENT_SPAWN_FAILED', 'Configured GitHub CLI credentials are absent or unsafe');
+  }
+  return { contents, secrets };
+}
+
+function readConfiguredGhAuth(source: NodeJS.ProcessEnv) {
+  const configuredDirectory = source.GH_CONFIG_DIR?.trim();
+  const directory = path.resolve(configuredDirectory || path.join(
+    source.XDG_CONFIG_HOME || path.join(source.HOME || os.homedir(), '.config'),
+    'gh',
+  ));
+  const authFile = path.join(directory, 'hosts.yml');
+  const noFollow = fs.constants.O_NOFOLLOW;
+  if (typeof noFollow !== 'number') {
+    throw new AgentRunnerError('AGENT_SPAWN_FAILED', 'This platform cannot safely inspect configured GitHub CLI credentials');
+  }
+
+  let directoryStat: fs.Stats;
+  try { directoryStat = fs.lstatSync(directory); }
+  catch (error) {
+    throw new AgentRunnerError('AGENT_SPAWN_FAILED', 'Configured GitHub CLI credentials are absent or unsafe', undefined, error);
+  }
+  if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink() || !isOwnedByCurrentUser(directoryStat) ||
+      (process.platform !== 'win32' && (directoryStat.mode & 0o022) !== 0)) {
+    throw new AgentRunnerError('AGENT_SPAWN_FAILED', 'Configured GitHub CLI credentials are absent or unsafe');
+  }
+
+  let fd: number;
+  try { fd = fs.openSync(authFile, fs.constants.O_RDONLY | noFollow); }
+  catch (error) {
+    throw new AgentRunnerError('AGENT_SPAWN_FAILED', 'Configured GitHub CLI credentials are absent or unsafe', undefined, error);
+  }
+  try {
+    const stats = fs.fstatSync(fd);
+    if (!stats.isFile() || !isOwnedByCurrentUser(stats) || (process.platform !== 'win32' && (stats.mode & 0o077) !== 0) ||
+        stats.size <= 0 || stats.size > MAX_GH_AUTH_BYTES) {
+      throw new AgentRunnerError('AGENT_SPAWN_FAILED', 'Configured GitHub CLI credentials are absent or unsafe');
+    }
+    const chunks: Buffer[] = [];
+    let length = 0;
+    const buffer = Buffer.alloc(64 * 1024);
+    while (true) {
+      const bytesRead = fs.readSync(fd, buffer, 0, Math.min(buffer.length, MAX_GH_AUTH_BYTES + 1 - length), null);
+      if (bytesRead === 0) break;
+      length += bytesRead;
+      if (length > MAX_GH_AUTH_BYTES) {
+        throw new AgentRunnerError('AGENT_SPAWN_FAILED', 'Configured GitHub CLI credentials are absent or unsafe');
+      }
+      chunks.push(Buffer.from(buffer.subarray(0, bytesRead)));
+    }
+    const contents = Buffer.concat(chunks);
+    const afterRead = fs.fstatSync(fd);
+    if (afterRead.size !== contents.length) {
+      throw new AgentRunnerError('AGENT_SPAWN_FAILED', 'Configured GitHub CLI credentials are absent or unsafe');
+    }
+    // Copy only the github.com host block. A multi-host gh config must not leak
+    // unrelated GitHub Enterprise or other host credentials into the session.
+    return selectGitHubHostConfig(contents.toString('utf8'));
+  } catch (error) {
+    if (error instanceof AgentRunnerError) throw error;
+    throw new AgentRunnerError('AGENT_SPAWN_FAILED', 'Configured GitHub CLI credentials are absent or unsafe', undefined, error);
+  } finally {
+    try { fs.closeSync(fd); } catch { /* already closed */ }
+  }
+}
+
+function seedTicketAgentGitHubAuth(source: NodeJS.ProcessEnv, privateConfigHome: string) {
+  const auth = readConfiguredGhAuth(source);
+  const configDirectory = ensurePrivateDirectory(path.join(privateConfigHome, 'gh'));
+  const authFile = path.join(configDirectory, 'hosts.yml');
+  writePrivateFile(authFile, auth.contents, 'private GitHub CLI credentials');
+  return { configDirectory, secrets: auth.secrets };
+}
+
+function writeTicketAgentGitCredentialConfig(sessionDirectory: string) {
+  const config = path.join(sessionDirectory, 'gitconfig');
+  writePrivateFile(config, '[credential]\n\thelper =\n\thelper = !gh auth git-credential\n', 'private Git credential helper config');
+  return config;
 }
 
 function importOpenCodeProviderAuth(
@@ -1046,11 +1243,11 @@ async function waitForPersistedGroupExit(identity: PersistedAgentProcess, timeou
 
 async function waitForSpawnedGroupExit(pgid: number, timeoutMs: number) {
   const deadline = Date.now() + timeoutMs;
-  do {
+  for (;;) {
     if (processGroupMembers(pgid).every(processHasExited)) return true;
     if (Date.now() >= deadline) return false;
     await new Promise((resolve) => setTimeout(resolve, 25));
-  } while (true);
+  }
 }
 
 async function waitForProcessClose(closed: Promise<ProcessOutcome>, timeoutMs: number) {
@@ -1105,7 +1302,7 @@ export class OpenCodeAgentRunner implements AgentRunner {
     resume: true,
     abort: true,
     result: true,
-    roles: Object.freeze(['triage', 'builder', 'verifier', 'reviewer']),
+    roles: Object.freeze(['triage', 'builder', 'ticket-agent', 'verifier', 'reviewer']),
     blockedRoles: Object.freeze([]),
   }, []);
 
@@ -1263,8 +1460,14 @@ export class OpenCodeAgentRunner implements AgentRunner {
     const sessions = ensureAgentSessionDirectory(worktree);
     const safeId = safeSessionPart(record.externalSessionId);
     const sessionDirectory = ensurePrivateDirectory(path.join(sessions, safeId));
-      const privatePaths = preparePrivateAgentDirectories(sessionDirectory);
-      const providerAuth = seedOpenCodeProviderAuth(this.environment, privatePaths.xdgData, record.model);
+    const privatePaths = preparePrivateAgentDirectories(sessionDirectory);
+    const providerAuth = seedOpenCodeProviderAuth(this.environment, privatePaths.xdgData, record.model);
+    const githubAuth = role === 'ticket-agent'
+      ? seedTicketAgentGitHubAuth(this.environment, privatePaths.xdgConfig)
+      : undefined;
+    const gitCredentialConfig = role === 'ticket-agent'
+      ? writeTicketAgentGitCredentialConfig(sessionDirectory)
+      : undefined;
     const sandbox = role === 'builder'
       ? requireBuilderSandbox(worktree, this.containerRuntime, this.environment, record.externalSessionId)
       : undefined;
@@ -1403,17 +1606,17 @@ export class OpenCodeAgentRunner implements AgentRunner {
         if (startupIntent) {
           // The supervisor cannot launch OpenCode until its identity is stored;
           // a token-only row therefore proves no agent or builder command ran.
-          cleanupSandboxContainers(false);
+          if (sandbox) cleanupSandboxContainers(false);
         } else {
           await terminatePersistedProcessGroup(previous, this.terminationGraceMs);
-          cleanupSandboxContainers(false);
+          if (sandbox) cleanupSandboxContainers(false);
         }
         if (!this.store().clearAgentSessionProcess(record.externalSessionId, owner)) {
           throw new AgentRunnerError('AGENT_EXECUTION_LEASE_LOST', 'Execution lease changed during stale-session recovery', record.externalSessionId);
         }
         previousExecutionReconciled = true;
       } else {
-        cleanupSandboxContainers(false);
+        if (sandbox) cleanupSandboxContainers(false);
       }
       if (!renewOwnership()) throw leaseFailure;
       ndjsonFd = openSessionLog(record.ndjsonPath, resume);
@@ -1433,24 +1636,34 @@ export class OpenCodeAgentRunner implements AgentRunner {
         shellWrapper = generatedWrapper.file;
         gitHooksDirectory = generatedWrapper.gitHooksDirectory;
       }
-      fs.writeFileSync(configFile, JSON.stringify(agentConfig(role, defaultAgent, worktree, shellWrapper, structured ? args.systemPrompt : undefined)), {
+      fs.writeFileSync(configFile, JSON.stringify(agentConfig(
+        role, defaultAgent, worktree, record.model, shellWrapper, structured ? args.systemPrompt : undefined,
+      )), {
         mode: 0o600,
         flag: 'wx',
       });
       const resultFile = path.join(worktree, RESULT_RELATIVE_PATH);
       const userTurn = structured ? JSON.stringify(args.input) : args.prompt!.trim();
+      const referenceInstructions = role === 'ticket-agent'
+        ? `Optionally include same-repository GitHub PR/check URLs that you created or inspected with gh. Verify each reported URL and CI/check status yourself; the router does not verify CI.`
+        : `Only report links provided by the selected integration; this bridge does not verify their existence or CI state.`;
       const prompt = [
         'Task from issue-orchestrator:',
         userTurn,
         '',
-        `Machine result contract: before finishing, write exactly one JSON object to the absolute path ${JSON.stringify(resultFile)} with required fields status (DONE, BLOCKED, CHANGES_REQUIRED or NEEDS_INFO), summary, changed_files (string[]), commands (string[]), acceptance (string[]), blocked_reason (string or null), evidence_dir (string or null), and verdict. Optionally include references as an array of up to 20 objects shaped {kind:"pull_request"|"checks",url:"https://github.com/<same-owner>/<same-repo>/pull/<number>"}, {kind:"checks",url:"https://github.com/<same-owner>/<same-repo>/pull/<number>/checks"}, or {kind:"checks",url:"https://github.com/<same-owner>/<same-repo>/actions/runs/<id>"}. Only report links provided by the selected integration; this bridge does not verify their existence or CI state. For BLOCKED or NEEDS_INFO, put the concise question or blocker in blocked_reason. Never invoke a question tool.`,
+        `Machine result contract: before finishing, write exactly one JSON object to the absolute path ${JSON.stringify(resultFile)} with required fields status (DONE, BLOCKED, CHANGES_REQUIRED or NEEDS_INFO), summary, changed_files (string[]), commands (string[]), acceptance (string[]), blocked_reason (string or null), evidence_dir (string or null), and verdict. Optionally include references as an array of up to 20 objects shaped {kind:"pull_request"|"checks",url:"https://github.com/<same-owner>/<same-repo>/pull/<number>"}, {kind:"checks",url:"https://github.com/<same-owner>/<same-repo>/pull/<number>/checks"}, or {kind:"checks",url:"https://github.com/<same-owner>/<same-repo>/actions/runs/<id>"}. ${referenceInstructions} For BLOCKED or NEEDS_INFO, put the concise question or blocker in blocked_reason. Never invoke a question tool.`,
       ].join('\n');
       const argv = [
         'run', '--standalone', '--session', record.externalSessionId,
         '--model', record.model, '--format', 'json', '--auto', prompt,
       ];
-      const agentPath = makeAgentPath(this.environment.PATH ?? this.environment.Path, runDirectory);
+      const agentPath = makeAgentPath(this.environment.PATH ?? this.environment.Path, runDirectory, role === 'ticket-agent');
       const env = scrubEnvironment(this.environment, configFile, agentPath, privatePaths, executionId);
+      if (githubAuth && gitCredentialConfig) {
+        env.GH_CONFIG_DIR = githubAuth.configDirectory;
+        env.GIT_CONFIG_GLOBAL = gitCredentialConfig;
+      }
+      const logSecrets = [...providerAuth.secrets, ...(githubAuth?.secrets ?? [])];
       if (providerAuth.importFile) {
         importOpenCodeProviderAuth(this.executable, env, privatePaths.cwd, providerAuth.importFile, record.externalSessionId);
       }
@@ -1553,7 +1766,7 @@ export class OpenCodeAgentRunner implements AgentRunner {
           const lines = pendingLine.split('\n');
           pendingLine = lines.pop() ?? '';
           if (lines.length) {
-            const completeLines = lines.map((line) => redactLogText(`${line}\n`, this.environment, providerAuth.secrets)).join('');
+            const completeLines = lines.map((line) => redactLogText(`${line}\n`, this.environment, logSecrets)).join('');
             fs.writeSync(ndjsonFd!, completeLines);
           }
           for (const line of lines) onLine(line);
@@ -1666,16 +1879,16 @@ export class OpenCodeAgentRunner implements AgentRunner {
           );
         }
       }
-      cleanupSandboxContainers(true);
+      if (sandbox) cleanupSandboxContainers(true);
       if (!renewOwnership()) throw leaseFailure;
       try {
-        const completeStderr = redactLogText(Buffer.concat(stderrChunks).toString('utf8'), this.environment, providerAuth.secrets);
+        const completeStderr = redactLogText(Buffer.concat(stderrChunks).toString('utf8'), this.environment, logSecrets);
         fs.writeSync(stderrFd!, Buffer.from(completeStderr).subarray(0, MAX_STDERR_BYTES));
       } catch { /* stderr capture is diagnostic only */ }
       // A final event without a trailing newline still decides the run: a
       // question tool must fail closed before any result is accepted.
       if (pendingLine) {
-        fs.writeSync(ndjsonFd!, redactLogText(pendingLine, this.environment, providerAuth.secrets));
+        fs.writeSync(ndjsonFd!, redactLogText(pendingLine, this.environment, logSecrets));
         if (pendingLine.trim()) onLine(pendingLine);
       }
 
