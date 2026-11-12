@@ -27,34 +27,48 @@ valuable host secrets.
 | Threat | Controls | Residual risk |
 | --- | --- | --- |
 | Trusted-author account or issue compromise | Trusted author is a routing gate, not proof of benign content. Issue, PR, repo, diff, and comments are untrusted data. Independent review and native server approval remain separate gates. | A compromised trusted account can induce malicious changes within the configured project scope. |
-| Prompt injection in issue/PR/repository content | Role-specific OpenCode config denies by default; questions and web access are not granted; builder shell runs in OCI; review receives complete diff as untrusted data. | Model policy/permission bugs and malicious outputs remain possible. |
+| Prompt injection in issue/PR/repository content | GitHub content is untrusted; `question` is denied; ticket-agent runs inside the existing Docker container, while the legacy builder shell runs in OCI. | A ticket-agent injection may exercise the configured bot's GitHub permissions, including through a delegated worker that shares the same shell, network, and credential authority. |
 | Malicious dependency | Frozen lockfile install, scoped offline staging, lifecycle scripts disabled, no-network DoD container, production dependency audit in CI. | Vulnerable or malicious locked code can still affect the worktree/outputs; audit does not prove safety. |
-| Model/provider compromise | No tracker/Git credentials in agent environment; no `gh`/`glab` on agent PATH; CLI alone owns provider writes. Only OpenCode's provider `auth.json` is copied to private session data, and the host data path is not exposed. | The model process can use/exfiltrate its configured model-provider credentials; OpenCode runs under the host account and may access resources exposed by the OS/runtime beyond the explicit environment. Provider credentials used by the host CLI remain high-value. |
-| Evidence exfiltration | Builder container has `--network=none`; no host provider CLI or credential mounts; evidence is validated and published by the CLI. | OpenCode control plane may communicate with its configured model provider. Never send customer data/secrets without approval. |
+| Model/provider compromise | Legacy builder receives no GitHub credentials; ticket-agent receives only the configured GitHub CLI login in private per-session storage. OpenCode provider auth is isolated per session. | Ticket-agent can read/write as the bot account; model/provider data may be exfiltrated over its authorized network. |
+| Evidence exfiltration | Legacy builder container has `--network=none`; ticket-agent has network and `gh` by design. | OpenCode and GitHub communicate externally. Never send customer data/secrets without approval. |
 | Credential leakage | Environment scrubbing, private agent HOME/XDG paths, private logs with token redaction, gitleaks CI. | Redaction is pattern-based and cannot identify every secret format or prevent encoding/transforming data. Do not treat logs as a secret-safe sink. |
 
 ## V1 ticket-to-agent boundary
 
-The controls above describe the retained legacy `run --once` workflow. The V1
-`goal` path, adopted in
-[issue #53](https://github.com/all-the-rest/issue-orchestrator/issues/53),
-reads structured GitHub issues/comments and sends them to a project-selected
-agent integration. It does not inspect CI, edit source, manage PRs, or call
-merge APIs. The selected agent/project integration owns those operations and
-its provider CLI.
+The OCI controls above apply only to the retained legacy `run --once` builder.
+The V1 `goal` and `tickets poll` paths are route-only, as tracked in
+[issues #61–#64](https://github.com/all-the-rest/issue-orchestrator/issues/61).
+They send event IDs/URLs, not copied ticket/comment bodies. The ticket-agent
+OpenCode role runs directly in the existing `code-dev` container without a
+nested OCI sandbox. It receives a private per-session copy of the configured
+GitHub CLI authentication, narrowed to the `github.com` host block, and can use
+network/`gh` to read tickets and publish agent-owned changes. A ticket agent may
+delegate bounded implementation work to one `build-worker` subagent in the same
+worktree and container. That worker inherits the question denial and cannot
+launch further subagents, but it shares the parent's trusted shell, network,
+`gh`, and Git credential authority; it is not a separate security sandbox.
+Delegate only work the parent could perform itself. `question` is denied for the
+parent and every delegated worker; human decisions use a GitHub comment and
+trusted-reply routing.
 
-Ticket bodies, comments, updates, and final acceptance criteria remain untrusted
-data and are never executable authority. The bridge does not put credentials in
-those payloads. However, an agent integration that can use a project CLI may be
-able to access that CLI's credential store; this is a real authority boundary,
-not something a short prompt or the ticket bridge can sandbox. Run it under a
-disposable/dedicated OS identity and give it only the minimum project-scoped,
-short-lived permissions required.
+The Docker container is the execution boundary for the ticket agent; this is
+not a hostile-kernel or dedicated-OS-user boundary. A compromised OpenCode,
+Node, or container process may exercise every permission granted to the bot
+login. In particular, the configured bot account's repository/org grants are
+the real authority boundary, not something a prompt can narrow. Keep the Docker
+host socket out of the container, use protected branches and required checks,
+and revoke the bot's access if a session is compromised.
+
+The `code-dev` supervisor and the router run as the same container UID as an
+interactive development session. That UID can read the actual `gh` and provider
+credentials and can reach the container's dind endpoint; the orchestrator state
+directory's `0700` mode does not isolate it from that UID. Code-dev isolation
+protects the host and other containers, not the operator's shell from the
+router. Scope provider credentials and dind access to what the bot may use.
 
 Every condition that must prevent an agent-side merge must be enforced outside
 prompt text: protected branches/rulesets, required CI checks that encode all
-merge hard-denies, and no agent bypass actors. Do not grant administrators or
-the agent a bypass path for those checks. Manual mode must be enforced by
+merge hard-denies, and no agent bypass actors. Manual mode must be enforced by
 provider permissions or an equivalent rule that withholds merge authority, not
 merely by asking the agent not to merge. The legacy `run --once` path still has
 its distinct CLI-owned `auto_merge` and native-approval gates below.
@@ -63,32 +77,33 @@ its distinct CLI-owned `auto_merge` and native-approval gates below.
 
 In the legacy `run --once` path the builder may modify and locally commit in its
 job worktree but must not push, call tracker write APIs, create a PR, or merge;
-those are CLI operations. In the V1 `goal` path the selected agent integration
-has the project-level authority assigned by the operator and provider. This
-bridge cannot sandbox or narrow that authority. Configure server-side branch
-protection/rulesets with required CI and trusted human approval as needed; the
-integration and CLI cannot guarantee that server-side protection is enabled or
-prevent administrator overrides. Binary evidence and anything containing
-customer data must be inspected by a human before publication.
+those are CLI operations. In the V1 ticket path the agent itself has the GitHub
+authority assigned to the configured bot account. The router only filters,
+persists, and routes events; it cannot sandbox or narrow that authority.
+Configure server-side branch protection/rulesets with required CI and trusted
+human approval as needed; the agent and router cannot guarantee those rules are
+enabled or prevent administrator overrides. Binary evidence and anything
+containing customer data must be inspected by a human before publication.
 
 ## Residual risks, non-goals, and operating requirements
 
-- The V1 ticket bridge does not provide a dedicated-user or hostile-kernel
-  sandbox for the selected integration. Agent execution may inherit the
-  project's configured CLI authority; use a disposable/dedicated OS identity
-  and least-privilege credentials.
+- Ticket-agent container isolation does not protect against host root, a
+  compromised Docker daemon, or other processes with access to the container.
+- The ticket agent can use the configured bot's `gh` permissions; scope those
+  permissions to the repositories and actions it is intended to manage.
 - Prompts, trusted-author lists, regex scanning, and model review do not prevent
   compromise.
 - This project does not protect against host root, compromised container
   runtime/daemon, provider account takeover, server administrators, or
   vulnerabilities in OpenCode/Node/kernel.
-- Builder is networkless, but OpenCode requires provider communication.
+- The legacy builder is networkless, but the ticket agent and OpenCode require
+  network/provider communication.
   Provider-side retention/training policies are outside this project's control.
 - Lockfiles and audit gates reduce supply-chain drift; they do not establish
   dependency provenance or eliminate vulnerabilities.
-- Configure least-privilege CLI credentials, required branch rules, protected
-  CI workflows, and a disposable runner. Never mount a host container socket
-  into the builder.
+- Configure CLI credentials, required branch rules, protected CI workflows,
+  and a disposable runner. Never mount a host container socket into either
+  agent role.
 
 ## Incident response
 

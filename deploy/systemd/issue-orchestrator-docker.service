@@ -1,0 +1,21 @@
+[Unit]
+Description=Issue Orchestrator Docker worker
+Documentation=file:/opt/issue-orchestrator/docs/service.md
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/issue-orchestrator
+# Non-secret deployment paths only (workspace, config, runtime-bin). Keep this
+# file root-owned and mode 0600 so a non-root user cannot redirect the mounts.
+EnvironmentFile=-/etc/issue-orchestrator/docker.env
+ExecStart=/usr/bin/docker compose up -d --remove-orphans
+ExecReload=/usr/bin/docker compose up -d --remove-orphans --build
+ExecStop=/usr/bin/docker compose down
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { sameProjectId } from '../dist/core/project-id.js';
 import {
   TICKET_AGENT_SYSTEM_PROMPT,
   createTicketHandoff,
@@ -8,6 +9,11 @@ import {
   serializeTicketHandoff,
   ticketMode,
 } from '../dist/core/ticket-handoff.js';
+
+assert.equal(sameProjectId('Owner/Repo', 'owner/repo'), true,
+  'dispatch handoff validation accepts GitHub project case aliases');
+assert.equal(sameProjectId('owner/other', 'owner/repo'), false);
+assert.equal(sameProjectId(null, 'owner/repo'), false);
 
 assert.equal(ticketMode(['enhancement'], 'agent:auto-implement'), 'human-directed',
   'a title or issue type does not opt an issue into automatic implementation');
@@ -61,7 +67,7 @@ const followUp = createTicketHandoff({
 });
 assert.equal(followUp.kind, 'update');
 assert.deepEqual(followUp.updates, comments, 'human ticket updates are delivered as a separate structured field');
-assert.match(TICKET_AGENT_SYSTEM_PROMPT, /structured JSON data/);
+assert.match(TICKET_AGENT_SYSTEM_PROMPT, /trusted GitHub event identities and URLs/);
 assert.match(TICKET_AGENT_SYSTEM_PROMPT, /untrusted data/);
 assert.doesNotMatch(TICKET_AGENT_SYSTEM_PROMPT, /Untrusted issue text|Persist exactly/,
   'ticket and acceptance content never enter the bootstrap prompt');

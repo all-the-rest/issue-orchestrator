@@ -165,7 +165,7 @@ async function stopPersisted(identity: { pid: number | null; pgid: number | null
 }
 function socketPath(token: string) { return path.join('/tmp', `io-${typeof process.getuid==='function'?process.getuid():0}-${createHash('sha256').update(token).digest('hex').slice(0,12)}`, 'c'); }
 function ensureSocketDir(socket: string) { const dir=path.dirname(socket); try { fs.mkdirSync(dir,{mode:0o700}); } catch(e) { if ((e as NodeJS.ErrnoException).code!=='EEXIST') throw e; } const s=fs.lstatSync(dir); if(!s.isDirectory()||s.isSymbolicLink()||s.mode&0o077||s.uid!==process.getuid?.()) throw new Error('guardian socket directory is unsafe'); }
-function cleanupSocket(socket: string) { try { const dir=fs.lstatSync(path.dirname(socket)); if(!dir.isDirectory()||dir.isSymbolicLink()||dir.mode&0o077||dir.uid!==process.getuid?.()) return; const entry=fs.lstatSync(socket); if(entry.isSocket()&&entry.uid===process.getuid?.()) fs.unlinkSync(socket); } catch {} try { fs.rmdirSync(path.dirname(socket)); } catch {} }
+function cleanupSocket(socket: string) { try { const dir=fs.lstatSync(path.dirname(socket)); if(!dir.isDirectory()||dir.isSymbolicLink()||dir.mode&0o077||dir.uid!==process.getuid?.()) return; const entry=fs.lstatSync(socket); if(entry.isSocket()&&entry.uid===process.getuid?.()) fs.unlinkSync(socket); } catch { /* socket already gone */ } try { fs.rmdirSync(path.dirname(socket)); } catch { /* directory not empty or already gone */ } }
 
 /** Each invocation exchanges one versioned JSON request/response with a trusted installed executable. */
 export class CommandAgentRunner implements AgentRunner {
@@ -300,7 +300,7 @@ export class CommandAgentRunner implements AgentRunner {
         try { const parsed = JSON.parse(stdout); if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || parsed.protocol !== 'issue-orchestrator.agent-runner/v1') throw new Error(); finish(undefined, parsed); }
         catch { finish(new AgentRunnerError('COMMAND_PROTOCOL_ERROR', 'configured agent command returned an invalid protocol response')); }
       };
-      const finish = (error?: Error, value?: ProtocolResponse) => { if (settled) return; settled = true; clearTimeout(timer); error ? reject(error) : resolve(value!); };
+      const finish = (error?: Error, value?: ProtocolResponse) => { if (settled) return; settled = true; clearTimeout(timer); if (error) reject(error); else resolve(value!); };
       const stopAndClear = () => cleanupPromise ??= (async () => {
         if (!guardianPid || !guardianTicks) throw new Error('missing guardian identity');
         await stopPersisted({ pid: guardianPid, pgid: guardianPid, startTicks: guardianTicks, token });

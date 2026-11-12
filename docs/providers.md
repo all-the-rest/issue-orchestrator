@@ -15,8 +15,8 @@ missing operation throws `UnsupportedCapabilityError` and stops the workflow.
 | GitLab | CodeHost | — | Stub; fails closed | Stub; fails closed | Stub; fails closed | No | None | None |
 | Jira | Tracker | Stub; fails closed | Stub; fails closed | — | — | — | — | — |
 | Jira | CodeHost | — | Stub; fails closed | Not supported | Not supported | No | None | None |
-| GitHub | Ticket | Issues | Labels, human comments/updates, idempotent status comments | — | — | — | — | — |
-| OpenCode | AgentRunner | — | — | — | — | — | — | Local CLI adapter; builder requires the preloaded OCI sandbox image |
+| GitHub | Ticket | Issue routing metadata | Ticket comments and PR conversation/inline/review cursors; legacy status API | — | — | — | — | — |
+| OpenCode | AgentRunner | — | — | — | — | — | — | Local CLI adapter; builder uses OCI, ticket-agent runs in-container with private `gh` auth narrowed to the `github.com` host |
 | Command | AgentRunner | — | — | — | — | — | — | Trusted installed executable using versioned JSON stdio |
 
 ## Runner selection
@@ -58,9 +58,10 @@ locale, temp and Windows platform variables; host HOME/XDG paths, GitHub tokens,
 SSH-agent state, and unrelated host credentials are excluded. The installed executable must
 obtain approved auth through its own credential mechanism. Stderr is discarded
 and diagnostics are generic/redacted. This adapter only hands off structured
-goal/ticket/update data; it does not perform source, CI, PR, evidence, or merge
-operations, nor enforce merge policy. Actual enforcement belongs to the
-selected project/provider.
+data; it does not perform source, CI, PR, evidence, or merge operations, nor
+enforce merge policy. It is not supported for the `ticket-agent` role because
+that role requires the private GitHub CLI auth handling of the OpenCode runner.
+Actual merge enforcement belongs to the selected project/provider.
 
 The test suite includes an in-memory reference runner to exercise the basic
 port and shared result contract. It is test-only: it provides no isolation,
@@ -79,32 +80,38 @@ Those adapters belong to the older broad workflow; V1 ticket intake is GitHub-on
 
 ## V1 ticket-to-agent path
 
-`issue-orchestrator goal --project <owner/repo> --issue <number> --goal-file
-<private-path|-> [--retry-blocked]` reads a GitHub issue through the `Ticket`
-port. It provides the
-normalized title, body, author, labels, state, URL, human comments, and exact
-operator-supplied final acceptance criteria as structured input, separate from
-the stable system prompt. Credentials and host-private paths are redacted or
-rejected before handoff. Comments from configured tool accounts and comments
-with orchestrator status markers are excluded.
+`goal` and `tickets poll` use a route-only event envelope containing repository,
+issue/PR/comment IDs and URLs. The router does not read or copy issue/comment
+bodies into the agent payload. The ticket-agent fetches full issue/PR context
+with `gh`, then owns source edits, commits, pushes, PRs, comments, and linked
+follow-up issues. It may delegate bounded implementation work to the dedicated
+`build-worker` subagent; the worker runs in the same worktree and container,
+uses the ticket session's configured model, cannot ask questions or launch
+further subagents, and shares the parent's trusted shell, network, `gh`, and Git
+credential authority. That shared authority is deliberate: shell permission
+patterns and result-file edit rules are defense in depth, not isolation, and an
+instruction not to publish is not an enforced boundary. Delegate only work the
+parent could perform itself. Optional operator acceptance criteria passed to
+`goal` remain separate from GitHub event data.
 
-The configured `labels.auto_implement` value (default
-`agent:auto-implement`) is the only auto-implementation opt-in. Without it the
-ticket gets a `REVIEW (human-directed)` status and no runner session is started.
-Human issue comments and meaningful ticket-field/label changes after a result
-are persisted as follow-up turns on the same agent conversation. The selected
-agent integration owns source edits, PRs, CI, and merge; the orchestrator does
-not add Ticket-adjacent source or CI provider ports. Manual merge enforcement is
-by provider permissions and branch protection, not prompt wording.
-Terminal `BLOCKED` results are retried only with the explicit
-`--retry-blocked` option after local remediation; the original goal and agent
-conversation are preserved.
+The router admits only configured trusted authors, excludes the authenticated
+bot/tool accounts, and stores separate durable cursors for ticket comments and
+PR conversation, inline review, and review submission state. Review cursors also
+retain observed pending review ids and a `submitted_at` watermark with the ids
+already seen at that exact second, so a draft created before later reviews but
+submitted afterwards — including in the same second as the watermark — is
+delivered instead of being skipped by the numeric cursor. Agent-reported
+same-repository PR references associate follow-up events with that ticket's
+existing chat; the router does not infer association from ticket text or publish
+status comments. `question` is denied on the ticket agent and on every delegated
+subagent: the agent asks in a GitHub comment, stops, and resumes after a trusted
+reply. `--retry-blocked` explicitly continues the persisted conversation after
+local remediation.
 
-The GitHub Ticket adapter lists/reads issue fields, paginates comments, uses a
-comment ID cursor, and publishes bounded status comments with stable markers so
-uncertain writes can be reconciled without duplicates. Direct PR-review polling,
-GitLab, Jira, remote runners, event/webhook triggers, and publishing are outside
-V1.
+The Ticket adapter provides routing metadata, paginated event sources and
+legacy read/status operations. The ticket router uses metadata and cursors only;
+it does not use the provider's status-comment publishing method. GitLab, Jira,
+and remote event/webhook ingress remain outside V1.
 
 ## Configuration
 

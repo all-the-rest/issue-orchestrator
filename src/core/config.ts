@@ -8,9 +8,125 @@ import {
   quarantineCorruptLegacyLock as quarantineLegacyLock,
 } from './persistence.js';
 
+import { DEFAULT_TICKET_BOOTSTRAP, TICKET_AGENT_SYSTEM_PROMPT } from './ticket-handoff.js';
+import {
+  DEFAULT_DELIVERY_SCHEDULE,
+  normalizeDeliverySchedule,
+  type DeliverySchedule,
+  type RawDeliverySettings,
+} from './delivery-window.js';
+
 export const DOD_CATEGORIES = ['build', 'test', 'lint', 'typecheck', 'security'] as const;
 export const EVIDENCE_CLASSES = ['ui', 'cli', 'docs'] as const;
 export const ACCEPTANCE_SOURCES = ['issue_body', 'triage_comment'] as const;
+
+/** Optional per-ticket agent instructions, validated before they are used. */
+interface RawTicketSettings {
+  bootstrap?: string[];
+  system_prompt?: string;
+  workspace?: string;
+  /** Global cap on simultaneously executing ticket-agent sessions. */
+  max_concurrency?: number;
+  /** Durable quiet period used to coalesce events belonging to one issue. */
+  quiet_period_ms?: number;
+  /** Cadence of the background intake ticker while an agent turn runs. */
+  intake_poll_ms?: number;
+  /** Minimum interval between polls of one merged/closed PR conversation. */
+  post_merge_poll_ms?: number;
+  /** Maximum retired PRs polled per turn, rotating fairly by last poll time. */
+  post_merge_poll_limit?: number;
+  /** Optional automated-dispatch windows and global start-to-start cooldown. */
+  delivery?: RawDeliverySettings;
+}
+
+export const DEFAULT_TICKET_MAX_CONCURRENCY = 1;
+export const DEFAULT_TICKET_QUIET_PERIOD_MS = 60_000;
+export const DEFAULT_TICKET_INTAKE_POLL_MS = 30_000;
+export const DEFAULT_TICKET_POST_MERGE_POLL_MS = 5 * 60_000;
+export const DEFAULT_TICKET_POST_MERGE_POLL_LIMIT = 2;
+export const MAX_TICKET_QUIET_PERIOD_MS = 60 * 60 * 1000;
+export const MIN_TICKET_INTAKE_POLL_MS = 1_000;
+export const MAX_TICKET_INTAKE_POLL_MS = 60 * 60 * 1000;
+const MAX_TICKET_POST_MERGE_POLL_MS = 60 * 60 * 1000;
+const MAX_TICKET_POST_MERGE_POLL_LIMIT = 20;
+
+interface RawCommandRunner {
+  executable?: string;
+  args?: string[];
+  timeout_ms?: number;
+}
+
+interface RawDodConfig {
+  commands?: Record<string, string[] | null>;
+  required_checks?: string[];
+  evidence_class?: string;
+  acceptance_source?: string;
+  timeout_ms?: number;
+}
+
+interface RawRepoConfig extends RawTicketSettings {
+  [key: string]: unknown;
+  enabled?: boolean;
+  local_only?: boolean;
+  auto_merge?: boolean;
+  agent_runner?: string;
+  command_runner?: RawCommandRunner;
+  max_concurrency?: number;
+  resource_locks?: string[];
+  account?: string;
+  tracker_account?: string;
+  code_host_account?: string;
+  provider?: string;
+  tracker?: string;
+  code_host?: string;
+  code_host_project?: string;
+  trusted_authors?: string[];
+  tool_authors?: string[];
+  labels?: Record<string, string>;
+  base_branch?: string;
+  tickets?: RawTicketSettings;
+  dod?: RawDodConfig;
+  evidence?: { branch_prefix?: string };
+  merge_method?: string;
+}
+
+export interface TicketAgentSettings {
+  bootstrap: string[];
+  system_prompt: string;
+  max_concurrency: number;
+  quiet_period_ms: number;
+  intake_poll_ms: number;
+  post_merge_poll_ms: number;
+  post_merge_poll_limit: number;
+  delivery: DeliverySchedule;
+}
+
+/** Resolved, fully validated configuration for one project. */
+export interface RepoRuntimeConfig {
+  project: string;
+  provider: string;
+  tracker: string;
+  code_host: string;
+  agent_runner: string;
+  command_runner: RawCommandRunner | undefined;
+  code_host_project: string;
+  account: string | null;
+  tracker_account: string | null;
+  code_host_account: string | null;
+  enabled: boolean;
+  local_only: boolean;
+  auto_merge: boolean;
+  base_branch: string;
+  trusted_authors: string[];
+  tool_authors: string[];
+  labels: Record<string, string>;
+  dod: RawDodConfig;
+  workspace: string | null;
+  tickets: TicketAgentSettings;
+  evidence_branch_prefix: string;
+  merge_method: string;
+  raw: RawRepoConfig;
+}
 
 export function configDir() {
   const home = process.env.ISSUE_ORCHESTRATOR_HOME ?? process.env.GIT_ISSUE_AGENT_HOME;
@@ -90,7 +206,7 @@ export function parseJsonc(text, source = 'config.jsonc') {
   try {
     return JSON.parse(out);
   } catch (error) {
-    throw new Error(`${source}: ${error.message}`);
+    throw new Error(`${source}: ${error.message}`, { cause: error });
   }
 }
 
@@ -118,6 +234,65 @@ function validateConfig(cfg, file) {
   const positiveInteger = (value, name) => {
     if (!Number.isSafeInteger(value) || value < 1) throw new Error(`${file}: "${name}" must be a positive integer`);
   };
+  const validateTicketSettings = (value: unknown, label: string, allowWorkspace: boolean, allowGlobalLimit = false) => {
+    if (value === undefined) return;
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new Error(`${file}: "${label}" must be an object`);
+    }
+    const settings = value as RawTicketSettings;
+    if (settings.bootstrap !== undefined) {
+      if (!Array.isArray(settings.bootstrap) || settings.bootstrap.length === 0 ||
+          settings.bootstrap.some((entry) => typeof entry !== 'string' || !entry.trim() || entry.includes('\0'))) {
+        throw new Error(`${file}: "${label}.bootstrap" must be a non-empty array of non-empty instructions`);
+      }
+    }
+    if (settings.system_prompt !== undefined &&
+        (typeof settings.system_prompt !== 'string' || !settings.system_prompt.trim() || settings.system_prompt.includes('\0'))) {
+      throw new Error(`${file}: "${label}.system_prompt" must be a non-empty string`);
+    }
+    if (settings.workspace !== undefined && !allowWorkspace) {
+      throw new Error(`${file}: "${label}.workspace" is only valid per repository`);
+    }
+    if (settings.workspace !== undefined && (typeof settings.workspace !== 'string' || !settings.workspace.trim())) {
+      throw new Error(`${file}: "${label}.workspace" must be a non-empty path`);
+    }
+    if (settings.max_concurrency !== undefined) {
+      if (!allowGlobalLimit) {
+        throw new Error(`${file}: "${label}.max_concurrency" is only valid at the top level`);
+      }
+      positiveInteger(settings.max_concurrency, `${label}.max_concurrency`);
+    }
+    if (settings.quiet_period_ms !== undefined &&
+        (!Number.isSafeInteger(settings.quiet_period_ms) || settings.quiet_period_ms < 0 ||
+         settings.quiet_period_ms > MAX_TICKET_QUIET_PERIOD_MS)) {
+      throw new Error(`${file}: "${label}.quiet_period_ms" must be an integer from 0 to ${MAX_TICKET_QUIET_PERIOD_MS}`);
+    }
+    if (settings.intake_poll_ms !== undefined &&
+        (!Number.isSafeInteger(settings.intake_poll_ms) ||
+         settings.intake_poll_ms < MIN_TICKET_INTAKE_POLL_MS ||
+         settings.intake_poll_ms > MAX_TICKET_INTAKE_POLL_MS)) {
+      throw new Error(`${file}: "${label}.intake_poll_ms" must be an integer from ${MIN_TICKET_INTAKE_POLL_MS} to ${MAX_TICKET_INTAKE_POLL_MS}`);
+    }
+    if (settings.post_merge_poll_ms !== undefined &&
+        (!Number.isSafeInteger(settings.post_merge_poll_ms) || settings.post_merge_poll_ms < 0 ||
+         settings.post_merge_poll_ms > MAX_TICKET_POST_MERGE_POLL_MS)) {
+      throw new Error(`${file}: "${label}.post_merge_poll_ms" must be an integer from 0 to ${MAX_TICKET_POST_MERGE_POLL_MS}`);
+    }
+    if (settings.post_merge_poll_limit !== undefined &&
+        (!Number.isSafeInteger(settings.post_merge_poll_limit) ||
+         settings.post_merge_poll_limit < 1 || settings.post_merge_poll_limit > MAX_TICKET_POST_MERGE_POLL_LIMIT)) {
+      throw new Error(`${file}: "${label}.post_merge_poll_limit" must be an integer from 1 to ${MAX_TICKET_POST_MERGE_POLL_LIMIT}`);
+    }
+    if (settings.delivery !== undefined) {
+      try {
+        normalizeDeliverySchedule(settings.delivery, `${label}.delivery`);
+      } catch (error) {
+        throw new Error(`${file}: ${(error as Error).message}`, { cause: error });
+      }
+    }
+  };
+  validateTicketSettings(cfg.tickets, 'tickets', false, true);
+  validateTicketSettings(cfg.defaults?.tickets, 'defaults.tickets', false, true);
   if (cfg.max_concurrency !== undefined) positiveInteger(cfg.max_concurrency, 'max_concurrency');
   if (!cfg.repos || typeof cfg.repos !== 'object' || Array.isArray(cfg.repos) ||
       Object.keys(cfg.repos).length === 0) {
@@ -162,7 +337,7 @@ function validateConfig(cfg, file) {
     throw new Error(`${file}: "tool_authors" must not contain duplicates`);
   }
 
-  const defaults: any = cfg.defaults ?? {};
+  const defaults = (cfg.defaults ?? {}) as Record<string, unknown>;
   if (!defaults || typeof defaults !== 'object' || Array.isArray(defaults)) {
     throw new Error(`${file}: "defaults" must be an object`);
   }
@@ -195,7 +370,7 @@ function validateConfig(cfg, file) {
   }
 
   for (const [project, rawRepo] of Object.entries(cfg.repos)) {
-    const repo: any = rawRepo;
+    const repo = rawRepo as RawRepoConfig;
     if (!/^[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)+$/.test(project)) {
       throw new Error(`${file}: invalid project id "${project}"`);
     }
@@ -230,7 +405,8 @@ function validateConfig(cfg, file) {
     if (account && !accounts.includes(account)) {
       throw new Error(`${file}: account "${account}" for "${project}" is not listed in accounts`);
     }
-    for (const provider of [repo.provider, repo.tracker, repo.code_host].filter((value) => value !== undefined)) {
+    for (const provider of [repo.provider, repo.tracker, repo.code_host]
+      .filter((value): value is string => value !== undefined)) {
       if (!['github', 'gitlab', 'jira'].includes(provider)) {
         throw new Error(`${file}: unsupported provider "${provider}" for "${project}"`);
       }
@@ -263,6 +439,13 @@ function validateConfig(cfg, file) {
     if (repo.base_branch !== undefined && (typeof repo.base_branch !== 'string' || !repo.base_branch)) {
       throw new Error(`${file}: repos.${project}.base_branch must be a non-empty string`);
     }
+    if (repo.workspace !== undefined && (typeof repo.workspace !== 'string' || !repo.workspace.trim())) {
+      throw new Error(`${file}: repos.${project}.workspace must be a non-empty path`);
+    }
+    validateTicketSettings(repo.tickets, `repos.${project}.tickets`, true, false);
+    if (repo.tickets?.workspace !== undefined && repo.workspace !== undefined) {
+      throw new Error(`${file}: repos.${project} must not set both "workspace" and "tickets.workspace"`);
+    }
     const dod = repo.dod;
     if (!dod || typeof dod !== 'object' || Array.isArray(dod)) {
       throw new Error(`${file}: repos.${project}.dod must be an object`);
@@ -288,10 +471,10 @@ function validateConfig(cfg, file) {
     if (new Set(dod.required_checks).size !== dod.required_checks.length) {
       throw new Error(`${file}: repos.${project}.dod.required_checks must contain unique names`);
     }
-    if (!EVIDENCE_CLASSES.includes(dod.evidence_class)) {
+    if (!EVIDENCE_CLASSES.includes(dod.evidence_class as (typeof EVIDENCE_CLASSES)[number])) {
       throw new Error(`${file}: repos.${project}.dod.evidence_class must be ui, cli or docs`);
     }
-    if (!ACCEPTANCE_SOURCES.includes(dod.acceptance_source)) {
+    if (!ACCEPTANCE_SOURCES.includes(dod.acceptance_source as (typeof ACCEPTANCE_SOURCES)[number])) {
       throw new Error(`${file}: repos.${project}.dod.acceptance_source must be issue_body or triage_comment`);
     }
     if (dod.timeout_ms !== undefined && (!Number.isSafeInteger(dod.timeout_ms) || dod.timeout_ms < 1 || dod.timeout_ms > 3_600_000)) {
@@ -318,12 +501,21 @@ function validateConfig(cfg, file) {
   rejectCredentials(cfg);
 }
 
-export function repoConfig(cfg, project) {
+export function repoConfig(cfg, project): RepoRuntimeConfig {
   const own = cfg.repos?.[project];
   if (!own || typeof own !== 'object') {
     throw new Error(`Project "${project}" is not in ${cfg.__file ?? 'the config'}`);
   }
   const defaults = cfg.defaults ?? {};
+  // Lowest precedence first: defaults, then top-level, then this repository.
+  const ticketSettings = { ...(defaults.tickets ?? {}), ...(cfg.tickets ?? {}), ...(own.tickets ?? {}) };
+  // The session cap is global; a repository override would make the shared
+  // database limit depend on which poller claims next.
+  const maxConcurrentTickets = (ticketSettings as RawTicketSettings).max_concurrency ??
+    DEFAULT_TICKET_MAX_CONCURRENCY;
+  const delivery = ticketSettings.delivery === undefined
+    ? { ...DEFAULT_DELIVERY_SCHEDULE, windows: [] }
+    : normalizeDeliverySchedule(ticketSettings.delivery, 'tickets.delivery');
   const labels = { ...(defaults.labels ?? {}), ...(own.labels ?? {}) };
   const enabled = own.enabled ?? defaults.enabled ?? true;
   const tracker = own.tracker ?? own.provider ?? defaults.tracker ?? cfg.tracker ??
@@ -354,6 +546,19 @@ export function repoConfig(cfg, project) {
     tool_authors: [...new Set([...(cfg.tool_authors ?? []), ...(own.tool_authors ?? [])])],
     labels,
     dod: own.dod,
+    workspace: ticketSettings.workspace ?? own.workspace ?? null,
+    tickets: {
+      bootstrap: Array.isArray(ticketSettings.bootstrap) && ticketSettings.bootstrap.length
+        ? ticketSettings.bootstrap
+        : DEFAULT_TICKET_BOOTSTRAP,
+      system_prompt: ticketSettings.system_prompt ?? TICKET_AGENT_SYSTEM_PROMPT,
+      max_concurrency: maxConcurrentTickets,
+      quiet_period_ms: ticketSettings.quiet_period_ms ?? DEFAULT_TICKET_QUIET_PERIOD_MS,
+      intake_poll_ms: ticketSettings.intake_poll_ms ?? DEFAULT_TICKET_INTAKE_POLL_MS,
+      post_merge_poll_ms: ticketSettings.post_merge_poll_ms ?? DEFAULT_TICKET_POST_MERGE_POLL_MS,
+      post_merge_poll_limit: ticketSettings.post_merge_poll_limit ?? DEFAULT_TICKET_POST_MERGE_POLL_LIMIT,
+      delivery,
+    },
     evidence_branch_prefix: own.evidence?.branch_prefix ?? cfg.evidence?.branch_prefix ?? 'agent-evidence',
     merge_method: own.merge_method ?? cfg.merge?.method ?? 'squash',
     raw: own,

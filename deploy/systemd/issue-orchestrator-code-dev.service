@@ -1,0 +1,39 @@
+[Unit]
+Description=Issue Orchestrator router in existing code-dev container
+Documentation=file:/srv/dev-projects/issue-orchestrator/docs/service.md
+# This unit supervises a docker exec into the already-running code-dev
+# container. It deliberately has no dependency on, and never starts, stops or
+# recreates, that container.
+Requires=docker.service
+PartOf=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+# Restart limits belong to [Unit], not [Service]. After the burst, systemd
+# leaves the unit failed instead of looping; fix the deployment and reset it.
+StartLimitIntervalSec=1800
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=/
+EnvironmentFile=-/etc/issue-orchestrator/code-dev.env
+# Preflight waits for code-dev (Docker's restart policy brings it up) and then
+# validates durable paths and the config inside the container as the dev user.
+ExecStartPre=/usr/local/lib/issue-orchestrator/preflight.sh
+ExecStart=/usr/local/lib/issue-orchestrator/run.sh
+# docker exec does not forward signals into the container. stop.sh signals the
+# router's own session/process group and allows one safe step to finish.
+ExecStop=/usr/local/lib/issue-orchestrator/stop.sh
+KillMode=control-group
+TimeoutStartSec=300
+TimeoutStopSec=330
+Restart=on-failure
+RestartSec=60
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+SyslogIdentifier=issue-orchestrator-code-dev
+
+[Install]
+WantedBy=multi-user.target

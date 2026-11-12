@@ -647,7 +647,8 @@ for (const [adapter, port, operation] of [
   ));
 }
 assert.equal(getAgentRunner('opencode').capabilities.capabilities.run, true);
-assert.deepEqual(getAgentRunner('opencode').capabilities.capabilities.roles, ['triage', 'builder', 'verifier', 'reviewer']);
+assert.deepEqual(getAgentRunner('opencode').capabilities.capabilities.roles,
+  ['triage', 'builder', 'ticket-agent', 'verifier', 'reviewer']);
 assert.throws(() => getTracker('github').updateWorkItem({
   project: 'reisi007/demo', number: 1, fields: { unsupported: true },
 }), (error) => error instanceof UnsupportedCapabilityError);
