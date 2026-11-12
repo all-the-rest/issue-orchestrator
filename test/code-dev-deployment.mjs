@@ -388,9 +388,9 @@ try {
   assert.match(unitSection, /^StartLimitBurst=5$/m);
   assert.doesNotMatch(serviceSection, /^StartLimit/m, 'start-limit directives belong to [Unit]');
   assert.match(serviceSection, /^EnvironmentFile=-\/etc\/issue-orchestrator\/code-dev\.env$/m);
-  assert.match(serviceSection, /^ExecStartPre=\/usr\/local\/lib\/issue-orchestrator\/preflight\.sh$/m);
-  assert.match(serviceSection, /^ExecStart=\/usr\/local\/lib\/issue-orchestrator\/run\.sh$/m);
-  assert.match(serviceSection, /^ExecStop=\/usr\/local\/lib\/issue-orchestrator\/stop\.sh$/m);
+  assert.match(serviceSection, /^ExecStartPre=\/bin\/sh \/usr\/local\/lib\/issue-orchestrator\/preflight\.sh$/m);
+  assert.match(serviceSection, /^ExecStart=\/bin\/sh \/usr\/local\/lib\/issue-orchestrator\/run\.sh$/m);
+  assert.match(serviceSection, /^ExecStop=\/bin\/sh \/usr\/local\/lib\/issue-orchestrator\/stop\.sh$/m);
   assert.match(serviceSection, /^Restart=on-failure$/m);
   assert.match(serviceSection, /^RestartSec=60$/m);
   assert.match(serviceSection, /^TimeoutStartSec=300$/m);
