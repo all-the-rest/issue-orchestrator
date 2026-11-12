@@ -19,11 +19,14 @@ WorkingDirectory=/
 EnvironmentFile=-/etc/issue-orchestrator/code-dev.env
 # Preflight waits for code-dev (Docker's restart policy brings it up) and then
 # validates durable paths and the config inside the container as the dev user.
-ExecStartPre=/usr/local/lib/issue-orchestrator/preflight.sh
-ExecStart=/usr/local/lib/issue-orchestrator/run.sh
+# The wrappers are started through /bin/sh on purpose: some hosts deny the
+# docker socket to a shebang-started unit main process under
+# NoNewPrivileges=yes, while the same command works as a child of a shell.
+ExecStartPre=/bin/sh /usr/local/lib/issue-orchestrator/preflight.sh
+ExecStart=/bin/sh /usr/local/lib/issue-orchestrator/run.sh
 # docker exec does not forward signals into the container. stop.sh signals the
 # router's own session/process group and allows one safe step to finish.
-ExecStop=/usr/local/lib/issue-orchestrator/stop.sh
+ExecStop=/bin/sh /usr/local/lib/issue-orchestrator/stop.sh
 KillMode=control-group
 TimeoutStartSec=300
 TimeoutStopSec=330
