@@ -1878,7 +1878,11 @@ setInterval(() => {}, 1000);
     const store = new SQLiteStore(path.join(TMP, 'builder-timeout.sqlite3'));
     const runner = runnerFor(store, {
       containerRuntime: FAKE_OCI,
-      timeoutMs: 1_000,
+      // The budget must cover Node cold start plus the builder container
+      // launch before it expires; a 1s budget made this check flaky on a
+      // loaded machine because the labeled container had not been created yet,
+      // so there was nothing to remove on timeout.
+      timeoutMs: 5_000,
       environment: { FAKE_OPENCODE_MODE: 'builder-hang' },
     });
     fs.writeFileSync(OCI_HANG, 'hang');
