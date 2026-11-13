@@ -1,9 +1,16 @@
 # issue-orchestrator
 
-GitHub-only trusted-event router. The orchestrator filters configured authors,
-persists issue-to-chat identity and event cursors, and forwards event IDs/URLs;
-the ticket agent reads GitHub context itself and owns source changes, commits,
-pushes, pull requests, comments, and follow-up issues.
+GitHub-event gateway to OpenCode. The router filters configured trusted authors,
+persists issue-to-chat identity and event cursors, and forwards compact event
+metadata to a persistent OpenCode session. The ticket agent reads GitHub context
+itself and owns source changes, commits, pushes, pull requests, comments, and
+follow-up issues.
+
+The router does not manage OpenCode internals: provider login, credential
+refresh, and private OpenCode session storage remain the operator/runtime's
+responsibility. Its only return path from an agent is the validated result
+needed to record workflow outcome; it is not an interactive conversation or
+provider-recovery channel. See [`docs/project-scope.md`](docs/project-scope.md).
 
 OpenCode is the first intended agent backend, not a dependency of the core.
 
