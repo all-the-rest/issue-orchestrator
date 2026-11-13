@@ -41,6 +41,8 @@ import {
 } from './dod.js';
 import { getCodeHost, getTracker } from '../providers/index.js';
 import { githubTicket } from '../providers/github-ticket.js';
+import { activationEligibleCandidates, activationSearchCost, reserveActivationSearchBudget } from './ticket-activation.js';
+import type { TicketIssue } from '../providers/ticket-port.js';
 import { runTicketHandoff, type TicketDispatch } from './ticket-runtime.js';
 import {
   MAX_DELIVERY_COOLDOWN_MS,
@@ -2781,6 +2783,100 @@ function eligibleTicketAuthor(cfg: TicketRouterConfig, rc: RepoRuntimeConfig, au
   return trustedTicketAuthor(rc, author) && !excludedTicketAuthor(cfg, rc, author);
 }
 
+interface TicketCandidateDiscovery {
+  candidates: TicketIssue[];
+  failures: Array<{ issue: number; error: string }>;
+  searchFailure: string | null;
+  /** Set when the shared activation budget deferred the mention search. */
+  searchBudgetRetryAt: number | null;
+  /** Candidates left for a later poll by the bounded activation-check budget. */
+  deferred: number[];
+  /** Candidates deferred without a provider call by the shared activation budget. */
+  budgetDenied: number[];
+  /** When the shared activation budget next admits work. */
+  budgetRetryAt: number | null;
+  /** Candidates waiting out a bounded per-issue retry delay. */
+  retrying: number[];
+  /** Candidates whose bounded comment scan continues on a later poll. */
+  incomplete: Array<{ issue: number; nextPage: number | null }>;
+  /** Activation checks that actually ran during this discovery pass. */
+  activationChecks: number;
+}
+
+/**
+ * Combine the bounded open-issue listing with a bounded mention search. The
+ * search is only needed once the listing window is saturated; it finds a late
+ * mention on an issue that has fallen outside that window.
+ */
+async function discoverTicketCandidates(cfg: TicketRouterConfig, rc: RepoRuntimeConfig,
+  listed: TicketIssue[], max: number, store?: ReturnType<typeof getRuntimeStore>): Promise<TicketCandidateDiscovery> {
+  const merged = listed.filter((issue) => eligibleTicketAuthor(cfg, rc, issue.author)).slice(0, max);
+  let searchFailure: string | null = null;
+  let searchBudgetRetryAt: number | null = null;
+  const login = rc.tickets.activation_mention;
+  if (login && listed.length >= Math.min(1000, max) && githubTicket.selectMentioned) {
+    const searchResults = Math.min(1000, max);
+    // The search is optional enrichment; reserve its conservative worst-case
+    // request count from the separate shared search budget. That budget keeps
+    // any rolling minute within GitHub's 30 search requests across projects,
+    // pollers and restarts; an exhausted budget skips it without an API call.
+    const reservation = reserveActivationSearchBudget(store, activationSearchCost(searchResults),
+      { project: rc.project });
+    if (!reservation.granted) {
+      searchBudgetRetryAt = reservation.retryAt;
+    } else {
+      try {
+        const mentioned = await githubTicket.selectMentioned(rc.project, login, searchResults);
+        const known = new Set(merged.map((issue) => issue.number));
+        for (const issue of mentioned) {
+          if (known.has(issue.number) || issue.state !== 'OPEN' ||
+              !eligibleTicketAuthor(cfg, rc, issue.author)) continue;
+          known.add(issue.number);
+          merged.push(issue);
+        }
+      } catch (error) {
+        searchFailure = error instanceof Error ? error.message : String(error);
+      }
+    }
+  }
+  if (!githubTicket.hasActivationMention && !githubTicket.scanActivationMention) {
+    return {
+      candidates: login ? [] : merged,
+      failures: login
+        ? merged.map((issue) => ({ issue: issue.number, error: 'GitHub activation mention check is unavailable' }))
+        : [],
+      searchFailure, searchBudgetRetryAt,
+      deferred: [], budgetDenied: [], budgetRetryAt: null, retrying: [], incomplete: [], activationChecks: 0,
+    };
+  }
+  const eligible = await activationEligibleCandidates({
+    candidates: merged,
+    project: rc.project,
+    login,
+    trustedAuthors: rc.trusted_authors,
+    excludedAuthors: ticketToolAuthors(cfg, rc),
+    store,
+    ...(githubTicket.scanActivationMention
+      ? { scanActivationMention: (request) => githubTicket.scanActivationMention!(request) }
+      : {}),
+    ...(githubTicket.hasActivationMention
+      ? { hasActivationMention: (request) => githubTicket.hasActivationMention!(request) }
+      : {}),
+  });
+  return {
+    candidates: eligible.candidates,
+    failures: eligible.failures,
+    searchFailure,
+    searchBudgetRetryAt,
+    deferred: eligible.deferred,
+    budgetDenied: eligible.budgetDenied,
+    budgetRetryAt: eligible.budgetRetryAt,
+    retrying: eligible.retrying,
+    incomplete: eligible.incomplete,
+    activationChecks: eligible.checks,
+  };
+}
+
 /** Route an event to a durable OpenCode chat; ticket-agent owns GitHub work. */
 export function createTicketDispatch(args: {
   cfg: TicketRouterConfig;
@@ -2944,8 +3040,14 @@ export function createTicketDispatch(args: {
   };
 }
 
-function ticketPolicy(cfg: TicketRouterConfig, rc: RepoRuntimeConfig, goal: string | undefined,
-  options: { routeOnly?: boolean; ticketUrl?: string; retryBlocked?: boolean; delivery?: DeliverySchedule } = {}): TicketRuntimePolicy {
+export function ticketPolicy(cfg: TicketRouterConfig, rc: RepoRuntimeConfig, goal: string | undefined,
+  options: { routeOnly?: boolean; ticketUrl?: string; retryBlocked?: boolean; delivery?: DeliverySchedule;
+    activationMention?: string | null; activationUpdatedAt?: string | null;
+    activationPreverified?: boolean } = {}): TicketRuntimePolicy {
+  // An explicit operator goal is already an affirmative action and must not
+  // wait for a poller activation mention. `null` disables the configured gate.
+  const activationMention = options.activationMention === null
+    ? undefined : options.activationMention ?? rc.tickets.activation_mention;
   return {
     ...(goal ? { goal } : {}),
     mergePolicy: (rc.auto_merge ? 'autonomous-after-required-checks' : 'manual') as TicketMergePolicy,
@@ -2955,6 +3057,9 @@ function ticketPolicy(cfg: TicketRouterConfig, rc: RepoRuntimeConfig, goal: stri
     trustedAuthors: rc.trusted_authors,
     routeOnly: options.routeOnly,
     ticketUrl: options.ticketUrl,
+    ...(activationMention ? { activationMention } : {}),
+    ...(options.activationPreverified ? { activationPreverified: true } : {}),
+    ...(options.activationUpdatedAt !== undefined ? { activationUpdatedAt: options.activationUpdatedAt } : {}),
     bootstrap: rc.tickets.bootstrap,
     systemPrompt: rc.tickets.system_prompt,
     maxConcurrentSessions: rc.tickets.max_concurrency,
@@ -3054,6 +3159,69 @@ function requireTicketAgentRunner(rc: RepoRuntimeConfig) {
   }
 }
 
+export type IntakeFailureKind = 'issue' | 'project' | 'search' | 'association' | 'task' | 'unexpected';
+
+/**
+ * A per-issue activation check failure is isolated: it backs that issue off and
+ * must never delay intake for unrelated issues, projects or sessions. Every
+ * other intake failure is a shared fault — the open-issue listing, candidate
+ * discovery, the mention search, retained-association verification, an intake
+ * task or an unexpected loop error — and slows the shared cadence so a broken
+ * provider is not hammered by every tick.
+ */
+export function intakeFailureBacksOff(kind: IntakeFailureKind): boolean {
+  return kind !== 'issue';
+}
+
+/**
+ * Backoff ceiling for the shared intake loop: eight base intervals, at most
+ * five minutes, but never below the configured base interval. A base interval
+ * above five minutes (up to the one-hour maximum) therefore keeps pacing at its
+ * configured cadence instead of failing the pacer's `max >= base` invariant.
+ */
+export function intakeBackoffLimit(baseMs: number): number {
+  return Math.max(baseMs, Math.min(300_000, baseMs * 8));
+}
+
+/**
+ * Durable-cadence state machine for the shared intake loop. A pass that only
+ * recorded per-issue activation diagnostics returns true and keeps the base
+ * interval; a shared provider, association, intake-task or unexpected
+ * loop-level fault returns false and doubles the delay (bounded at four
+ * failures / eight base intervals). The poller uses this class directly, so
+ * tests exercise the same transitions the running loop uses.
+ */
+export class IntakePacer {
+  readonly baseMs: number;
+  readonly maxMs: number;
+  failures = 0;
+  backoffMs = 0;
+
+  constructor(baseMs: number, maxMs = intakeBackoffLimit(baseMs)) {
+    if (!Number.isSafeInteger(baseMs) || baseMs < 1 || !Number.isSafeInteger(maxMs) || maxMs < baseMs) {
+      throw new Error('invalid intake pacing interval');
+    }
+    this.baseMs = baseMs;
+    this.maxMs = maxMs;
+  }
+
+  /** Record one completed intake pass and return the next scheduled delay. */
+  record(ok: boolean): number {
+    if (ok) {
+      this.failures = 0;
+      this.backoffMs = 0;
+    } else {
+      this.failures = Math.min(this.failures + 1, 4);
+      this.backoffMs = Math.min(this.maxMs, this.baseMs * 2 ** this.failures);
+    }
+    return this.nextDelayMs;
+  }
+
+  get nextDelayMs(): number {
+    return this.backoffMs || this.baseMs;
+  }
+}
+
 async function cmdGoal(opts: ParsedArgs) {
   const allowed = new Set(['_', 'project', 'issue', 'goal-file', 'config', 'reconciliation', 'retry-blocked']);
   if (Object.keys(opts).some((key) => !allowed.has(key)) || opts._.length !== 0) {
@@ -3108,7 +3276,7 @@ async function cmdGoal(opts: ParsedArgs) {
     issue,
     // Explicit operator criteria are not poller events and must not wait for a
     // quiet period; the session cap still applies.
-    policy: { ...ticketPolicy(cfg, rc, goal, { routeOnly: true,
+    policy: { ...ticketPolicy(cfg, rc, goal, { routeOnly: true, activationMention: null,
       ticketUrl: identity.url, retryBlocked: opts['retry-blocked'] === true }), quietPeriodMs: 0 },
     dispatch: createTicketDispatch({ cfg, rc, project, issue, worktree, store, runner, role: 'ticket-agent' }),
   });
@@ -3163,6 +3331,227 @@ async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T, index: nu
   return results;
 }
 
+export interface TicketProjectContext {
+  project: string;
+  rc: RepoRuntimeConfig;
+  base: string;
+  store: ReturnType<typeof getRuntimeStore>;
+  runner: ReturnType<typeof getAgentRunner>;
+  routingPort: ReturnType<typeof ticketRoutingPort>;
+  delivery: DeliverySchedule;
+}
+
+export interface TicketTask extends TicketProjectContext {
+  issue: number;
+  ticketUrl: string;
+  activationUpdatedAt: string | null;
+  /** Discovery in this poll proved activation; retained legacy rows may still need a check. */
+  activationPreverified: boolean;
+  retryBlocked: boolean;
+}
+
+function ticketTaskKey(project: string, issue: number): string {
+  return `${project.toLocaleLowerCase()}#${issue}`;
+}
+
+/**
+ * Persisted route-only workflows whose issue may no longer appear in the
+ * open-issue listing (merged/closed). They keep draining known PR activity.
+ * Only tracked associations are resumed, never abandoned historical goals.
+ * Returns whether the durable scan hit its hard safety bound, so callers can
+ * report truncation instead of silently stopping older associations.
+ */
+async function appendKnownRouteTasks(cfg: TicketRouterConfig, context: TicketProjectContext,
+  target: TicketTask[], skip?: (project: string, issue: number) => boolean) {
+  const existing = new Set(target.map((task) => ticketTaskKey(task.project, task.issue)));
+  const rows = context.store.listTicketHandoffs(context.project, 5000);
+  let added = 0;
+  let unverified = 0;
+  let rejected = 0;
+  for (const record of rows) {
+    if (existing.has(ticketTaskKey(record.project, record.issue))) continue;
+    if (skip?.(record.project, record.issue)) continue;
+    const state = record.state as Record<string, unknown>;
+    if (state.workflow !== 'route-only') continue;
+    // Only a real PR association justifies rediscovering an issue that GitHub
+    // no longer lists as open. `terminal: false` alone could start a fresh
+    // agent on a closed, never-dispatched issue.
+    const hasActiveAssociation = !!state.pullRequest;
+    const hasRetiredAssociation = Array.isArray(state.retiredPullRequests) &&
+      state.retiredPullRequests.length > 0;
+    if (!hasActiveAssociation && !hasRetiredAssociation) continue;
+    // Revalidate the issue with the provider instead of trusting stale
+    // durable state. This also covers a failed open-issue listing, where a
+    // closed or untrusted issue could otherwise be picked up.
+    let identity: { number: number; author: string | null; state: string; url: string };
+    try {
+      identity = await context.routingPort.identity(context.project, record.issue);
+    } catch {
+      // Fail closed: a retained association whose identity cannot be proven
+      // is skipped for this poll, never dispatched.
+      unverified += 1;
+      continue;
+    }
+    if (!eligibleTicketAuthor(cfg, context.rc, identity.author)) {
+      rejected += 1;
+      continue;
+    }
+    // A closed issue may continue an existing persistent chat, but it must
+    // never receive a first bootstrap after it has closed.
+    if (identity.state !== 'OPEN' && state.initialDispatched !== true) {
+      rejected += 1;
+      continue;
+    }
+    const ticket = state.ticket as Record<string, unknown> | undefined;
+    const ticketUrl = typeof ticket?.url === 'string' && ticket.url
+      ? ticket.url : identity.url;
+    existing.add(ticketTaskKey(record.project, record.issue));
+    target.push({ ...context, issue: record.issue, ticketUrl, activationUpdatedAt: null,
+      activationPreverified: false, retryBlocked: false });
+    added += 1;
+  }
+  return { added, unverified, rejected, truncated: rows.length >= 5000 };
+}
+
+/**
+ * Order intake contexts by the durable activation-budget rotation. The first
+ * store owns the shared runtime database, so every context sees the same
+ * persisted "last served" sequence; without a durable store (dry run or a test
+ * double) the configured order is kept.
+ */
+export function fairIntakeContexts(contexts: TicketProjectContext[]): TicketProjectContext[] {
+  const store = contexts[0]?.store;
+  if (!store || typeof store.activationBudgetFairOrder !== 'function') return contexts;
+  const order = new Map(store.activationBudgetFairOrder(contexts.map((context) => context.project))
+    .map((project, index) => [project.toLocaleLowerCase(), index]));
+  return [...contexts].sort((left, right) =>
+    (order.get(left.project.toLocaleLowerCase()) ?? Number.MAX_SAFE_INTEGER) -
+    (order.get(right.project.toLocaleLowerCase()) ?? Number.MAX_SAFE_INTEGER));
+}
+
+export interface IntakeTickDeps {
+  cfg: TicketRouterConfig;
+  max: number;
+  contexts: TicketProjectContext[];
+  knownTasks: Set<string>;
+  /** Durable task list shared with the dispatch loop; discovered tasks are appended. */
+  tasks: TicketTask[];
+  noteError(error: unknown, project?: string, issue?: number): void;
+  /** Intake one task; false marks a global intake fault, not a per-issue delay. */
+  runTask(task: TicketTask): Promise<boolean>;
+  /** Provider hooks are injectable so tests can exercise the real tick. */
+  select?: (project: string, max: number) => Promise<TicketIssue[]>;
+  discover?: typeof discoverTicketCandidates;
+  appendKnown?: typeof appendKnownRouteTasks;
+}
+
+/**
+ * One shared intake tick: discover candidates for every project in durable
+ * fair order and drain known associations without dispatching an agent.
+ *
+ * Returns `true` only when every provider read and task completed. A per-issue
+ * activation check failure is recorded as a diagnostic for that issue and does
+ * not slow other projects; listing, candidate-discovery/search, retained
+ * association and per-task intake failures are global faults, so the caller
+ * backs the shared cadence off instead of hammering a broken provider.
+ * Budget deferrals (`budgetDenied`, `searchBudgetRetryAt`, `deferred` and the
+ * per-issue `retrying` window) are expected pacing, not failures.
+ */
+export async function runIntakeTick(deps: IntakeTickDeps): Promise<boolean> {
+  const select = deps.select ?? ((project: string, max: number) => githubTicket.select(project, max));
+  const discover = deps.discover ?? discoverTicketCandidates;
+  const appendKnown = deps.appendKnown ?? appendKnownRouteTasks;
+  const discovered: TicketTask[] = [];
+  let ok = true;
+  // Route every fault through the same classifier the pacer contract uses, so
+  // a per-issue activation failure can never throttle unrelated projects while
+  // a shared provider/association/task failure always does.
+  const recordFault = (kind: IntakeFailureKind) => {
+    if (intakeFailureBacksOff(kind)) ok = false;
+  };
+  for (const context of fairIntakeContexts(deps.contexts)) {
+    let candidates: TicketIssue[] = [];
+    let listedNumbers = new Set<number>();
+    try {
+      const listed = await select(context.project, Math.min(1000, deps.max));
+      const discovery = await discover(deps.cfg, context.rc, listed, deps.max, context.store);
+      candidates = discovery.candidates;
+      listedNumbers = new Set(listed.map((issue) => issue.number));
+      // A per-issue activation failure (or an unavailable check) is a local
+      // diagnostic: other issues, projects and sessions are unaffected.
+      for (const failure of discovery.failures) {
+        deps.noteError(new Error(failure.error), context.project, failure.issue);
+        recordFault('issue');
+      }
+      if (discovery.searchFailure) {
+        // The optional mention search is a provider read, not a per-issue
+        // activation decision; a broken search must slow the shared cadence.
+        deps.noteError(new Error(discovery.searchFailure), context.project);
+        recordFault('search');
+      }
+      if (discovery.searchBudgetRetryAt !== null) {
+        deps.noteError(new Error(
+          `activation mention search deferred by the shared API budget until ${new Date(discovery.searchBudgetRetryAt).toISOString()}`),
+        context.project);
+      }
+      if (discovery.budgetDenied.length) {
+        deps.noteError(new Error(
+          `shared activation API budget exhausted; ${discovery.budgetDenied.length} candidate(s) made no provider request`),
+        context.project);
+      }
+      for (const entry of discovery.incomplete.slice(0, 20)) {
+        deps.noteError(new Error(
+          `activation comment scan incomplete; continuing from page ${entry.nextPage ?? 'end'} later`),
+        context.project, entry.issue);
+      }
+      if (discovery.deferred.length) {
+        deps.noteError(new Error(
+          `activation check budget reached; ${discovery.deferred.length} candidate(s) wait for a later poll`),
+        context.project);
+      }
+      if (discovery.retrying.length) {
+        deps.noteError(new Error(
+          `activation check backing off for ${discovery.retrying.length} issue(s) after provider failures`),
+        context.project);
+      }
+    } catch (error) {
+      // The listing and candidate discovery are provider reads shared by every
+      // candidate in the project. Their failure backs the shared cadence off;
+      // known persisted associations are still drained below.
+      deps.noteError(error, context.project);
+      recordFault('project');
+    }
+    try {
+      const knownDiscovery = await appendKnown(deps.cfg, context, discovered,
+        (project, issue) => deps.knownTasks.has(ticketTaskKey(project, issue)) || listedNumbers.has(issue));
+      if (knownDiscovery.truncated) {
+        deps.noteError(new Error('retained association scan reached its 5000-row safety bound'), context.project);
+      }
+      if (knownDiscovery.unverified) {
+        deps.noteError(new Error('retained association identity unavailable; skipping this poll'), context.project);
+      }
+      for (const task of discovered) deps.knownTasks.add(ticketTaskKey(task.project, task.issue));
+      for (const issue of candidates) {
+        const key = ticketTaskKey(context.project, issue.number);
+        if (deps.knownTasks.has(key)) continue;
+        deps.knownTasks.add(key);
+        discovered.push({ ...context, issue: issue.number, ticketUrl: issue.url,
+          activationUpdatedAt: issue.updatedAt, activationPreverified: true, retryBlocked: false });
+      }
+    } catch (error) {
+      // Retained-association verification reads provider identity. A failure
+      // to complete that shared scan is a global intake fault; individual
+      // missing identities remain per-object diagnostics above.
+      deps.noteError(error, context.project);
+      recordFault('association');
+    }
+  }
+  deps.tasks.push(...discovered);
+  const outcomes = await mapLimit([...deps.tasks], Math.min(8, deps.tasks.length), deps.runTask);
+  if (outcomes.some((entry) => !entry)) recordFault('task');
+  return ok;
+}
+
 async function cmdTickets(opts: ParsedArgs) {
   const usage = 'usage: tickets poll [--project <owner/repo>] [--dry-run] [--max <n>] [--retry-blocked] ' +
     '[--quiet-period-ms <n>] [--intake-poll-ms <n>] [--max-concurrency <n>] ' +
@@ -3203,81 +3592,14 @@ async function cmdTickets(opts: ParsedArgs) {
   let deliveryReport: Array<Record<string, unknown>> | null = null;
   let deliveryReconfiguration: Record<string, unknown> | null = null;
   let failed = false;
-  interface TicketProjectContext {
-    project: string;
-    rc: RepoRuntimeConfig;
-    base: string;
-    store: ReturnType<typeof getRuntimeStore>;
-    runner: ReturnType<typeof getAgentRunner>;
-    routingPort: ReturnType<typeof ticketRoutingPort>;
-    delivery: DeliverySchedule;
-  }
-  interface TicketTask extends TicketProjectContext {
-    issue: number;
-    ticketUrl: string;
-    retryBlocked: boolean;
-  }
   const tasks: TicketTask[] = [];
   const projectContexts: TicketProjectContext[] = [];
-  const taskKeyOf = (project: string, issue: number) => `${project.toLocaleLowerCase()}#${issue}`;
-  /**
-   * Persisted route-only workflows whose issue may no longer appear in the
-   * open-issue listing (merged/closed). They keep draining known PR activity.
-   * Only tracked associations are resumed, never abandoned historical goals.
-   * Returns whether the durable scan hit its hard safety bound, so callers can
-   * report truncation instead of silently stopping older associations.
-   */
-  const appendKnownRouteTasks = async (context: TicketProjectContext, target: TicketTask[],
-    skip?: (project: string, issue: number) => boolean) => {
-    const existing = new Set(target.map((task) => taskKeyOf(task.project, task.issue)));
-    const rows = context.store.listTicketHandoffs(context.project, 5000);
-    let added = 0;
-    let unverified = 0;
-    let rejected = 0;
-    for (const record of rows) {
-      if (existing.has(taskKeyOf(record.project, record.issue))) continue;
-      if (skip?.(record.project, record.issue)) continue;
-      const state = record.state as Record<string, unknown>;
-      if (state.workflow !== 'route-only') continue;
-      // Only a real PR association justifies rediscovering an issue that GitHub
-      // no longer lists as open. `terminal: false` alone could start a fresh
-      // agent on a closed, never-dispatched issue.
-      const hasActiveAssociation = !!state.pullRequest;
-      const hasRetiredAssociation = Array.isArray(state.retiredPullRequests) &&
-        state.retiredPullRequests.length > 0;
-      if (!hasActiveAssociation && !hasRetiredAssociation) continue;
-      // Revalidate the issue with the provider instead of trusting stale
-      // durable state. This also covers a failed open-issue listing, where a
-      // closed or untrusted issue could otherwise be picked up.
-      let identity: { number: number; author: string | null; state: string; url: string };
-      try {
-        identity = await context.routingPort.identity(context.project, record.issue);
-      } catch {
-        // Fail closed: a retained association whose identity cannot be proven
-        // is skipped for this poll, never dispatched.
-        unverified += 1;
-        continue;
-      }
-      if (!eligibleTicketAuthor(cfg, context.rc, identity.author)) {
-        rejected += 1;
-        continue;
-      }
-      // A closed issue may continue an existing persistent chat, but it must
-      // never receive a first bootstrap after it has closed.
-      if (identity.state !== 'OPEN' && state.initialDispatched !== true) {
-        rejected += 1;
-        continue;
-      }
-      const ticket = state.ticket as Record<string, unknown> | undefined;
-      const ticketUrl = typeof ticket?.url === 'string' && ticket.url
-        ? ticket.url : identity.url;
-      existing.add(taskKeyOf(record.project, record.issue));
-      target.push({ ...context, issue: record.issue, ticketUrl, retryBlocked: false });
-      added += 1;
-    }
-    return { added, unverified, rejected, truncated: rows.length >= 5000 };
-  };
-  for (const project of projects) {
+  const taskKeyOf = ticketTaskKey;
+  // Durable fair order: a project that consumed the shared activation budget
+  // on an earlier poll goes behind projects that have waited longer, so the
+  // first configured project cannot starve all later ones across polls.
+  const fairProjects = dryRun ? [...projects] : getRuntimeStore().activationBudgetFairOrder(projects);
+  for (const project of fairProjects) {
     try {
       let rc = repoConfig(cfg, project);
       if (!rc.enabled) { results.push({ project, outcome: 'SKIPPED', reason: 'disabled' }); continue; }
@@ -3306,17 +3628,78 @@ async function cmdTickets(opts: ParsedArgs) {
         failed = true;
         results.push({ project, outcome: 'FAILED', error: listFailure });
       }
-      const candidates = listed.filter((issue) => eligibleTicketAuthor(cfg, rc, issue.author)).slice(0, max);
+      const store = dryRun ? undefined : getRuntimeStore();
+      let discovery: TicketCandidateDiscovery = {
+        candidates: [], failures: [], searchFailure: null, searchBudgetRetryAt: null,
+        deferred: [], budgetDenied: [], budgetRetryAt: null, retrying: [],
+        incomplete: [], activationChecks: 0,
+      };
+      try {
+        discovery = await discoverTicketCandidates(cfg, rc, listed, max, store);
+      } catch (error) {
+        // Candidate discovery must never prevent the retained-association path
+        // below from draining already admitted issue chats.
+        if (!dryRun) failed = true;
+        results.push({ project, outcome: 'DEFERRED', reason: 'candidate discovery unavailable',
+          error: error instanceof Error ? error.message : String(error) });
+      }
+      for (const failure of discovery.failures) {
+        if (!dryRun) failed = true;
+        results.push({ project, outcome: 'DEFERRED', reason: 'activation mention check unavailable',
+          issue: failure.issue, error: failure.error });
+      }
+      if (discovery.searchFailure) {
+        if (!dryRun) failed = true;
+        results.push({ project, outcome: 'DEFERRED', reason: 'activation mention search unavailable',
+          error: discovery.searchFailure });
+      }
+      if (discovery.searchBudgetRetryAt !== null) {
+        results.push({ project, outcome: 'DEFERRED',
+          reason: 'activation mention search deferred by the shared API budget; no request was made',
+          retry_at: new Date(discovery.searchBudgetRetryAt).toISOString() });
+      }
+      // A bounded scan that has not reached the end is a delay, never a
+      // negative result or a provider failure. Report the next page so an
+      // operator can see that activation is still progressing.
+      for (const entry of discovery.incomplete.slice(0, 20)) {
+        results.push({ project, outcome: 'DEFERRED',
+          reason: 'activation comment scan incomplete; continuing a bounded scan on a later poll',
+          issue: entry.issue, next_page: entry.nextPage });
+      }
+      if (discovery.incomplete.length > 20) {
+        results.push({ project, outcome: 'DEFERRED',
+          reason: 'additional activation comment scans are incomplete',
+          count: discovery.incomplete.length - 20 });
+      }
+      if (discovery.deferred.length) {
+        results.push({ project, outcome: 'DEFERRED',
+          reason: 'activation check budget exhausted; remaining candidates wait for a later poll',
+          count: discovery.deferred.length, issues: discovery.deferred.slice(0, 20) });
+      }
+      if (discovery.budgetDenied.length) {
+        results.push({ project, outcome: 'DEFERRED',
+          reason: 'shared activation API budget exhausted; no provider request was made for these candidates',
+          count: discovery.budgetDenied.length, issues: discovery.budgetDenied.slice(0, 20),
+          ...(discovery.budgetRetryAt !== null
+            ? { retry_at: new Date(discovery.budgetRetryAt).toISOString() } : {}) });
+      }
+      if (discovery.retrying.length) {
+        results.push({ project, outcome: 'DEFERRED',
+          reason: 'activation check backing off after a provider failure',
+          count: discovery.retrying.length, issues: discovery.retrying.slice(0, 20) });
+      }
+      const candidates = discovery.candidates;
       if (dryRun) {
         const decision = evaluateDelivery(delivery, Date.now());
         results.push({ project, outcome: 'DRY_RUN', candidates: candidates.map((issue) => issue.number),
+          activation_checks: discovery.activationChecks,
           scheduling: { quiet_period_ms: rc.tickets.quiet_period_ms, intake_poll_ms: rc.tickets.intake_poll_ms,
             max_concurrency: rc.tickets.max_concurrency },
           delivery: { schedule: describeDeliverySchedule(delivery), active: decision.dispatchAllowed,
             reason: decision.reason, next_change_at: decision.nextChangeAt, retry_at: decision.retryAt } });
         continue;
       }
-      const store = getRuntimeStore();
+      if (!store) throw new Error('ticket runtime store is unavailable');
       const runner = getAgentRunner(rc.agent_runner, rc.command_runner && {
         executable: rc.command_runner.executable,
         args: rc.command_runner.args,
@@ -3329,7 +3712,8 @@ async function cmdTickets(opts: ParsedArgs) {
       // issues stay subject to the current trusted-author filter instead of
       // being resumed from stale state.
       const listedNumbers = new Set(listed.map((issue) => issue.number));
-      const knownDiscovery = await appendKnownRouteTasks({ project, rc, base, store, runner, routingPort, delivery }, tasks,
+      const knownDiscovery = await appendKnownRouteTasks(cfg,
+        { project, rc, base, store, runner, routingPort, delivery }, tasks,
         (_projectName, issueNumber) => listedNumbers.has(issueNumber));
       if (knownDiscovery.truncated) {
         results.push({ project, outcome: 'DEFERRED', reason: 'retained association scan reached its 5000-row safety bound' });
@@ -3347,7 +3731,8 @@ async function cmdTickets(opts: ParsedArgs) {
         const key = taskKeyOf(project, issue.number);
         if (known.has(key)) continue;
         known.add(key);
-        tasks.push({ project, rc, base, issue: issue.number, ticketUrl: issue.url, store, runner, routingPort,
+        tasks.push({ project, rc, base, issue: issue.number, ticketUrl: issue.url,
+          activationUpdatedAt: issue.updatedAt, activationPreverified: true, store, runner, routingPort,
           delivery, retryBlocked: opts['retry-blocked'] === true });
       }
       if (listFailure) results.push({ project, outcome: 'DEFERRED',
@@ -3407,13 +3792,13 @@ async function cmdTickets(opts: ParsedArgs) {
     });
     deliveryReport = deliveryReportEntries;
     const intakeBaseMs = Math.min(...projectContexts.map((context) => context.rc.tickets.intake_poll_ms));
-    const intakeMaxBackoffMs = Math.min(300_000, intakeBaseMs * 8);
+    const intakeMaxBackoffMs = intakeBackoffLimit(intakeBaseMs);
     const intakeSummary: Record<string, unknown> & { polls: number; errors: Array<Record<string, unknown>>;
       backoff_ms: number; next_at: string | null } = {
       base_interval_ms: intakeBaseMs, polls: 0, errors: [], backoff_ms: 0, next_at: null,
     };
     let intakeTimer: NodeJS.Timeout | null = null;
-    let intakeFailures = 0;
+    const intakePacer = new IntakePacer(intakeBaseMs, intakeMaxBackoffMs);
     let intakeStopped = false;
     const noteIntakeError = (error: unknown, project?: string, issue?: number) => {
       intakeSummary.errors.push({ ...(project ? { project } : {}), ...(issue ? { issue } : {}),
@@ -3432,7 +3817,8 @@ async function cmdTickets(opts: ParsedArgs) {
       try {
         await runTicketHandoff({
           port: task.routingPort, store: task.store, project: task.project, issue: task.issue,
-          policy: { ...ticketPolicy(cfg, task.rc, undefined, { routeOnly: true, ticketUrl: task.ticketUrl }),
+          policy: { ...ticketPolicy(cfg, task.rc, undefined, { routeOnly: true, ticketUrl: task.ticketUrl,
+            activationUpdatedAt: task.activationUpdatedAt, activationPreverified: task.activationPreverified }),
             intakeOnly: true, maxConcurrentSessions: undefined },
           dispatch: async () => { throw new Error('intake must never dispatch an agent'); },
         });
@@ -3447,51 +3833,23 @@ async function cmdTickets(opts: ParsedArgs) {
     };
     // Intake does not wait for session slots and keeps running while a long
     // agent turn blocks the dispatch pool. Its cadence is deliberately much
-    // slower than the quiet period to avoid provider rate limits.
+    // slower than the quiet period to avoid provider rate limits. The shared
+    // tick orders projects by the durable budget rotation and reports global
+    // provider/association/task faults so the pacer backs the cadence off;
+    // per-issue activation failures stay local diagnostics.
     const discoverAndIntake = async (): Promise<boolean> => {
       if (discovering) return true;
       discovering = true;
-      let ok = true;
       try {
-        const discovered: TicketTask[] = [];
-        for (const context of projectContexts) {
-          let candidates: Awaited<ReturnType<typeof githubTicket.select>> = [];
-          let listedNumbers = new Set<number>();
-          try {
-            const listed = await githubTicket.select(context.project, Math.min(1000, max));
-            candidates = listed.filter((issue) => eligibleTicketAuthor(cfg, context.rc, issue.author)).slice(0, max);
-            listedNumbers = new Set(listed.map((issue) => issue.number));
-          } catch (error) {
-            // Known persisted associations can still be drained below.
-            ok = false;
-            noteIntakeError(error, context.project);
-          }
-          try {
-            const knownDiscovery = await appendKnownRouteTasks(context, discovered,
-              (project, issue) => knownTasks.has(taskKey(project, issue)) || listedNumbers.has(issue));
-            if (knownDiscovery.truncated) {
-              noteIntakeError(new Error('retained association scan reached its 5000-row safety bound'), context.project);
-            }
-            if (knownDiscovery.unverified) {
-              noteIntakeError(new Error('retained association identity unavailable; skipping this poll'), context.project);
-            }
-            for (const task of discovered) knownTasks.add(taskKey(task.project, task.issue));
-            for (const issue of candidates) {
-              const key = taskKey(context.project, issue.number);
-              if (knownTasks.has(key)) continue;
-              knownTasks.add(key);
-              discovered.push({ ...context, issue: issue.number, ticketUrl: issue.url, retryBlocked: false });
-            }
-          } catch (error) {
-            ok = false;
-            noteIntakeError(error, context.project);
-          }
-        }
-        intakeTasks.push(...discovered);
-        const snapshot = [...intakeTasks];
-        const results = await mapLimit(snapshot, Math.min(8, snapshot.length), runIntake);
-        if (results.some((result) => !result)) ok = false;
-        return ok;
+        return await runIntakeTick({
+          cfg, max, contexts: projectContexts, knownTasks, tasks: intakeTasks,
+          noteError: noteIntakeError, runTask: runIntake,
+        });
+      } catch (error) {
+        // Unexpected shared failure (for example a broken scheduler or a
+        // database error): throttle the shared cadence to avoid a hot loop.
+        noteIntakeError(error);
+        return false;
       } finally {
         discovering = false;
       }
@@ -3501,23 +3859,18 @@ async function cmdTickets(opts: ParsedArgs) {
         void discoverAndIntake().then((ok) => {
           if (intakeStopped) return;
           intakeSummary.polls += 1;
-          if (ok) {
-            intakeFailures = 0;
-            intakeSummary.backoff_ms = 0;
-          } else {
-            intakeFailures = Math.min(intakeFailures + 1, 4);
-            intakeSummary.backoff_ms = Math.min(intakeMaxBackoffMs, intakeBaseMs * 2 ** intakeFailures);
-          }
-          intakeSummary.next_at = intakeSummary.backoff_ms
-            ? new Date(Date.now() + intakeSummary.backoff_ms).toISOString() : null;
-          scheduleIntake(intakeSummary.backoff_ms || intakeBaseMs);
+          const delay = intakePacer.record(ok);
+          intakeSummary.backoff_ms = intakePacer.backoffMs;
+          intakeSummary.next_at = intakePacer.backoffMs
+            ? new Date(Date.now() + intakePacer.backoffMs).toISOString() : null;
+          scheduleIntake(delay);
         }).catch((error) => {
           if (intakeStopped) return;
           noteIntakeError(error);
-          intakeFailures = Math.min(intakeFailures + 1, 4);
-          intakeSummary.backoff_ms = Math.min(intakeMaxBackoffMs, intakeBaseMs * 2 ** intakeFailures);
-          intakeSummary.next_at = new Date(Date.now() + intakeSummary.backoff_ms).toISOString();
-          scheduleIntake(intakeSummary.backoff_ms);
+          const delay = intakePacer.record(false);
+          intakeSummary.backoff_ms = intakePacer.backoffMs;
+          intakeSummary.next_at = new Date(Date.now() + intakePacer.backoffMs).toISOString();
+          scheduleIntake(delay);
         });
       }, delayMs);
       intakeTimer.unref?.();
@@ -3539,6 +3892,7 @@ async function cmdTickets(opts: ParsedArgs) {
             project: task.project,
             issue: task.issue,
             policy: ticketPolicy(cfg, task.rc, undefined, { routeOnly: true, ticketUrl: task.ticketUrl,
+              activationUpdatedAt: task.activationUpdatedAt, activationPreverified: task.activationPreverified,
               retryBlocked: task.retryBlocked, delivery: task.delivery }),
             dispatch: async (request) => {
               // Lazy: capacity-deferred issues never allocate a worktree or session.

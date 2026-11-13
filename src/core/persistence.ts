@@ -801,6 +801,68 @@ const MIGRATIONS = [
       last_started_ms INTEGER
     );
   `,
+  `
+    -- Content-free activation bookkeeping. Only the observed issue revision,
+    -- the activation policy digest, a boolean result and bounded scan progress
+    -- are stored; issue/comment text and mention logins never reach this table.
+    CREATE TABLE IF NOT EXISTS ticket_activation_state (
+      key TEXT PRIMARY KEY,
+      project TEXT NOT NULL,
+      issue INTEGER NOT NULL CHECK(issue > 0),
+      policy TEXT NOT NULL,
+      revision TEXT NOT NULL,
+      matched INTEGER NOT NULL CHECK(matched IN (0, 1)),
+      complete_revision TEXT,
+      next_page INTEGER CHECK(next_page IS NULL OR next_page > 0),
+      checked_at INTEGER NOT NULL CHECK(checked_at >= 0),
+      last_complete_at INTEGER,
+      failures INTEGER NOT NULL DEFAULT 0 CHECK(failures >= 0)
+    );
+    CREATE INDEX IF NOT EXISTS ticket_activation_state_checked
+      ON ticket_activation_state(checked_at);
+    CREATE INDEX IF NOT EXISTS ticket_activation_state_issue
+      ON ticket_activation_state(lower(project), issue);
+  `,
+  `
+    -- Newest comment page observed when the descending scan cursor was saved.
+    -- It lets an ordinary comment continue history instead of restarting at
+    -- the top, while a page growth still re-covers the new page range.
+    ALTER TABLE ticket_activation_state ADD COLUMN top_page INTEGER
+      CHECK(top_page IS NULL OR top_page > 0);
+    -- One shared, time-based activation API budget for every project and
+    -- poller process using this runtime database. No issue content is stored;
+    -- tokens are a fraction of what GitHub allows so ticket agents keep room.
+    CREATE TABLE IF NOT EXISTS ticket_api_budget (
+      singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+      tokens REAL NOT NULL CHECK(tokens >= 0),
+      updated_ms INTEGER NOT NULL CHECK(updated_ms >= 0)
+    );
+  `,
+  `
+    -- Durable cross-project rotation for the shared activation budget. A
+    -- monotonic grant sequence (not a wall-clock time) breaks ties, so two
+    -- grants in the same millisecond cannot pin one project to the front.
+    -- Unknown projects sort first; no issue or comment content is stored.
+    CREATE TABLE IF NOT EXISTS ticket_api_budget_fairness (
+      project TEXT PRIMARY KEY,
+      last_grant_seq INTEGER NOT NULL CHECK(last_grant_seq >= 0),
+      granted_at_ms INTEGER NOT NULL CHECK(granted_at_ms >= 0)
+    );
+  `,
+  `
+    -- Separate, shared rolling-window log for the GitHub search endpoint. A
+    -- token bucket would still allow a full burst plus its refill inside one
+    -- minute; retaining every grant for a full window proves that the summed
+    -- cost of any rolling 60 seconds cannot exceed the configured limit. No
+    -- issue, query or comment content is stored.
+    CREATE TABLE IF NOT EXISTS ticket_search_budget (
+      granted_at_ms INTEGER NOT NULL CHECK(granted_at_ms >= 0),
+      cost INTEGER NOT NULL CHECK(cost >= 1),
+      project TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS ticket_search_budget_granted
+      ON ticket_search_budget(granted_at_ms);
+  `,
 ];
 
 export interface TicketHandoffRecord {
@@ -810,6 +872,118 @@ export interface TicketHandoffRecord {
   goalHash: string;
   goal: string;
   state: Record<string, unknown>;
+}
+
+/**
+ * Durable, content-free result of one bounded activation scan. The row is
+ * keyed by repository, issue and activation policy so a changed trusted-author
+ * or login policy cannot reuse a previous boolean.
+ */
+export interface TicketActivationStateRecord {
+  key: string;
+  project: string;
+  issue: number;
+  policy: string;
+  /** Issue `updatedAt` observed by the last successful scan ('' when null). */
+  revision: string;
+  matched: boolean;
+  /** Revision whose comment pages were scanned to the end. */
+  completeRevision: string | null;
+  /** Next descending comment page to scan, or null when no scan is pending. */
+  nextPage: number | null;
+  /** Newest comment page observed with the saved cursor; null when unknown. */
+  topPage: number | null;
+  checkedAt: number;
+  lastCompleteAt: number | null;
+  /** Consecutive provider failures; drives a bounded per-issue retry delay. */
+  failures: number;
+}
+
+const MAX_TICKET_ACTIVATION_STATE_ROWS = 10_000;
+
+/** Order two content-free issue revisions; '' means "unknown" and is oldest. */
+function compareActivationRevision(left: string, right: string): number {
+  if (left === right) return 0;
+  if (!left) return -1;
+  if (!right) return 1;
+  const leftMs = Date.parse(left);
+  const rightMs = Date.parse(right);
+  if (Number.isFinite(leftMs) && Number.isFinite(rightMs) && leftMs !== rightMs) {
+    return leftMs < rightMs ? -1 : 1;
+  }
+  // GitHub emits fixed-width ISO-8601 UTC timestamps; lexical order is
+  // chronological and remains correct for unusual-but-comparable formats.
+  if (left.length === right.length) return left < right ? -1 : 1;
+  return 0;
+}
+
+/**
+ * Safe merge for a stale concurrent activation writer (compare-and-swap
+ * against the committed row):
+ * - a positive result is monotonic and can never be reset by a stale negative;
+ * - a writer that observed an older revision cannot overwrite a newer
+ *   revision, its completion marker, or its cursor;
+ * - within one revision and thread top, progress only moves forward
+ *   (descending cursor takes the lower page, completion wins over pending, and
+ *   the checked timestamp never moves backwards).
+ */
+export function mergeTicketActivationState(existing: TicketActivationStateRecord | null,
+  incoming: TicketActivationStateRecord): TicketActivationStateRecord {
+  if (!existing) return incoming;
+  const order = compareActivationRevision(incoming.revision, existing.revision);
+  if (order < 0) {
+    // Older revision: keep the committed row, but never lose a positive.
+    if (existing.matched) return existing;
+    if (!incoming.matched) return existing;
+    // The older observation still proves admission. Latch only the positive
+    // flag: the committed row keeps its newer revision, completion marker and
+    // cursor, and `matched` short-circuits every later check anyway.
+    return { ...existing, matched: true };
+  }
+  if (order > 0) {
+    // Newer revision: the freshly observed scan is authoritative, but a
+    // previously positive result still latches.
+    const matched = existing.matched || incoming.matched;
+    return matched
+      ? { ...incoming, matched: true, completeRevision: incoming.revision, nextPage: null }
+      : { ...incoming, matched: false };
+  }
+  // Same revision observed by both writers.
+  const matched = existing.matched || incoming.matched;
+  const checkedAt = Math.max(existing.checkedAt, incoming.checkedAt);
+  if (matched) {
+    return { ...incoming, matched: true, completeRevision: incoming.revision,
+      nextPage: null, checkedAt, lastCompleteAt: Math.max(existing.lastCompleteAt ?? 0, incoming.lastCompleteAt ?? 0) || null };
+  }
+  // A changed thread top invalidates the old cursor invariant; take the row
+  // that actually scanned the current thread. Same top: merge monotonically.
+  const sameTop = existing.topPage === incoming.topPage;
+  // A later observation may legitimately find an incomplete range again (for
+  // example a page growth noticed after the negative cache expired), so only a
+  // stale — not newer — incomplete write is overruled by a previous completion.
+  const completed = incoming.completeRevision === incoming.revision ||
+    (existing.completeRevision === incoming.revision && incoming.checkedAt <= existing.checkedAt);
+  if (completed) {
+    return { ...incoming, matched: false, completeRevision: incoming.revision, nextPage: null, checkedAt,
+      lastCompleteAt: Math.max(existing.lastCompleteAt ?? 0, incoming.lastCompleteAt ?? 0) || null };
+  }
+  const nextPage = sameTop
+    ? (existing.nextPage === null ? incoming.nextPage
+      : incoming.nextPage === null ? existing.nextPage
+        : Math.min(existing.nextPage, incoming.nextPage))
+    : incoming.nextPage;
+  return {
+    ...incoming,
+    matched: false,
+    completeRevision: null,
+    nextPage,
+    topPage: sameTop ? existing.topPage : incoming.topPage,
+    checkedAt,
+    lastCompleteAt: Math.max(existing.lastCompleteAt ?? 0, incoming.lastCompleteAt ?? 0) || null,
+    // The newer observation reports the outcome of a newer attempt; a stale
+    // failure must not extend the retry delay over a successful check.
+    failures: incoming.checkedAt >= existing.checkedAt ? incoming.failures : existing.failures,
+  };
 }
 
 export type TicketHandoffClaim =
@@ -877,6 +1051,250 @@ export class SQLiteStore {
     const row = asSqlRow<{ id: string; project: string; issue: number; goal_hash: string; goal_json: string; state_json: string }>(
       this.db.prepare('SELECT id,project,issue,goal_hash,goal_json,state_json FROM ticket_handoffs WHERE id=?').get(id));
     return row ? { id: row.id, project: row.project, issue: Number(row.issue), goalHash: row.goal_hash, goal: JSON.parse(row.goal_json) as string, state: JSON.parse(row.state_json) as Record<string, unknown> } : null;
+  }
+
+  /** Read one content-free activation scan record; read-only, no migration. */
+  readTicketActivationState(key: string): TicketActivationStateRecord | null {
+    type Row = {
+      key: string; project: string; issue: number | bigint; policy: string; revision: string;
+      matched: number; complete_revision: string | null; next_page: number | bigint | null;
+      top_page: number | bigint | null;
+      checked_at: number | bigint; last_complete_at: number | bigint | null; failures: number | bigint;
+    };
+    const row = asSqlRow<Row>(this.db.prepare(`SELECT key,project,issue,policy,revision,matched,
+      complete_revision,next_page,top_page,checked_at,last_complete_at,failures
+      FROM ticket_activation_state WHERE key=?`).get(key));
+    if (!row) return null;
+    return {
+      key: row.key,
+      project: row.project,
+      issue: Number(row.issue),
+      policy: row.policy,
+      revision: row.revision,
+      matched: Number(row.matched) === 1,
+      completeRevision: row.complete_revision,
+      nextPage: row.next_page === null ? null : Number(row.next_page),
+      topPage: row.top_page === null ? null : Number(row.top_page),
+      checkedAt: Number(row.checked_at),
+      lastCompleteAt: row.last_complete_at === null ? null : Number(row.last_complete_at),
+      failures: Number(row.failures),
+    };
+  }
+
+  /**
+   * Persist one activation scan result and prune old rows.
+   *
+   * Concurrent pollers work from stale snapshots. A blind upsert would let a
+   * slower writer regress a positive result to negative, or overwrite a newer
+   * revision/cursor with an older one. The merge below runs inside the write
+   * transaction (BEGIN IMMEDIATE), so it is a compare-and-swap against the
+   * committed row: positives latch, an older revision cannot overwrite a
+   * newer one, and same-revision progress only moves forward.
+   */
+  writeTicketActivationState(record: TicketActivationStateRecord): void {
+    if (!record.key || !record.project || !Number.isSafeInteger(record.issue) || record.issue < 1 ||
+        !record.policy || !Number.isSafeInteger(record.checkedAt) || record.checkedAt < 0 ||
+        (record.nextPage !== null && (!Number.isSafeInteger(record.nextPage) || record.nextPage < 1)) ||
+        (record.topPage !== null && (!Number.isSafeInteger(record.topPage) || record.topPage < 1)) ||
+        !Number.isSafeInteger(record.failures) || record.failures < 0) {
+      throw new Error('invalid ticket activation state');
+    }
+    this.transaction(() => {
+      const merged = mergeTicketActivationState(this.readTicketActivationState(record.key), record);
+      this.db.prepare(`INSERT INTO ticket_activation_state(key,project,issue,policy,revision,matched,
+        complete_revision,next_page,top_page,checked_at,last_complete_at,failures)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(key) DO UPDATE SET
+          revision=excluded.revision,
+          matched=excluded.matched,
+          complete_revision=excluded.complete_revision,
+          next_page=excluded.next_page,
+          top_page=excluded.top_page,
+          checked_at=excluded.checked_at,
+          last_complete_at=excluded.last_complete_at,
+          failures=excluded.failures`)
+        .run(merged.key, merged.project, merged.issue, merged.policy, merged.revision,
+          merged.matched ? 1 : 0, merged.completeRevision, merged.nextPage, merged.topPage,
+          merged.checkedAt, merged.lastCompleteAt, merged.failures);
+      this.db.prepare(`DELETE FROM ticket_activation_state WHERE key IN (
+        SELECT key FROM ticket_activation_state ORDER BY checked_at ASC
+        LIMIT MAX(0, (SELECT COUNT(*) FROM ticket_activation_state) - ?)
+      )`).run(MAX_TICKET_ACTIVATION_STATE_ROWS);
+    });
+  }
+
+  /**
+   * Consume a reservation from the one shared, time-based activation API
+   * budget. The transaction serializes poller processes, and refill is derived
+   * from wall-clock time so a restart keeps the same bucket instead of
+   * resetting it. A denial consumes nothing and returns the earliest retry
+   * time; callers must make no provider request in that case.
+   *
+   * Every granted reservation also advances a durable round-robin rotation:
+   * the charged project receives the next monotonic grant sequence and
+   * therefore moves behind every project that has not been served recently.
+   * Search and per-issue checks share this rotation, so a project whose many
+   * candidates exhaust the bucket still yields the next tick to another
+   * project instead of starving it forever.
+   */
+  consumeTicketActivationBudget(requests: number, options: {
+    now?: number; limit: number; windowMs: number; project: string;
+  }): { granted: boolean; remaining: number; retryAt: number | null } {
+    const { limit, windowMs } = options;
+    const project = typeof options.project === 'string' ? options.project.trim().toLocaleLowerCase() : '';
+    const now = options.now ?? Date.now();
+    if (!Number.isSafeInteger(requests) || requests < 1 ||
+        !Number.isSafeInteger(limit) || limit < 1 ||
+        !Number.isSafeInteger(windowMs) || windowMs < 1 ||
+        !Number.isSafeInteger(now) || now < 0 ||
+        !project || project.length > 200) {
+      throw new Error('invalid ticket activation API budget arguments');
+    }
+    return this.transaction(() => {
+      const row = asSqlRow<{ tokens: number | bigint; updated_ms: number | bigint }>(
+        this.db.prepare('SELECT tokens,updated_ms FROM ticket_api_budget WHERE singleton=1').get());
+      const anchor = row ? Number(row.updated_ms) : now;
+      const stored = row ? Number(row.tokens) : limit;
+      // A process whose clock is behind the persisted anchor must not inflate
+      // the bucket; elapsed time is simply treated as zero until clocks agree.
+      const elapsed = Math.max(0, now - anchor);
+      const tokens = Math.min(limit, stored + (elapsed * limit) / windowMs);
+      const epsilon = 1e-9;
+      const write = (value: number) => {
+        this.db.prepare(`INSERT INTO ticket_api_budget(singleton,tokens,updated_ms) VALUES (1,?,?)
+          ON CONFLICT(singleton) DO UPDATE SET tokens=excluded.tokens, updated_ms=excluded.updated_ms`)
+          .run(value, Math.max(anchor, now));
+      };
+      // The sequence row is written in the same transaction as the token
+      // consumption, so a crash cannot grant budget without charging the
+      // rotation (or vice versa).
+      const advanceRotation = () => this.advanceActivationBudgetRotation(project, Math.max(anchor, now));
+      if (requests > limit) {
+        // A reservation larger than the whole bucket could never be granted;
+        // persist refill progress and fail closed without a provider request.
+        write(tokens);
+        return { granted: false, remaining: Math.floor(tokens), retryAt: null };
+      }
+      if (tokens + epsilon >= requests) {
+        const remaining = Math.max(0, tokens - requests);
+        write(remaining);
+        advanceRotation();
+        return { granted: true, remaining: Math.floor(remaining), retryAt: null };
+      }
+      write(tokens);
+      const missing = requests - tokens;
+      return {
+        granted: false,
+        remaining: Math.floor(tokens),
+        retryAt: Math.max(anchor, now) + Math.ceil((missing * windowMs) / limit),
+      };
+    });
+  }
+
+  /**
+   * Advance the durable cross-project rotation for either shared budget.
+   * Callers run it inside the same transaction as their grant, so a crash
+   * cannot grant budget without charging (or vice versa).
+   */
+  private advanceActivationBudgetRotation(project: string, at: number): void {
+    const next = Number(asSqlRow<{ seq: number | bigint }>(
+      this.db.prepare('SELECT COALESCE(MAX(last_grant_seq),0)+1 AS seq FROM ticket_api_budget_fairness').get())?.seq ?? 1);
+    this.db.prepare(`INSERT INTO ticket_api_budget_fairness(project,last_grant_seq,granted_at_ms)
+      VALUES (?,?,?) ON CONFLICT(project) DO UPDATE SET
+        last_grant_seq=excluded.last_grant_seq, granted_at_ms=excluded.granted_at_ms`)
+      .run(project, next, at);
+  }
+
+  /**
+   * Consume a reservation from the separate, shared search budget.
+   *
+   * GitHub allows 30 search requests per minute for one authenticated token.
+   * A token bucket of that capacity still permits a full burst plus its refill
+   * within one minute (capacity + rate * window), so this budget instead keeps
+   * a durable rolling log: a grant is admitted only while the summed cost of
+   * every grant in the preceding `windowMs` stays within `limit`. Because each
+   * admission checks the whole trailing window, the sum over any rolling
+   * window is bounded by `limit`, including bursts across processes, projects
+   * and restarts.
+   *
+   * A backward clock step is clamped to the newest recorded grant, so grants
+   * cannot be replayed into an earlier window. A denial records nothing and
+   * returns the earliest time at which enough old grants expire.
+   */
+  consumeTicketSearchBudget(requests: number, options: {
+    now?: number; limit: number; windowMs: number; project: string;
+  }): { granted: boolean; remaining: number; retryAt: number | null } {
+    const { limit, windowMs } = options;
+    const project = typeof options.project === 'string' ? options.project.trim().toLocaleLowerCase() : '';
+    const now = options.now ?? Date.now();
+    if (!Number.isSafeInteger(requests) || requests < 1 ||
+        !Number.isSafeInteger(limit) || limit < 1 ||
+        !Number.isSafeInteger(windowMs) || windowMs < 1 ||
+        !Number.isSafeInteger(now) || now < 0 ||
+        !project || project.length > 200) {
+      throw new Error('invalid ticket search budget arguments');
+    }
+    return this.transaction(() => {
+      const latest = asSqlRow<{ anchor: number | bigint | null }>(
+        this.db.prepare('SELECT MAX(granted_at_ms) AS anchor FROM ticket_search_budget').get());
+      const anchor = latest?.anchor === null || latest?.anchor === undefined ? 0 : Number(latest.anchor);
+      const effectiveNow = Math.max(now, anchor);
+      this.db.prepare('DELETE FROM ticket_search_budget WHERE granted_at_ms <= ?')
+        .run(effectiveNow - windowMs);
+      const rows = asSqlRows<{ granted_at_ms: number | bigint; cost: number | bigint }>(
+        this.db.prepare('SELECT granted_at_ms, cost FROM ticket_search_budget ORDER BY granted_at_ms ASC').all());
+      const used = rows.reduce((sum, row) => sum + Number(row.cost), 0);
+      const remaining = Math.max(0, limit - used);
+      if (requests > limit) {
+        // A reservation larger than the whole window can never be granted.
+        return { granted: false, remaining, retryAt: null };
+      }
+      if (used + requests <= limit) {
+        this.db.prepare('INSERT INTO ticket_search_budget(granted_at_ms,cost,project) VALUES (?,?,?)')
+          .run(effectiveNow, requests, project);
+        this.advanceActivationBudgetRotation(project, effectiveNow);
+        return { granted: true, remaining: limit - used - requests, retryAt: null };
+      }
+      // The oldest grants expire first; the retry time is when exactly enough
+      // cost has left the rolling window.
+      const missing = used + requests - limit;
+      let freed = 0;
+      let retryAt = effectiveNow;
+      for (const row of rows) {
+        freed += Number(row.cost);
+        if (freed >= missing) {
+          retryAt = Number(row.granted_at_ms) + windowMs;
+          break;
+        }
+      }
+      return { granted: false, remaining, retryAt: Math.max(effectiveNow, retryAt) };
+    });
+  }
+
+  /**
+   * Durable fair order for the activation budget: the least recently served
+   * project first, never-served projects before any served project, and a
+   * stable case-insensitive name tie-break. Read-only and restart-safe;
+   * callers use it to order project discovery in a poll and in every intake
+   * tick, so budget starvation cannot follow configuration or list order.
+   */
+  activationBudgetFairOrder(projects: string[]): string[] {
+    if (!Array.isArray(projects)) throw new Error('invalid activation budget project list');
+    const entries: Array<{ project: string; key: string; index: number }> = [];
+    projects.forEach((project, index) => {
+      if (typeof project !== 'string' || !project.trim()) throw new Error('invalid activation budget project');
+      entries.push({ project, key: project.trim().toLocaleLowerCase(), index });
+    });
+    const served = new Map<string, number>();
+    const rows = this.db.prepare('SELECT project,last_grant_seq FROM ticket_api_budget_fairness')
+      .all() as Array<{ project: string; last_grant_seq: number | bigint }>;
+    for (const row of rows) served.set(String(row.project).toLocaleLowerCase(), Number(row.last_grant_seq));
+    return entries
+      .sort((left, right) =>
+        (served.get(left.key) ?? 0) - (served.get(right.key) ?? 0) ||
+        (left.key < right.key ? -1 : left.key > right.key ? 1 : 0) ||
+        left.index - right.index)
+      .map((entry) => entry.project);
   }
 
   /**
