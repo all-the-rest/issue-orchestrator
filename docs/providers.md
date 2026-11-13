@@ -81,9 +81,21 @@ Those adapters belong to the older broad workflow; V1 ticket intake is GitHub-on
 ## V1 ticket-to-agent path
 
 `goal` and `tickets poll` use a route-only event envelope containing repository,
-issue/PR/comment IDs and URLs. The router does not read or copy issue/comment
-bodies into the agent payload. The ticket-agent fetches full issue/PR context
-with `gh`, then owns source edits, commits, pushes, PRs, comments, and linked
+issue/PR/comment IDs and URLs. The router does not copy issue/comment bodies
+into the agent payload. The optional per-repository activation gate is the one
+private content read: the provider inspects the issue title/body and comments
+only to return a boolean, and never persists or forwards that text. Comment
+pages are hard-bounded per check and the durable page cursor (plus the newest
+page observed) is content-free; ordinary comments continue history after
+re-reading the newest page, while a newly added page restarts the bounded range.
+An incomplete scan is deferred, not treated as unmentioned. Every scan and the
+optional mention search first reserve their worst-case request cost from one
+durable, time-based budget shared across pollers and projects; a denied
+reservation makes no provider call, and granted reservations rotate across
+projects so one repository cannot starve the others. An explicit operator
+`goal` bypasses that poller gate. The ticket-agent fetches full
+issue/PR context with `gh`, then owns source edits, commits, pushes, PRs,
+comments, and linked
 follow-up issues. It may delegate bounded implementation work to the dedicated
 `build-worker` subagent; the worker runs in the same worktree and container,
 uses the ticket session's configured model, cannot ask questions or launch

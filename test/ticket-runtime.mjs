@@ -1382,9 +1382,101 @@ try {
     ['issue-comment:902'], 'the retained cursor resumes after backoff without replay');
   prSeedDb.close();
 
+  const activationFixture = fixture(61);
+  activationFixture.port.read = async () => { throw new Error('route-only mode must not read ticket content'); };
+  let activationAllowed = false;
+  let activationUpdatedAt = '2026-06-01T00:00:00Z';
+  let activationChecks = 0;
+  const activationTimestamps = [];
+  activationFixture.port.hasActivationMention = async (request) => {
+    activationChecks++;
+    activationTimestamps.push(request.updatedAt);
+    return activationAllowed && request.updatedAt === activationUpdatedAt;
+  };
+  let activationDb = new SQLiteStore(path.join(dir, 'activation.sqlite3'));
+  const activationPolicy = { ...policy, routeOnly: true, trustedAuthors: ['human'], toolAuthors: [],
+    ticketUrl: 'https://github.com/owner/repo/issues/61', activationMention: 'reisi007-jr',
+    bootstrap: ['Start the ticket session.'] };
+  const activationRun = (store = activationDb) => runTicketHandoff({ port: activationFixture.port,
+    dispatch: activationFixture.dispatch, store, project: 'owner/repo', issue: 61,
+    policy: { ...activationPolicy, activationUpdatedAt } });
+  const notActivated = await activationRun();
+  assert.equal(notActivated.state, 'deferred');
+  assert.equal(notActivated.reason, 'activation-mention');
+  assert.equal(activationFixture.dispatchCount, 0);
+  assert.equal(activationDb.listTicketHandoffs('owner/repo', 10).length, 0,
+    'a missing activation mention creates no durable route-only handoff');
+  // A late mention updates the issue timestamp; the next poll retries with the
+  // new revision instead of trusting a previous negative result.
+  activationAllowed = true;
+  activationUpdatedAt = '2026-06-02T00:00:00Z';
+  const activated = await activationRun();
+  assert.equal(activated.state, 'done');
+  assert.deepEqual(activationTimestamps, ['2026-06-01T00:00:00Z', '2026-06-02T00:00:00Z'],
+    'late activation is rechecked with the updated issue timestamp');
+  assert.equal(activationChecks, 2);
+  let activationState = activationDb.readTicketHandoff(activated.jobId).state;
+  assert.equal(activationState.activationAdmitted, true,
+    'the admitted state keeps a content-free permanent activation latch');
+  assert.doesNotMatch(JSON.stringify(activationState), /reisi007-jr|Please activate/);
+  // Restart/another poller opens the same SQLite file: the durable latch must
+  // prevent a second mention check and continue the same session.
+  activationDb.close();
+  activationDb = new SQLiteStore(path.join(dir, 'activation.sqlite3'));
+  activationFixture.port.hasActivationMention = async () => {
+    throw new Error('an admitted session must never recheck its activation mention');
+  };
+  activationUpdatedAt = '2026-06-03T00:00:00Z';
+  activationFixture.comments = [...activationFixture.issue.comments,
+    { id: '2', author: 'human', body: 'trusted follow-up must never be persisted verbatim', createdAt: '2026-06-03' }];
+  assert.equal((await activationRun(activationDb)).state, 'done');
+  assert.equal(activationChecks, 2, 'a restart reuses the durable activation latch');
+  assert.equal(activationFixture.dispatchCount, 2, 'follow-up events continue on the original route session');
+  const activationUpdate = JSON.parse(activationFixture.messages.at(-1).message);
+  assert.equal(activationUpdate.kind, 'update');
+  assert.ok(activationUpdate.events.every((event) => !('body' in event)));
+  assert.doesNotMatch(JSON.stringify(activationUpdate), /trusted follow-up must never be persisted verbatim|reisi007-jr/);
+  activationState = activationDb.readTicketHandoff(activated.jobId).state;
+  assert.doesNotMatch(JSON.stringify(activationState), /trusted follow-up must never be persisted verbatim|reisi007-jr/);
+  activationDb.close();
+
+  // Two pollers opening separate SQLite handles must still admit exactly one
+  // bootstrap. The second waits on the durable lease and defers.
+  let releaseConcurrentActivation;
+  let concurrentActivationStarted;
+  const concurrentStarted = new Promise((resolve) => { concurrentActivationStarted = resolve; });
+  const concurrentActivation = fixture(62, { async onDispatch(input) {
+    concurrentActivationStarted();
+    await new Promise((resolve) => { releaseConcurrentActivation = resolve; });
+    return { sessionId: input.sessionId ?? 'concurrent-activation-session', result: validResult() };
+  } });
+  concurrentActivation.port.hasActivationMention = async () => true;
+  const concurrentPath = path.join(dir, 'activation-concurrent.sqlite3');
+  const concurrentStoreA = new SQLiteStore(concurrentPath);
+  const concurrentStoreB = new SQLiteStore(concurrentPath);
+  const concurrentPolicy = { ...activationPolicy, ticketUrl: 'https://github.com/owner/repo/issues/62',
+    activationUpdatedAt: '2026-07-01T00:00:00Z' };
+  const concurrentArgs = (store) => ({ port: concurrentActivation.port, dispatch: concurrentActivation.dispatch,
+    store, project: 'owner/repo', issue: 62, policy: concurrentPolicy });
+  const firstPoller = runTicketHandoff(concurrentArgs(concurrentStoreA));
+  await concurrentStarted;
+  const secondPoller = await runTicketHandoff(concurrentArgs(concurrentStoreB));
+  assert.equal(secondPoller.state, 'deferred');
+  assert.equal(secondPoller.reason, 'busy', 'a concurrent poller cannot start a second bootstrap');
+  releaseConcurrentActivation();
+  const firstOutcome = await firstPoller;
+  assert.equal(firstOutcome.state, 'done');
+  assert.equal(secondPoller.jobId, firstOutcome.jobId, 'both pollers share one durable route job');
+  assert.equal(concurrentActivation.dispatchCount, 1, 'concurrent pollers admit exactly one bootstrap');
+  assert.equal(concurrentStoreB.readTicketHandoff(firstOutcome.jobId).state.activationAdmitted, true,
+    'the activation latch is durable for the next poller');
+  concurrentStoreA.close();
+  concurrentStoreB.close();
+
   const ticketDefaults = repoConfig({ __file: 'test-config', model: 'provider/model',
     repos: { 'owner/repo': {} } }, 'owner/repo');
   assert.equal(ticketDefaults.tickets.max_concurrency, 1);
+  assert.equal(ticketDefaults.tickets.activation_mention, undefined, 'activation mention is absent by default');
   assert.equal(ticketDefaults.tickets.quiet_period_ms, 60_000);
   assert.equal(ticketDefaults.tickets.intake_poll_ms, 30_000);
   const ticketDefaultsOnly = repoConfig({ __file: 'test-config', model: 'provider/model',
@@ -1396,10 +1488,12 @@ try {
   const ticketOverrides = repoConfig({ __file: 'test-config', model: 'provider/model',
     defaults: { tickets: { max_concurrency: 3, quiet_period_ms: 7, intake_poll_ms: 5_000 } },
     tickets: { max_concurrency: 2, quiet_period_ms: 60_000, intake_poll_ms: 1_000 },
-    repos: { 'owner/repo': { tickets: { quiet_period_ms: 5, intake_poll_ms: 2_000 } } } }, 'owner/repo');
+    repos: { 'owner/repo': { tickets: { quiet_period_ms: 5, intake_poll_ms: 2_000,
+      activation_mention: 'reisi007-jr' } } } }, 'owner/repo');
   assert.equal(ticketOverrides.tickets.max_concurrency, 2, 'top-level tickets override defaults');
   assert.equal(ticketOverrides.tickets.quiet_period_ms, 5, 'the quiet period may be tuned per repository');
   assert.equal(ticketOverrides.tickets.intake_poll_ms, 2_000, 'the intake cadence may be tuned per repository');
+  assert.equal(ticketOverrides.tickets.activation_mention, 'reisi007-jr');
   assert.deepEqual(ticketDefaults.tickets.delivery, { timezone: null, windows: [], cooldownMs: 0 },
     'no delivery window is the default: existing installations run 24/7');
   const deliveryConfigured = repoConfig({ __file: 'test-config', model: 'provider/model',

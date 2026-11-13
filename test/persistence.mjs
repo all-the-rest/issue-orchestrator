@@ -175,7 +175,7 @@ try {
   assert.equal(Number(store.rows('PRAGMA foreign_keys')[0].foreign_keys), 1);
   assert.equal(store.rows('PRAGMA journal_mode')[0].journal_mode, 'wal');
   assert.equal(Number(store.rows('PRAGMA busy_timeout')[0].timeout), 5000);
-  assert.equal(store.rows('SELECT version FROM schema_migrations').length, 11);
+  assert.equal(store.rows('SELECT version FROM schema_migrations').length, 15);
   assert.ok(columns('jobs').has('lease_pid'), 'jobs should record the OS process that owns its lease');
   assert.ok(columns('jobs').has('lease_start_ticks'), 'jobs should record process identity to detect PID reuse');
   assert.ok(tables.has('job_resource_locks') && tables.has('scheduler_global_limit'));
@@ -184,9 +184,16 @@ try {
   }
   assert.ok(tables.has('ticket_scheduler_global_limit'), 'the global ticket cap must be durable');
   assert.ok(tables.has('ticket_delivery_state'), 'the global ticket delivery cooldown must be durable');
+  assert.ok(tables.has('ticket_api_budget'), 'the shared activation API budget must be durable');
+  assert.ok(tables.has('ticket_api_budget_fairness'),
+    'the durable cross-project budget rotation must be persisted');
+  assert.ok(tables.has('ticket_search_budget'),
+    'the durable rolling-window search budget must be persisted');
+  assert.ok(columns('ticket_activation_state').has('top_page'),
+    'activation scan state records the observed newest page');
   store.close();
   store = new SQLiteStore(migrationFile);
-  assert.equal(store.rows('SELECT version FROM schema_migrations').length, 11, 'reopening must not reapply migrations');
+  assert.equal(store.rows('SELECT version FROM schema_migrations').length, 15, 'reopening must not reapply migrations');
   store.close();
   ok('empty database receives all schema migrations with WAL/foreign keys, and restart is idempotent');
 
@@ -234,12 +241,16 @@ try {
     ALTER TABLE jobs DROP COLUMN lease_pid;
     ALTER TABLE jobs DROP COLUMN lease_start_ticks;
     DROP TABLE ticket_handoffs;
-    DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11);
+    DROP TABLE ticket_activation_state;
+    DROP TABLE ticket_api_budget;
+    DROP TABLE ticket_api_budget_fairness;
+    DROP TABLE ticket_search_budget;
+    DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
   `);
   store.close();
   store = new SQLiteStore(upgradeFile);
   assert.equal(store.rows('SELECT workflow_state FROM jobs WHERE id=?', upgradeJob.id)[0].workflow_state, 'EVIDENCE_PUBLISHED');
-  assert.equal(store.rows('SELECT MAX(version) AS version FROM schema_migrations')[0].version, 11);
+  assert.equal(store.rows('SELECT MAX(version) AS version FROM schema_migrations')[0].version, 15);
   store.close();
   ok('v1 jobs retain their workflow meaning when the additive migration is applied');
 
@@ -247,11 +258,11 @@ try {
   fs.mkdirSync(path.dirname(futureSchema), { recursive: true });
   const futureDb = new DatabaseSync(futureSchema);
   futureDb.exec('CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)');
-  futureDb.prepare('INSERT INTO schema_migrations(version, applied_at) VALUES (12, ?)').run(new Date().toISOString());
+  futureDb.prepare('INSERT INTO schema_migrations(version, applied_at) VALUES (16, ?)').run(new Date().toISOString());
   futureDb.close();
   assert.throws(() => new SQLiteStore(futureSchema), /newer than supported version/);
   const stillFutureDb = new DatabaseSync(futureSchema);
-  assert.equal(Number(stillFutureDb.prepare('SELECT MAX(version) AS version FROM schema_migrations').get().version), 12);
+  assert.equal(Number(stillFutureDb.prepare('SELECT MAX(version) AS version FROM schema_migrations').get().version), 16);
   stillFutureDb.close();
   ok('a database with a newer schema version is rejected without being downgraded');
 
@@ -1213,6 +1224,249 @@ try {
   peerA.close();
   peerB.close();
   ok('ticket delivery cooldown is durable, transactional across pollers, restart-safe, conservatively consumed on failure, explicitly reconfigurable and config-matched');
+
+  // --- Activation scan state: stale writers cannot regress positives or
+  // overwrite a newer revision/cursor. The merge is a compare-and-swap inside
+  // one write transaction, interleaved here through two SQLite handles. ---
+  const activationPath = path.join(TMP, 'ticket-activation-merge', 'orchestrator.sqlite3');
+  const activationA = new SQLiteStore(activationPath);
+  const activationB = new SQLiteStore(activationPath);
+  const baseState = {
+    key: 'owner/repo#7\u0000policy', project: 'owner/repo', issue: 7, policy: 'policy',
+    revision: '2026-05-01T00:00:00Z', matched: false, completeRevision: null, nextPage: 9,
+    topPage: 10, checkedAt: 1_000, lastCompleteAt: null, failures: 0,
+  };
+  activationA.writeTicketActivationState(baseState);
+  activationA.writeTicketActivationState({ ...baseState, matched: true,
+    completeRevision: baseState.revision, nextPage: null, checkedAt: 1_100, lastCompleteAt: 1_100 });
+  // A stale writer still believes the issue is unmentioned and has older progress.
+  activationB.writeTicketActivationState({ ...baseState, nextPage: 5, checkedAt: 900 });
+  let mergedState = activationA.readTicketActivationState(baseState.key);
+  assert.equal(mergedState.matched, true, 'a persisted positive is monotonic under a stale negative writer');
+  assert.equal(mergedState.completeRevision, baseState.revision);
+  assert.equal(mergedState.nextPage, null, 'a stale cursor cannot reopen a completed scan');
+  assert.equal(mergedState.checkedAt, 1_100, 'a stale timestamp cannot move the check time backwards');
+
+  const newerRevision = '2026-05-02T00:00:00Z';
+  activationA.writeTicketActivationState({ ...baseState, revision: newerRevision, matched: false,
+    completeRevision: newerRevision, topPage: 12, nextPage: null, checkedAt: 2_000, lastCompleteAt: 2_000 });
+  activationB.writeTicketActivationState({ ...baseState, revision: baseState.revision, nextPage: 7,
+    checkedAt: 5_000 });
+  mergedState = activationA.readTicketActivationState(baseState.key);
+  assert.equal(mergedState.revision, newerRevision,
+    'a stale writer cannot overwrite a newer issue revision');
+  assert.equal(mergedState.completeRevision, newerRevision);
+  assert.equal(mergedState.nextPage, null, 'a stale cursor cannot replace a newer completed range');
+  assert.equal(mergedState.checkedAt, 2_000);
+
+  // An older-revision positive observation must still latch admission, but it
+  // must not drag the committed row back to the stale revision or replace its
+  // cursor. This is the dedicated stale-positive branch.
+  const stalePositiveKey = 'owner/repo#10\u0000policy';
+  activationA.writeTicketActivationState({ ...baseState, key: stalePositiveKey, issue: 10,
+    revision: newerRevision, matched: false, completeRevision: null, nextPage: 5, topPage: 12,
+    checkedAt: 6_000 });
+  activationB.writeTicketActivationState({ ...baseState, key: stalePositiveKey, issue: 10,
+    matched: true, completeRevision: baseState.revision, nextPage: null, topPage: 10,
+    checkedAt: 5_500, lastCompleteAt: 5_500 });
+  mergedState = activationA.readTicketActivationState(stalePositiveKey);
+  assert.equal(mergedState.matched, true,
+    'an older-revision positive observation still proves admission and latches');
+  assert.equal(mergedState.revision, newerRevision,
+    'latching a stale positive keeps the newer observed revision');
+  assert.equal(mergedState.completeRevision, null,
+    'latching a stale positive does not fabricate a completion for the newer revision');
+  assert.equal(mergedState.nextPage, 5,
+    'latching a stale positive leaves the newer descending cursor untouched');
+  assert.equal(mergedState.topPage, 12);
+  assert.equal(mergedState.checkedAt, 6_000);
+  // Even a newer-timestamp stale negative cannot clear the latched positive.
+  activationB.writeTicketActivationState({ ...baseState, key: stalePositiveKey, issue: 10,
+    matched: false, nextPage: 3, checkedAt: 9_000 });
+  mergedState = activationA.readTicketActivationState(stalePositiveKey);
+  assert.equal(mergedState.matched, true, 'a stale negative never resets a latched positive');
+  assert.equal(mergedState.revision, newerRevision);
+
+  const cursorKey = 'owner/repo#8\u0000policy';
+  const cursorBase = { ...baseState, key: cursorKey, issue: 8, revision: newerRevision,
+    nextPage: 6, topPage: 12, checkedAt: 3_000 };
+  activationA.writeTicketActivationState(cursorBase);
+  activationB.writeTicketActivationState({ ...cursorBase, nextPage: 4, checkedAt: 3_100 });
+  mergedState = activationA.readTicketActivationState(cursorKey);
+  assert.equal(mergedState.nextPage, 4, 'same-revision history progress takes the lower page');
+  assert.equal(mergedState.checkedAt, 3_100);
+  activationA.writeTicketActivationState({ ...cursorBase, nextPage: 8, checkedAt: 2_800 });
+  mergedState = activationA.readTicketActivationState(cursorKey);
+  assert.equal(mergedState.nextPage, 4, 'a stale writer cannot move the descending cursor backwards');
+  assert.equal(mergedState.checkedAt, 3_100);
+
+  const topChangedKey = 'owner/repo#9\u0000policy';
+  const topBase = { ...cursorBase, key: topChangedKey, issue: 9 };
+  activationA.writeTicketActivationState(topBase);
+  activationB.writeTicketActivationState({ ...topBase, topPage: 13, nextPage: 11, checkedAt: 3_200 });
+  mergedState = activationA.readTicketActivationState(topChangedKey);
+  assert.equal(mergedState.topPage, 13);
+  assert.equal(mergedState.nextPage, 11,
+    'a changed thread top replaces the cursor instead of merging an invalid range');
+
+  activationB.writeTicketActivationState({ ...topBase, topPage: 13, completeRevision: newerRevision,
+    nextPage: null, checkedAt: 3_300, lastCompleteAt: 3_300 });
+  activationA.writeTicketActivationState({ ...topBase, topPage: 13, nextPage: 2, checkedAt: 3_200 });
+  mergedState = activationA.readTicketActivationState(topChangedKey);
+  assert.equal(mergedState.completeRevision, newerRevision, 'completion is monotonic against a stale writer');
+  assert.equal(mergedState.nextPage, null, 'a stale incomplete write cannot un-complete a scanned revision');
+  // A genuinely newer observation may find more comments above the saved top
+  // and legitimately resume an incomplete range for the same revision.
+  activationA.writeTicketActivationState({ ...topBase, topPage: 14, nextPage: 13, checkedAt: 3_400 });
+  mergedState = activationA.readTicketActivationState(topChangedKey);
+  assert.equal(mergedState.completeRevision, null,
+    'a newer incomplete observation of a grown thread is not reported as a completed negative');
+  assert.equal(mergedState.nextPage, 13);
+  assert.equal(mergedState.topPage, 14);
+  activationA.close();
+  activationB.close();
+  ok('activation state writes merge stale concurrent pollers without regressing positives, revisions or cursors');
+
+  // --- One shared, time-based activation API budget across poller processes.
+  const budgetPath = path.join(TMP, 'ticket-api-budget', 'orchestrator.sqlite3');
+  let budgetA = new SQLiteStore(budgetPath);
+  let budgetB = new SQLiteStore(budgetPath);
+  const budgetOptions = (now, project = 'owner/alpha') => ({ now, limit: 12, windowMs: 60_000, project });
+  assert.deepEqual(budgetA.consumeTicketActivationBudget(5, budgetOptions(10_000)),
+    { granted: true, remaining: 7, retryAt: null });
+  assert.deepEqual(budgetB.consumeTicketActivationBudget(5, budgetOptions(10_000, 'owner/beta')),
+    { granted: true, remaining: 2, retryAt: null },
+    'a second poller handle consumes the same shared bucket');
+  assert.deepEqual(budgetA.activationBudgetFairOrder(['owner/alpha', 'owner/beta']),
+    ['owner/alpha', 'owner/beta'],
+    'the project served last rotates behind the project served before it');
+  budgetA.close();
+  budgetA = new SQLiteStore(budgetPath);
+  assert.deepEqual(budgetA.activationBudgetFairOrder(['owner/alpha', 'owner/beta', 'owner/gamma']),
+    ['owner/gamma', 'owner/alpha', 'owner/beta'],
+    'the fair order is durable across a restart and never-served projects go first');
+  const budgetDenied = budgetA.consumeTicketActivationBudget(5, budgetOptions(10_000));
+  assert.equal(budgetDenied.granted, false);
+  assert.equal(budgetDenied.remaining, 2);
+  assert.equal(budgetDenied.retryAt, 25_000, 'denial reports the exact refill time');
+  assert.equal(budgetA.consumeTicketActivationBudget(13, budgetOptions(10_000)).granted, false,
+    'a reservation larger than the bucket fails closed without consuming');
+  budgetA.close();
+  budgetA = new SQLiteStore(budgetPath);
+  assert.equal(budgetA.consumeTicketActivationBudget(5, budgetOptions(24_999)).granted, false,
+    'a restart preserves the refill anchor, and time alone refills the bucket');
+  assert.equal(budgetA.consumeTicketActivationBudget(5, budgetOptions(25_000)).granted, true,
+    'the refilled bucket admits the bounded reservation at the reported time');
+  // Both handles race for the whole window at one instant; only one may win.
+  const racers = [
+    budgetA.consumeTicketActivationBudget(12, budgetOptions(90_000)),
+    budgetB.consumeTicketActivationBudget(12, budgetOptions(90_000)),
+  ];
+  assert.deepEqual(racers.map((entry) => entry.granted), [true, false],
+    'two pollers cannot both spend the same tokens');
+  assert.throws(() => budgetA.consumeTicketActivationBudget(0, budgetOptions(90_000)),
+    /invalid ticket activation API budget arguments/);
+  budgetA.close();
+  budgetB.close();
+
+  // --- Separate shared search budget with a provable rolling-minute bound.
+  // GitHub allows 30 search requests per minute. A token bucket would admit a
+  // capacity burst plus refill inside one minute, so the durable store keeps a
+  // rolling log and admits only while the trailing minute stays within 30.
+  const searchPath = path.join(TMP, 'ticket-search-budget', 'orchestrator.sqlite3');
+  let searchA = new SQLiteStore(searchPath);
+  let searchB = new SQLiteStore(searchPath);
+  const searchOptions = (now, project = 'owner/alpha') => ({
+    now, limit: 30, windowMs: 60_000, project });
+  const searchProjects = ['owner/alpha', 'owner/beta', 'owner/gamma', 'owner/delta', 'owner/epsilon'];
+  const searchStart = 4_000_000;
+  const saturated = searchProjects.map((project) =>
+    searchA.consumeTicketSearchBudget(10, searchOptions(searchStart, project)));
+  assert.deepEqual(saturated.map((entry) => entry.granted), [true, true, true, false, false],
+    'five saturated projects cannot exceed 30 search requests in one minute');
+  assert.deepEqual(saturated[3], { granted: false, remaining: 0, retryAt: searchStart + 60_000 },
+    'the fourth project is denied with the exact rolling-window retry time');
+  assert.deepEqual(saturated[4], saturated[3],
+    'the fifth project is denied too; more projects never increase the shared quota');
+  assert.equal(searchB.consumeTicketSearchBudget(10, searchOptions(searchStart + 59_999, 'owner/zeta'))
+    .granted, false, 'a second poller sees the same saturated rolling minute');
+  assert.equal(searchA.consumeTicketSearchBudget(10, searchOptions(searchStart + 60_000, 'owner/delta'))
+    .granted, true, 'grants expire exactly one window after their own timestamp');
+  assert.equal(searchB.consumeTicketSearchBudget(10, searchOptions(searchStart + 90_000, 'owner/epsilon'))
+    .granted, true, 'a partially refilled window admits another bounded search');
+  assert.equal(searchA.consumeTicketSearchBudget(10, searchOptions(searchStart + 120_000, 'owner/zeta'))
+    .granted, true, 'window expiry is per grant, not a full-bucket reset');
+  // At 120_000 the trailing window (60_000, 120_000] holds the 90_000 grant
+  // plus the new 120_000 grant: 20 of 30; the 60_000 grant has expired.
+  assert.equal(searchA.consumeTicketSearchBudget(10, searchOptions(searchStart + 120_000, 'owner/eta'))
+    .granted, true, 'the remaining ten-request slice is still admitted');
+  assert.equal(searchA.consumeTicketSearchBudget(1, searchOptions(searchStart + 120_000, 'owner/theta'))
+    .granted, false, 'even a one-request search is refused once the rolling minute is full');
+  const searchDenied = searchB.consumeTicketSearchBudget(1, searchOptions(searchStart + 120_000, 'owner/theta'));
+  assert.equal(searchDenied.retryAt, searchStart + 150_000,
+    'the retry time is when enough of the oldest cost leaves the rolling window');
+  searchA.close();
+  searchA = new SQLiteStore(searchPath);
+  assert.equal(searchA.consumeTicketSearchBudget(30, searchOptions(searchStart + 120_000, 'owner/theta'))
+    .granted, false, 'a restart keeps the rolling log; an earlier clock cannot reset it');
+  assert.equal(searchB.consumeTicketSearchBudget(30, searchOptions(searchStart + 180_000, 'owner/theta'))
+    .granted, true, 'the full window refills after one minute without grants');
+  // A later search grant rotates its project behind every other served
+  // project, and search never spends the issue-read bucket: the budgets are
+  // durable and independent.
+  assert.equal(searchA.consumeTicketSearchBudget(10, searchOptions(searchStart + 240_000, 'owner/alpha'))
+    .granted, true);
+  assert.deepEqual(searchA.activationBudgetFairOrder(searchProjects),
+    ['owner/beta', 'owner/gamma', 'owner/delta', 'owner/epsilon', 'owner/alpha'],
+    'search grants share the durable cross-project rotation');
+  assert.equal(searchA.consumeTicketActivationBudget(45, {
+    now: searchStart + 240_000, limit: 45, windowMs: 60_000, project: 'owner/alpha' }).granted, true,
+  'search reservations do not drain the shared issue-read budget');
+  const oversizedSearch = searchA.consumeTicketSearchBudget(31,
+    searchOptions(searchStart + 300_000, 'owner/theta'));
+  assert.equal(oversizedSearch.granted, false,
+    'a reservation larger than the whole search window fails closed');
+  assert.equal(oversizedSearch.retryAt, null,
+    'an oversized search reservation has no admitting retry time');
+  assert.throws(() => searchA.consumeTicketSearchBudget(0, searchOptions(searchStart + 300_000)),
+    /invalid ticket search budget arguments/);
+  searchA.close();
+  searchB.close();
+
+  // Two independent poller processes released at the same instant must not both
+  // spend the same tokens.
+  const processBudgetPath = path.join(TMP, 'ticket-api-budget-process', 'orchestrator.sqlite3');
+  const processStart = Date.now() + 500;
+  const runBudgetConsumer = () => {
+    const code = `
+      import { SQLiteStore } from ${JSON.stringify(SOURCE)};
+      const store = new SQLiteStore(process.env.TEST_DB);
+      while (Date.now() < Number(process.env.TEST_START)) {}
+      console.log(JSON.stringify(store.consumeTicketActivationBudget(12, {
+        now: 5_000_000, limit: 12, windowMs: 60_000, project: 'owner/race' })));
+      store.close();
+    `;
+    return new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, ['--input-type=module', '-e', code], {
+        env: { ...process.env, TEST_DB: processBudgetPath, TEST_START: String(processStart) },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let out = '';
+      let err = '';
+      child.stdout.on('data', (part) => { out += part; });
+      child.stderr.on('data', (part) => { err += part; });
+      child.on('error', reject);
+      child.on('close', (code) => resolve({ code, out, err }));
+    });
+  };
+  const consumerResults = await Promise.all([runBudgetConsumer(), runBudgetConsumer()]);
+  const consumerGrants = consumerResults.map((result) => {
+    assert.equal(result.code, 0, result.err);
+    return JSON.parse(result.out.trim()).granted;
+  });
+  assert.deepEqual(consumerGrants.sort(), [false, true],
+    'racing poller processes cannot both reserve the same shared tokens');
+  ok('the activation API budget is shared, durable, clock-based and transactional across poller processes');
 
   console.log(`\n${passed} persistence checks passed`);
 } finally {

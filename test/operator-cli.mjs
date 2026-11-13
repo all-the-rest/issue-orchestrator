@@ -26,6 +26,27 @@ fs.writeFileSync(config, JSON.stringify({
 assert.equal(loadConfig(config).agent_runner, 'opencode');
 assert.equal(repoConfig(loadConfig(config), 'owner/repo').agent_runner, 'opencode');
 fs.writeFileSync(config, JSON.stringify({
+  model: 'openai/test-model', agent_runner: 'opencode', accounts: ['configured-account'],
+  repos: { 'owner/repo': { account: 'configured-account', tickets: { activation_mention: 'reisi007-jr' }, dod } },
+}));
+assert.equal(repoConfig(loadConfig(config), 'owner/repo').tickets.activation_mention, 'reisi007-jr',
+  'per-repository activation mention is retained in the resolved settings');
+for (const login of ['@reisi007-jr', 'bad login', '-invalid', 'invalid-', 'two--hyphens', 'x'.repeat(40)]) {
+  fs.writeFileSync(config, JSON.stringify({
+    model: 'openai/test-model', agent_runner: 'opencode', accounts: ['configured-account'],
+    repos: { 'owner/repo': { account: 'configured-account', tickets: { activation_mention: login }, dod } },
+  }));
+  assert.throws(() => loadConfig(config), /activation_mention.*GitHub login/,
+    `invalid activation login ${login} is rejected`);
+}
+fs.writeFileSync(config, JSON.stringify({
+  model: 'openai/test-model', agent_runner: 'opencode', accounts: ['configured-account'],
+  tickets: { activation_mention: 'reisi007-jr' },
+  repos: { 'owner/repo': { account: 'configured-account', dod } },
+}));
+assert.throws(() => loadConfig(config), /activation_mention.*only valid per repository/,
+  'activation mention is accepted only under a repository ticket setting');
+fs.writeFileSync(config, JSON.stringify({
   model: 'openai/test-model', agent_runner: 'unknown', accounts: ['configured-account'],
   repos: { 'owner/repo': { account: 'configured-account', dod } },
 }));

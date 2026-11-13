@@ -47,11 +47,15 @@ Top-level fields:
   coalescing). It may be overridden per repository with
   `repos.<project>.tickets.quiet_period_ms`. `tickets.intake_poll_ms` sets the
   background intake cadence while an agent turn runs (default `30000`, minimum
-  `1000`), and may also be tuned per repository. `tickets.post_merge_poll_ms`
+  `1000`, maximum `3600000`), and may also be tuned per repository.
+  `tickets.post_merge_poll_ms`
   is the minimum interval between polls of one merged/closed pull request
   conversation (default `300000`, `0` polls every turn). `tickets.post_merge_poll_limit`
   bounds how many retained PRs are polled per turn (default `2`, range `1..20`);
   rotation by last poll time means older PRs are delayed, never abandoned.
+  `tickets.activation_mention` optionally names a GitHub login whose exact
+  mention must activate the first ticket-agent turn; it is valid only under
+  `repos.<project>.tickets`, not globally or in `defaults.tickets`.
   `tickets.delivery` optionally restricts automated dispatches to weekly windows
   in an explicit IANA zone and sets a global start-to-start cooldown; see
   [Delivery windows and global cooldown](#delivery-windows-and-global-cooldown).
@@ -81,7 +85,8 @@ Repository fields include `account`, `tracker_account`,
 `base_branch` (default `main`); `trusted_authors`; `tool_authors`; `labels`;
 `agent_runner`; `command_runner`;
 `workspace` (project checkout used by ticket-agent sessions); `tickets`
-(per-repository overrides of the `tickets` settings above);
+(per-repository overrides of the `tickets` settings above, including
+`activation_mention`);
 `max_concurrency`;
 `resource_locks`; `merge_method`; `evidence.branch_prefix`; and required `dod`.
 Repository values override applicable defaults/global provider selections.
@@ -101,6 +106,123 @@ repository level; repository values replace the global list. It discovers
 trusted issue authors, then routes only trusted ticket/PR events. The authenticated
 bot and configured `tool_authors` are always filtered out. `workspace` may also
 be specified as `tickets.workspace`, but not both ways for one repository.
+
+An optional `repos.<project>.tickets.activation_mention` can require a GitHub
+login (without `@`) to activate that repository's first ticket-agent bootstrap:
+
+```jsonc
+"repos": {
+  "owner/repository": {
+    "tickets": {
+      "activation_mention": "reisi007-jr"
+    }
+  }
+}
+```
+
+When configured, the exact complete `@reisi007-jr` mention (case-insensitive)
+must appear in the issue title/body or in a comment by a trusted, non-bot,
+non-tool author before the first route-only handoff is created. The issue
+author remains subject to the existing `trusted_authors` and account/tool
+exclusions. The mention is checked again during intake when the issue's
+`updatedAt` changes, so a later trusted comment can activate it. An explicit
+operator `goal` command is already affirmative and bypasses this poller gate.
+The router privately reads the text only to compute a boolean; bodies and
+mention text are not persisted, forwarded, or logged. Once admitted, the
+persistent ticket session continues to receive its normal issue, PR, merge, and
+close updates without another mention. If unset, existing dispatch behavior is
+unchanged.
+
+When the bounded open-issue listing is saturated, the router also runs one
+bounded GitHub `mentions:<login>` search per project poll to find a late
+mention on an issue that has fallen outside that window. The search is advisory
+and bounded independently of the listing (at most `--max` results, never more
+than 1000); its issues are added to, not substituted for, the listing cap. The
+per-issue trusted-author and activation checks still decide admission. GitHub
+search indexing can lag, matches beyond the search cap are not discovered by
+this fallback, and the listing itself is a bounded snapshot ordered by issue
+creation (not by update time): a new comment on an older issue does **not**
+necessarily re-enter that window merely because `updatedAt` changed. Such an
+issue is found only by the mention search, or on a later poll once it is inside
+the listing window again.
+
+Activation checks are hard-bounded so a large or adversarial comment history
+cannot exhaust the GitHub API. One discovery pass performs at most 20
+activation checks per repository. Each check reads the issue metadata and at
+most 4 comment pages of 100 entries. A content-free durable record per issue
+and activation policy stores the observed issue revision, the policy digest, a
+boolean result, the next descending page and the newest page seen; worker
+restarts resume from that cursor. When the issue revision changes because an
+ordinary comment was added to the newest page, the scan re-reads that newest
+page and then continues the saved descending cursor instead of restarting at the
+top. Only a comment burst that adds a new page restarts the bounded range from
+the new top, so a newly appended page cannot be skipped. A previously completed
+scan of the thread only re-reads the newest range when a revision changes,
+because appends cannot alter older pages. A scan that reaches the page cap
+without a decision is reported as deferred (`activation comment scan
+incomplete`) and is never treated as a negative, so a mention deeper in a long
+thread is delayed, not silently lost. Unchecked candidates beyond the per-pass
+budget are reported as deferred and prioritized on later polls: a changed issue
+revision is checked first, then the least recently checked issue. Completed
+negative results are reused for the same revision for five minutes (GitHub
+timestamps have second precision); positive results are permanent and
+content-free. A per-issue activation read failure is reported, backs that issue
+off for 30 seconds doubling up to one hour, and does not block other issues,
+persisted associations or the shared intake cadence.
+
+All activation reads draw from one durable, time-based API budget shared by
+every project and poller process that uses the runtime database: 45 requests
+per 60-second window, refilled continuously, with the bucket persisted across
+restarts. The optional mention search has its own durable, shared rolling-window
+budget of 30 requests per minute, matching GitHub's search limit. Because a
+grant is admitted only while the summed cost of every grant in the preceding
+minute stays within 30, no burst, refill or extra project can exceed the search
+quota; a token bucket of the same capacity could spend a full burst plus its
+refill inside one minute. Both budgets are scheduled across projects in durable
+round-robin order: a granted reservation (check or search) records a monotonic
+sequence for its project, and the next poll or intake tick considers the least
+recently served project first. A project that exhausts a budget in its turn
+therefore moves behind every project that has waited longer, so the first
+configured or first listed project cannot starve later projects across separate
+polls, intake ticks or worker restarts. Each scan reserves its worst-case cost
+up front (one issue read plus four comment pages); a boolean-only provider
+reserves one read plus eight pages, and the mention search reserves one request
+per 100 results (at most 10) from the search budget only. A reservation that
+does not fit makes no provider request: the affected candidates are reported as
+deferred with the next `retry_at`, and the search is skipped. The rotation is
+work-conserving: a project with pending work may use the whole remaining bucket
+during its turn, but its next turn starts behind every other project. That keeps
+a saturated or adversarial listing from turning into a request storm, but it is
+deliberately slower than GitHub's own limits: under sustained demand the router
+can check roughly nine four-page scans or five boolean checks per minute, and
+the deferred remainder can wait several polls. The open-issue listing is not
+activation-specific and still runs on every poll, so it is outside both
+budgets. The budgets assume the pollers share a reasonably synchronized wall
+clock; a machine whose clock is far behind only delays refill, while one far
+ahead can refill early (the search log clamps a backward step to its newest
+recorded grant). A budget-denied candidate is not an error and does not consume
+a per-issue failure retry.
+
+Concurrent pollers can hold stale snapshots. Activation state writes therefore
+merge inside one SQLite write transaction: a positive result is monotonic and
+can never be reset by a stale negative, a writer that observed an older revision
+cannot replace a newer revision or its completion marker, and within one
+revision and thread top the descending cursor only moves forward; a stale write
+cannot undo a completed scan, while a genuinely newer observation that finds a
+grown thread may legitimately resume it. A changed thread top replaces the
+cursor instead of merging an invalid page range.
+
+Realistic limits remain. A flood that adds more pages between two polls than one
+check may read can delay the descending historical scan (it is reported as
+incomplete, never as unmentioned), and deleting comments shifts page boundaries,
+so the scan restarts from the top instead of trusting a stale cursor. GitHub's
+open-issue listing is a bounded snapshot ordered by creation time, the mention
+search can lag its index, and a mention beyond the search cap is not found by
+that fallback. `--dry-run` does not write SQLite and therefore neither reads nor
+updates these durable latches, cursors or the shared budget: it applies the same
+per-call bounds, but may list a different candidate subset and repeat checks
+compared with a real poll. Its output is diagnostic, not a guaranteed preview of
+admission order.
 
 Follow-up events are grouped per issue. The first observation starts a durable
 batch; every new event identity extends the deadline to
@@ -158,10 +280,17 @@ running—or that still has an undelivered pending turn—defers instead of read
 concurrently, and collects on a later poll after that turn finishes. No event is
 lost because the durable cursor and pending batch are only advanced by the
 owning turn; the deferred intake retries from the same position. Its cadence is
-`tickets.intake_poll_ms` (default 30 seconds), not a tight loop. Intake failures
-are reported in the poll's `intake.errors` output and retried with exponential
-backoff up to a five-minute cap. Intake claims use a separate short-lived claim
-kind and never count against `tickets.max_concurrency`.
+`tickets.intake_poll_ms` (default 30 seconds), not a tight loop. Shared intake
+failures — the open-issue listing, candidate discovery, the mention search,
+retained-association verification, or an intake task — are reported in the
+poll's `intake.errors` output and retried with exponential backoff capped at
+the greater of the base interval and the smaller of five minutes and eight base
+intervals; a cadence above five minutes therefore still paces at its configured
+interval. Only a per-issue activation check failure is isolated and uses that
+issue's own bounded retry delay. Budget deferrals are diagnostics and do not
+trigger the global backoff.
+Intake claims use a separate short-lived claim kind and never count against
+`tickets.max_concurrency`.
 
 ## Delivery windows and global cooldown
 

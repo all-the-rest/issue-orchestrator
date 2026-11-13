@@ -38,8 +38,9 @@ Ctrl-C ends the stream. Logs never expose agent process credentials.
 `goal --project <owner/repo> --issue <number> --goal-file <private-path|-> [--retry-blocked]`
 accepts optional operator-provided acceptance criteria from an owned, private
 regular file or stdin, bounded to 32 KiB. It routes the criteria separately from
-GitHub event data; ticket and comment bodies are never fetched or copied into
-the router payload. It shares the ticket's persistent OpenCode chat and uses the same
+GitHub event data and bypasses any configured poller activation mention; ticket
+and comment bodies are not copied into the router payload. It shares the
+ticket's persistent OpenCode chat and uses the same
 configured bootstrap as `tickets poll`. Run it from a checkout whose `origin`
 matches the project. Ticket agents require `agent_runner: "opencode"`; the
 runner executes directly in the existing container, has private access to the
@@ -57,7 +58,37 @@ OCI-isolated builder workflow is unchanged.
 `[--delivery-timezone <IANA>] [--delivery-window <spec>] [--delivery-cooldown-ms <n>] [--delivery-24-7]`
 dispatches open issues authored by a configured trusted author in enabled
 repositories, up to `--max` newly listed candidates per project (default 1000).
-Persisted route-only handoffs with active or retained PR associations are
+When `tickets.activation_mention` is configured and that listing is saturated,
+one bounded mention search can add up to `--max` further older candidates so a
+late activation outside the window is still discoverable. Activation work is
+hard-bounded per discovery pass (at most 20 checks, each reading at most 4
+comment pages of 100 entries). Durable content-free state records the revision,
+policy digest, page cursor, newest page and result. A revision change re-reads
+the newest page and continues the saved cursor unless comments added a page, so
+restarts resume an incomplete scan and a page cap is reported as deferred rather
+than as a negative decision. One durable, time-based budget (45 requests per
+minute by default) is shared by every poller process and project for issue
+reads. Each scan reserves one issue read plus four comment pages, a boolean-only
+provider one read plus eight pages. The optional mention search uses a separate
+durable rolling-window budget of 30 requests per minute, matching GitHub's
+search limit, because a token bucket of that capacity could spend a full burst
+plus its refill inside one minute; only grants whose summed cost stays within
+30 over the preceding minute are admitted, so bursts across projects and pollers
+cannot exceed the quota. A search reserves one request per 100 results (at most
+10). When a reservation does not fit, no provider request is made and the
+affected candidates (or the search) are reported as deferred with `retry_at`;
+the issue-read bucket refills continuously and the search log expires grants one
+window after their own timestamp, and both survive restarts. Reservations are
+also scheduled in durable cross-project round-robin order: a project that
+received budget (including a mention search reservation) moves behind projects
+that have waited longer, so the first configured project cannot starve later
+ones across polls, intake ticks or restarts. Expect roughly nine
+four-page scans per minute under sustained demand. Candidates beyond the
+per-pass budget are reported and retried fairly on later polls (changed
+revisions first, then least recently checked). Per-issue activation failures
+are diagnostics with a bounded retry delay and never slow the shared intake
+cadence. Persisted route-only
+handoffs with active or retained PR associations are
 always rediscovered from SQLite, including closed issues, so post-merge activity
 is not lost when GitHub stops listing the issue as open. A retained record is
 rediscovered only when it has an active or retired PR association and the
@@ -70,8 +101,13 @@ detached Git worktree under the runtime home for its persistent chat; this is
 not a nested OCI sandbox. `repos.<project>.workspace` selects the base checkout;
 without it the current directory must be a checkout of the project.
 `--dry-run` lists trusted candidates without starting an agent or writing
-SQLite/GitHub state. Actual routing requires `agent_runner: "opencode"` and a
-non-empty `trusted_authors` allowlist.
+SQLite/GitHub state. Because it writes no SQLite, it does not read or update the
+durable activation latches, negative cache, comment-page cursors or the shared
+time-based API budget; it applies the same per-call bounds but can show a
+different subset/order and repeat checks compared with a real poll (and it does
+not report budget deferrals). Treat dry-run output as a diagnostic snapshot, not
+a guaranteed preview of admission. Actual routing requires `agent_runner:
+"opencode"` and a non-empty `trusted_authors` allowlist.
 
 Scheduling defaults are visible in `--help`: quiet period `60000` ms, intake
 cadence `30000` ms, ticket concurrency `1`, no delivery window (24/7) and a
@@ -119,8 +155,11 @@ when a global slot is free. A full cap defers the issue without losing events.
 Because delivery is poll-driven, the worker interval adds latency; keep it at or
 below the quiet period. A busy issue session returns a deferred outcome (not a
 failure) and is retried later. Intake during a long turn runs at
-`tickets.intake_poll_ms` (default 30 seconds, never a tight loop); its errors
-appear under `intake.errors` and back off exponentially. Delivery is
+`tickets.intake_poll_ms` (default 30 seconds, never a tight loop, valid up to
+one hour); shared intake faults (listing, provider/search, retained-association
+or per-task failures) appear under `intake.errors` and back off exponentially,
+but never below the configured base interval, while a per-issue activation
+failure keeps its own bounded retry delay. Delivery is
 at-least-once: a crash after dispatch
 but before result persistence can replay the same turn, so agent-side effects
 must be idempotent.
@@ -134,8 +173,10 @@ turn, and waits for a trusted-author reply.
 Trusted-author comments on the ticket and on the agent-reported same-repository
 pull request (conversation, inline review activity, and submitted reviews)
 resume the same agent session. The router reads metadata identities only, not
-comment or review bodies. Comments by the authenticated bot/configured tool
-accounts and all non-trusted authors are ignored. The router neither creates
+comment or review bodies, except for the optional one-time activation check,
+which reads issue/comment text privately and returns only a boolean. Comments
+by the authenticated bot/configured tool accounts and all non-trusted authors
+are ignored. The router neither creates
 nor adopts a PR from ticket text; the agent reads the live PR context.
 
 The `issue-orchestrator goal` CLI command is this path. The project ships no

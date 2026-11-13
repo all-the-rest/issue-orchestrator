@@ -59,6 +59,254 @@ const emptyBody = createGithubTicketPort({
 });
 assert.equal((await emptyBody.select('owner/repo'))[0].body, '');
 
+let activationIssue = { title: 'Routing request', body: 'Please review this.', updated_at: '2026-04-01T00:00:00Z' };
+let activationComments = [];
+const activationCalls = [];
+const activationPort = createGithubTicketPort({ json(args) {
+  activationCalls.push(args);
+  if (args[0] === 'api' && args.at(-1) === 'repos/owner/repo/issues/7') return activationIssue;
+  if (args[0] === 'api' && args.at(-1).startsWith('repos/owner/repo/issues/7/comments')) return [activationComments];
+  throw new Error('unexpected activation fixture request');
+}, run() {} });
+const activationRequest = { project: 'owner/repo', number: 7, login: 'Reisi007-jr',
+  trustedAuthors: ['Trusted', 'tool-user', 'ci-bot'], excludedAuthors: ['tool-user'], updatedAt: activationIssue.updated_at };
+assert.equal(await activationPort.hasActivationMention(activationRequest), false);
+assert.equal(await activationPort.hasActivationMention(activationRequest), false);
+assert.equal(activationCalls.filter((args) => args.at(-1) === 'repos/owner/repo/issues/7').length, 1,
+  'activation results cache only by the issue updatedAt during a router process');
+activationIssue = { ...activationIssue, body: '@Reisi007-jr-extra', updated_at: '2026-04-01T00:01:00Z' };
+activationRequest.updatedAt = activationIssue.updated_at;
+assert.equal(await activationPort.hasActivationMention(activationRequest), false,
+  'a longer handle is not a complete mention');
+activationIssue = { ...activationIssue, body: 'contact x@reisi007-jr please', updated_at: '2026-04-01T00:02:00Z' };
+activationRequest.updatedAt = activationIssue.updated_at;
+assert.equal(await activationPort.hasActivationMention(activationRequest), false,
+  'a mention embedded in another token is not accepted');
+activationIssue = { ...activationIssue, title: 'Question for @REISI007-JR!', body: '', updated_at: '2026-04-01T00:03:00Z' };
+activationRequest.updatedAt = activationIssue.updated_at;
+assert.equal(await activationPort.hasActivationMention(activationRequest), true,
+  'the title/body accept an exact case-insensitive handle');
+assert.equal(typeof await activationPort.hasActivationMention(activationRequest), 'boolean',
+  'the detector returns only a boolean, never issue text');
+activationIssue = { ...activationIssue, title: 'Routing request', updated_at: '2026-04-01T00:04:00Z' };
+activationComments = [
+  { body: 'Please ask @Reisi007-jr', user: { login: 'outsider', type: 'User' } },
+  { body: 'Please ask @Reisi007-jr', user: { login: 'tool-user', type: 'User' } },
+  { body: 'Please ask @Reisi007-jr', user: { login: 'ci-bot', type: 'Bot' } },
+  { body: 'Please ask @Reisi007-jr', user: { login: 'trusted', type: 'User' } },
+];
+activationRequest.updatedAt = activationIssue.updated_at;
+assert.equal(await activationPort.hasActivationMention(activationRequest), true,
+  'only trusted, non-bot, non-tool comments can activate');
+activationIssue = { ...activationIssue, updated_at: '2026-04-01T00:05:00Z' };
+activationComments = activationComments.slice(0, 3);
+activationRequest.updatedAt = activationIssue.updated_at;
+assert.equal(await activationPort.hasActivationMention(activationRequest), false,
+  'untrusted, tool, and bot mentions do not activate');
+activationComments = [{ body: 'ask @reisi007-jr_now', user: { login: 'trusted', type: 'User' } }];
+activationIssue = { ...activationIssue, updated_at: '2026-04-01T00:06:00Z' };
+activationRequest.updatedAt = activationIssue.updated_at;
+assert.equal(await activationPort.hasActivationMention(activationRequest), false,
+  'an underscore-adjacent handle is not accepted as a complete mention');
+const activationFailure = createGithubTicketPort({ json() { throw new Error('private issue body and @reisi007-jr'); }, run() {} });
+await assert.rejects(activationFailure.hasActivationMention(activationRequest), (error) => {
+  assert.equal(error.message, 'GitHub activation mention check failed');
+  assert.doesNotMatch(error.message, /private issue body|reisi007-jr/);
+  return true;
+}, 'provider failures are sanitized and fail closed');
+
+// Activation comments are read page by page; a mention on a later page must
+// still be found without copying any text into the result.
+const pagedCalls = [];
+const pagedPort = createGithubTicketPort({ json(args) {
+  pagedCalls.push(args);
+  if (args[0] === 'api' && args.at(-1) === 'repos/owner/repo/issues/7') {
+    return { title: 'No mention here', body: '', updated_at: '2026-04-02T00:00:00Z' };
+  }
+  if (args[0] === 'api' && args.at(-1).startsWith('repos/owner/repo/issues/7/comments')) {
+    return [[{ body: 'first page', user: { login: 'trusted', type: 'User' } }],
+      [{ body: 'late page asks @Reisi007-jr', user: { login: 'trusted', type: 'User' } }]];
+  }
+  throw new Error('unexpected paged activation fixture request');
+}, run() {} });
+assert.equal(await pagedPort.hasActivationMention({ ...activationRequest,
+  updatedAt: '2026-04-02T00:00:00Z' }), true,
+'a trusted mention on a later comment page activates the issue');
+assert.ok(pagedCalls.some((args) => args[0] === 'api' &&
+  args.at(-1).startsWith('repos/owner/repo/issues/7/comments')));
+
+// Comment pagination is hard-bounded per call. A long, attacker-amplifiable
+// thread is scanned newest-first in small slices; the returned cursor lets a
+// later poll continue, so a mention is delayed but never silently lost.
+const boundedPages = [];
+const pageRows = Array.from({ length: 10 }, (_, index) => Array.from({ length: 100 }, (_, offset) => ({
+  body: `page ${index + 1} entry ${offset}`, user: { login: 'trusted', type: 'User' },
+})));
+const boundedPort = createGithubTicketPort({ json(args) {
+  const endpoint = String(args.at(-1));
+  if (args[0] === 'api' && endpoint === 'repos/owner/repo/issues/7') {
+    return { title: 'No mention', body: '', updated_at: '2026-04-04T00:00:00Z', comments: 1_000 };
+  }
+  if (args[0] === 'api' && endpoint.startsWith('repos/owner/repo/issues/7/comments')) {
+    const page = Number(/[?&]page=(\d+)/.exec(endpoint)?.[1]);
+    boundedPages.push(page);
+    return [pageRows[page - 1]];
+  }
+  throw new Error('unexpected bounded activation fixture request');
+}, run() {} });
+const boundedRequest = { project: 'owner/repo', number: 7, login: 'reisi007-jr',
+  trustedAuthors: ['trusted'], excludedAuthors: [] };
+const firstBound = await boundedPort.scanActivationMention({
+  ...boundedRequest, newest: true, page: null, maxPages: 3,
+});
+assert.equal(firstBound.matched, false);
+assert.equal(firstBound.complete, false);
+assert.equal(firstBound.nextPage, 7, 'the bounded scan reports where it will continue');
+assert.deepEqual(boundedPages, [10, 9, 8],
+  'one call reads only the bounded newest pages, never the whole thread');
+const secondBound = await boundedPort.scanActivationMention({
+  ...boundedRequest, newest: false, page: firstBound.nextPage, maxPages: 6,
+});
+assert.equal(secondBound.complete, false);
+assert.equal(secondBound.nextPage, 1);
+assert.deepEqual(boundedPages.slice(3), [7, 6, 5, 4, 3, 2]);
+const finalBound = await boundedPort.scanActivationMention({
+  ...boundedRequest, newest: false, page: secondBound.nextPage, maxPages: 6,
+});
+assert.equal(finalBound.complete, true);
+assert.equal(finalBound.nextPage, null);
+assert.deepEqual([...boundedPages].sort((a, b) => a - b), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+  'continuing the durable cursor covers every page without re-reading them');
+assert.ok(!boundedPages.some((page) => !Number.isSafeInteger(page)));
+
+// Ordinary comments change the issue revision without adding a page. The
+// newest page is re-read on every revision change, while the descending
+// historical cursor keeps moving down instead of restarting at the top.
+let grownCount = 500;
+let grownRevision = '2026-04-04T00:00:00Z';
+const grownPages = [];
+const grownPort = createGithubTicketPort({ json(args) {
+  const endpoint = String(args.at(-1));
+  if (args[0] === 'api' && endpoint === 'repos/owner/repo/issues/7') {
+    return { title: 'No mention', body: '', updated_at: grownRevision, comments: grownCount };
+  }
+  if (args[0] === 'api' && endpoint.startsWith('repos/owner/repo/issues/7/comments')) {
+    const page = Number(/[?&]page=(\d+)/.exec(endpoint)?.[1]);
+    grownPages.push(page);
+    return [pageRows[0].map((entry) => ({ ...entry, body: `grown page ${page}` }))];
+  }
+  throw new Error('unexpected growth activation fixture request');
+}, run() {} });
+const beforeGrowth = await grownPort.scanActivationMention({
+  ...boundedRequest, newest: true, page: null, maxPages: 2,
+});
+assert.deepEqual(grownPages, [5, 4], 'the initial revision scans newest-first');
+assert.equal(beforeGrowth.nextPage, 3);
+assert.equal(beforeGrowth.topPage, 5, 'the scan reports the newest page it observed');
+// Three polls, each with a new comment on the same newest page.
+let growthCursor = beforeGrowth.nextPage;
+const progress = [];
+for (let poll = 1; poll <= 3; poll += 1) {
+  grownPages.length = 0;
+  grownRevision = `2026-04-04T00:0${poll}:00Z`;
+  const scan = await grownPort.scanActivationMention({
+    ...boundedRequest, newest: true, page: growthCursor, knownTop: beforeGrowth.topPage, maxPages: 2,
+  });
+  assert.equal(grownPages[0], 5, `poll ${poll} still checks the newest page for a late mention`);
+  assert.equal(grownPages.length, 2, `poll ${poll} stays within its page budget`);
+  progress.push(scan.nextPage);
+  growthCursor = scan.nextPage;
+}
+assert.deepEqual(progress, [2, 1, null],
+  'continuous ordinary edits keep the historical cursor moving instead of resetting it');
+
+// A comment burst adds pages above the saved cursor. The revision check
+// restarts at the new top so the new page range is not silently skipped, and
+// the call remains page-bounded.
+const restartCursor = 3;
+grownPages.length = 0;
+grownCount = 3_000;
+grownRevision = '2026-04-05T00:00:00Z';
+const afterGrowth = await grownPort.scanActivationMention({
+  ...boundedRequest, newest: true, page: restartCursor, knownTop: 5, maxPages: 3,
+});
+assert.deepEqual(grownPages, [30, 29, 28],
+  'a grown thread restarts at the new top instead of jumping to the stale cursor');
+assert.equal(afterGrowth.complete, false);
+assert.equal(afterGrowth.nextPage, 27);
+assert.equal(afterGrowth.topPage, 30);
+
+// A completed scan of the previous revision only re-reads the pages that can
+// have changed when comments are appended, not the whole bounded thread.
+grownPages.length = 0;
+grownRevision = '2026-04-06T00:00:00Z';
+grownCount = 3_050;
+const completedResume = await grownPort.scanActivationMention({
+  ...boundedRequest, newest: true, page: null, knownTop: 30, resumeComplete: true, maxPages: 4,
+});
+assert.deepEqual(grownPages, [31, 30],
+  'a completed revision re-checks the newest page and the previously partial last page only');
+assert.equal(completedResume.complete, true);
+assert.equal(completedResume.nextPage, null);
+
+const newestMentionPages = [];
+const newestMentionPort = createGithubTicketPort({ json(args) {
+  const endpoint = String(args.at(-1));
+  if (args[0] === 'api' && endpoint === 'repos/owner/repo/issues/7') {
+    return { title: 'No mention', body: '', updated_at: '2026-04-05T00:00:00Z', comments: 1_000 };
+  }
+  if (args[0] === 'api' && endpoint.startsWith('repos/owner/repo/issues/7/comments')) {
+    const page = Number(/[?&]page=(\d+)/.exec(endpoint)?.[1]);
+    newestMentionPages.push(page);
+    return [pageRows[page - 1].map((entry, index) => index === 0 && page === 10
+      ? { ...entry, body: 'late trusted @Reisi007-jr' } : entry)];
+  }
+  throw new Error('unexpected newest activation fixture request');
+}, run() {} });
+const newestMention = await newestMentionPort.scanActivationMention({
+  ...boundedRequest, newest: true, page: null, maxPages: 3,
+});
+assert.equal(newestMention.matched, true, 'a late mention on the newest page activates immediately');
+assert.deepEqual(newestMentionPages, [10],
+  'finding the newest mention stops the bounded scan without reading older pages');
+
+// Mention search is a bounded fallback for issues outside the open-issue
+// listing window. It stays advisory; the normal trusted-author and
+// per-issue activation checks still apply.
+const searchCalls = [];
+const searchPort = createGithubTicketPort({ json(args) {
+  searchCalls.push(args);
+  if (args[0] === 'issue' && args[1] === 'list') {
+    return [{ id: 9, number: 9, author: { login: 'trusted' }, state: 'OPEN',
+      url: 'https://github.com/owner/repo/issues/9', updatedAt: '2026-02-01T00:00:00Z' }];
+  }
+  throw new Error('unexpected search fixture request');
+}, run() {} });
+const mentioned = await searchPort.selectMentioned('owner/repo', 'Reisi007-jr', 25);
+assert.equal(mentioned[0].number, 9);
+assert.equal(mentioned[0].body, '', 'search returns routing metadata only');
+const searchArgs = searchCalls.find((args) => args[0] === 'issue' && args[1] === 'list');
+assert.equal(searchArgs[searchArgs.indexOf('--search') + 1], 'is:issue mentions:Reisi007-jr');
+assert.equal(searchArgs[searchArgs.indexOf('--limit') + 1], '25');
+await assert.rejects(searchPort.selectMentioned('owner/repo', 'not a login'), /activation login/);
+
+// A cached negative result is keyed by the complete policy as well as the
+// content revision. Changing the login must not reuse the previous boolean.
+let keyedIssueCalls = 0;
+const keyedPort = createGithubTicketPort({ json(args) {
+  if (args[0] === 'api' && args.at(-1) === 'repos/owner/repo/issues/7') {
+    keyedIssueCalls += 1;
+    return { title: '', body: 'Ask @first', updated_at: '2026-04-03T00:00:00Z' };
+  }
+  if (args[0] === 'api' && args.at(-1).startsWith('repos/owner/repo/issues/7/comments')) return [[]];
+  throw new Error('unexpected cache fixture request');
+}, run() {} });
+const keyedRequest = { ...activationRequest, updatedAt: '2026-04-03T00:00:00Z' };
+assert.equal(await keyedPort.hasActivationMention({ ...keyedRequest, login: 'first' }), true);
+assert.equal(await keyedPort.hasActivationMention({ ...keyedRequest, login: 'second' }), false,
+  'a cached result is not reused for a different activation login');
+assert.equal(keyedIssueCalls, 2, 'the policy change forces a fresh content check');
+
 const change = (id, body, login = 'operator', createdAt = '2026-01-05T00:00:00Z', extra = {}) => ({
   id, body, created_at: createdAt, user: login === null ? null : { login }, html_url: `https://example/change/${id}`, ...extra,
 });

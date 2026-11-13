@@ -17,6 +17,7 @@ import {
   type EventMetadata,
 } from './event-metadata.js';
 import { evaluateDelivery, type DeliveryDecision, type DeliverySchedule } from './delivery-window.js';
+import { checkTicketActivation } from './ticket-activation.js';
 
 type TicketSnapshot = Omit<NormalizedTicket, 'updatedAt' | 'comments'>;
 type StatusName = 'started' | 'finished';
@@ -94,6 +95,8 @@ interface TicketHandoffState {
   routeCursorSeeded?: boolean;
   routeGoalHashes?: string[];
   workflow?: 'route-only' | 'goal';
+  /** Content-free latch: a configured activation mention was observed before first admission. */
+  activationAdmitted?: boolean;
   sessionId: string | null;
   initialDispatched: boolean;
   /** Bootstrap messages already dispatched for the initial turn. */
@@ -147,6 +150,15 @@ export interface TicketRuntimePolicy {
   /** Route event references only; the agent fetches all ticket/PR content itself. */
   routeOnly?: boolean;
   ticketUrl?: string;
+  /** Optional per-repository login required for the first route-only bootstrap. */
+  activationMention?: string;
+  /**
+   * Discovery in this poll already proved admission (or the durable admission
+   * latch). Skips a second provider activation read before the first dispatch.
+   */
+  activationPreverified?: boolean;
+  /** Listing/identity timestamp used only for the provider's in-memory mention cache. */
+  activationUpdatedAt?: string | null;
   /** Ordered turn instructions; each entry becomes one turn in the same session. */
   bootstrap?: string[];
   systemPrompt?: string;
@@ -179,7 +191,8 @@ export interface TicketRuntimeOutcome {
   statusPending?: boolean;
   /** True when no dispatch happened but the durable workflow was left retryable. */
   deferred?: boolean;
-  reason?: 'busy' | 'capacity' | 'quiet-period' | 'delivery-window' | 'cooldown';
+  reason?: 'busy' | 'capacity' | 'quiet-period' | 'delivery-window' | 'cooldown' |
+    'activation-mention' | 'activation-scan' | 'activation-budget';
   /** ISO timestamp of the durable quiet-period deadline. */
   quietUntil?: string;
   /** ISO timestamp of the next delivery-window or cooldown opportunity. */
@@ -540,6 +553,54 @@ export async function runTicketHandoff(args: {
   const routeJobId = createHash('sha256').update(`ticket-router:${projectKey}#${issue}`).digest('hex');
   const priorRoute = policy.routeOnly ? store.readTicketHandoff(routeJobId) : null;
   const priorRouteState = priorRoute?.state as unknown as TicketHandoffState | undefined;
+  const alreadyAdmitted = priorRouteState?.activationAdmitted === true || priorRouteState?.initialDispatched === true ||
+    (typeof priorRouteState?.initialProgress === 'number' && priorRouteState.initialProgress > 0) ||
+    (typeof priorRouteState?.sessionId === 'string' && !!priorRouteState.sessionId);
+  let activationAdmitted = false;
+  if (policy.routeOnly && policy.activationMention && policy.activationPreverified) {
+    // Discovery already proved admission under the hard per-pass budget. Persist
+    // the same content-free latch so a restart cannot re-gate the issue.
+    activationAdmitted = true;
+  }
+  if (policy.routeOnly && policy.activationMention && !alreadyAdmitted && !policy.activationPreverified) {
+    if (!port.hasActivationMention && !port.scanActivationMention) {
+      throw new Error('GitHub activation mention check is unavailable');
+    }
+    // Route retained associations through the same durable, budgeted scan as
+    // discovery so they also resume a page cursor, respect the shared time-based
+    // budget and never turn an incomplete scan into a negative.
+    const outcome = await checkTicketActivation({
+      project,
+      issue,
+      updatedAt: policy.activationUpdatedAt ?? null,
+      login: policy.activationMention,
+      trustedAuthors: policy.trustedAuthors ?? [],
+      excludedAuthors: policy.toolAuthors ?? [],
+      store,
+      ...(port.scanActivationMention
+        ? { scanActivationMention: (request) => port.scanActivationMention!(request) }
+        : { hasActivationMention: (request) => port.hasActivationMention!(request) }),
+      now: clock,
+    });
+    if (outcome.status === 'budget') {
+      return { jobId: routeJobId, sessionId: null, state: 'deferred', deferred: true, reason: 'activation-budget',
+        ...(outcome.retryAt !== null ? { retryAt: new Date(outcome.retryAt).toISOString() } : {}) };
+    }
+    if (outcome.status === 'incomplete') {
+      return { jobId: routeJobId, sessionId: null, state: 'deferred', deferred: true, reason: 'activation-scan' };
+    }
+    if (outcome.status === 'backoff') {
+      return { jobId: routeJobId, sessionId: null, state: 'deferred', deferred: true, reason: 'activation-mention',
+        retryAt: new Date(outcome.retryAt).toISOString() };
+    }
+    if (outcome.status === 'failure') {
+      throw new Error(outcome.error);
+    }
+    if (outcome.status === 'negative') {
+      return { jobId: routeJobId, sessionId: null, state: 'deferred', deferred: true, reason: 'activation-mention' };
+    }
+    activationAdmitted = true;
+  }
   let issueData: TicketIssue | null = null;
   let initialReadFailed = false;
   let current: NormalizedTicket;
@@ -582,6 +643,7 @@ export async function runTicketHandoff(args: {
     changeCursor: null as string | null, pullRequest: null, pendingPullRequest: null, retiredPullRequests: [],
     routeCursorSeeded: policy.routeOnly ? !routeSeedFailed : true,
     workflow: policy.routeOnly ? 'route-only' : 'goal',
+    ...(activationAdmitted || priorRouteState?.activationAdmitted === true ? { activationAdmitted: true } : {}),
     sessionId: null as string | null, initialDispatched: false, initialProgress: 0, state: 'active', terminal: false,
     statusKeys: { started: randomUUID(), finished: randomUUID() }, statusIds: {} as Record<string, string>,
     turns: [], pendingTurn: null, result: null, summary: '', finalStatusBody: '',
@@ -644,6 +706,10 @@ export async function runTicketHandoff(args: {
   // These pre-dispatch writes happen outside the main try/finally; release the
   // lease explicitly if they fail so a setup error cannot leak ownership.
   try {
+    if (activationAdmitted && !state.activationAdmitted) {
+      state.activationAdmitted = true;
+      persistState();
+    }
     if (tightenedMergePolicy) persistState();
     if (policy.routeOnly && !state.routeCursorSeeded) {
       if (routeSeedFailed) {

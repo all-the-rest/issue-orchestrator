@@ -38,9 +38,27 @@ valuable host secrets.
 The OCI controls above apply only to the retained legacy `run --once` builder.
 The V1 `goal` and `tickets poll` paths are route-only, as tracked in
 [issues #61–#64](https://github.com/all-the-rest/issue-orchestrator/issues/61).
-They send event IDs/URLs, not copied ticket/comment bodies. The ticket-agent
-OpenCode role runs directly in the existing `code-dev` container without a
-nested OCI sandbox. It receives a private per-session copy of the configured
+They send event IDs/URLs, not copied ticket/comment bodies. One deliberate
+exception is the optional per-repository activation gate: the provider reads
+the issue title/body and comments privately to decide whether a configured
+login was mentioned by a trusted author. Only a boolean leaves that function;
+the text is not persisted in router state, forwarded in an event payload, or
+included in diagnostics. GitHub content remains untrusted data, and an
+activation read failure fails closed for that issue without blocking others;
+comment reads are page-bounded and an incomplete scan is reported as deferred,
+never as a negative decision. A shared, durable time-based request budget is
+reserved before any activation read or mention search, so an exhausted budget
+performs no provider call and cannot be turned into a request storm. Granted
+reservations are charged to a durable cross-project rotation, so one saturated
+project yields the next poll or intake tick to the least recently served
+project. Concurrent
+pollers merge state transactionally: a stale writer cannot clear a positive
+latch, replace a newer revision, undo a completed scan or move a cursor
+backwards. Only content-free
+revisions, policy digests, booleans, failure counts, page numbers and token
+counts are cached durably.
+The ticket-agent OpenCode role runs directly in the existing `code-dev`
+container without a nested OCI sandbox. It receives a private per-session copy of the configured
 GitHub CLI authentication, narrowed to the `github.com` host block, and can use
 network/`gh` to read tickets and publish agent-owned changes. A ticket agent may
 delegate bounded implementation work to one `build-worker` subagent in the same

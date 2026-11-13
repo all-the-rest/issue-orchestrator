@@ -25,6 +25,8 @@ interface RawTicketSettings {
   bootstrap?: string[];
   system_prompt?: string;
   workspace?: string;
+  /** GitHub login whose exact mention activates a repository's first ticket-agent bootstrap. */
+  activation_mention?: string;
   /** Global cap on simultaneously executing ticket-agent sessions. */
   max_concurrency?: number;
   /** Durable quiet period used to coalesce events belonging to one issue. */
@@ -93,6 +95,7 @@ interface RawRepoConfig extends RawTicketSettings {
 export interface TicketAgentSettings {
   bootstrap: string[];
   system_prompt: string;
+  activation_mention?: string;
   max_concurrency: number;
   quiet_period_ms: number;
   intake_poll_ms: number;
@@ -234,7 +237,8 @@ function validateConfig(cfg, file) {
   const positiveInteger = (value, name) => {
     if (!Number.isSafeInteger(value) || value < 1) throw new Error(`${file}: "${name}" must be a positive integer`);
   };
-  const validateTicketSettings = (value: unknown, label: string, allowWorkspace: boolean, allowGlobalLimit = false) => {
+  const validateTicketSettings = (value: unknown, label: string, allowWorkspace: boolean,
+    allowGlobalLimit = false, allowActivationMention = false) => {
     if (value === undefined) return;
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
       throw new Error(`${file}: "${label}" must be an object`);
@@ -255,6 +259,15 @@ function validateConfig(cfg, file) {
     }
     if (settings.workspace !== undefined && (typeof settings.workspace !== 'string' || !settings.workspace.trim())) {
       throw new Error(`${file}: "${label}.workspace" must be a non-empty path`);
+    }
+    if (settings.activation_mention !== undefined) {
+      if (!allowActivationMention) {
+        throw new Error(`${file}: "${label}.activation_mention" is only valid per repository`);
+      }
+      if (typeof settings.activation_mention !== 'string' ||
+          !/^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$/.test(settings.activation_mention)) {
+        throw new Error(`${file}: "${label}.activation_mention" must be a GitHub login without @`);
+      }
     }
     if (settings.max_concurrency !== undefined) {
       if (!allowGlobalLimit) {
@@ -442,7 +455,7 @@ function validateConfig(cfg, file) {
     if (repo.workspace !== undefined && (typeof repo.workspace !== 'string' || !repo.workspace.trim())) {
       throw new Error(`${file}: repos.${project}.workspace must be a non-empty path`);
     }
-    validateTicketSettings(repo.tickets, `repos.${project}.tickets`, true, false);
+    validateTicketSettings(repo.tickets, `repos.${project}.tickets`, true, false, true);
     if (repo.tickets?.workspace !== undefined && repo.workspace !== undefined) {
       throw new Error(`${file}: repos.${project} must not set both "workspace" and "tickets.workspace"`);
     }
@@ -552,6 +565,9 @@ export function repoConfig(cfg, project): RepoRuntimeConfig {
         ? ticketSettings.bootstrap
         : DEFAULT_TICKET_BOOTSTRAP,
       system_prompt: ticketSettings.system_prompt ?? TICKET_AGENT_SYSTEM_PROMPT,
+      ...(ticketSettings.activation_mention !== undefined
+        ? { activation_mention: ticketSettings.activation_mention }
+        : {}),
       max_concurrency: maxConcurrentTickets,
       quiet_period_ms: ticketSettings.quiet_period_ms ?? DEFAULT_TICKET_QUIET_PERIOD_MS,
       intake_poll_ms: ticketSettings.intake_poll_ms ?? DEFAULT_TICKET_INTAKE_POLL_MS,

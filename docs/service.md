@@ -15,7 +15,8 @@ those are dispatched on a later poll. The running issue's exclusive session
 lease (and an undelivered pending turn) defers its own intake until that work
 finishes, then collection resumes from the same durable cursor without loss.
 Intake errors appear in the poll result
-and use exponential backoff capped at five minutes. Polling still paces
+and use exponential backoff capped at the smaller of five minutes and eight base
+intervals. Polling still paces
 delivery: the worker interval adds to the coalescing latency, so
 keep it at or below the quiet period. The persisted global cap and a durable
 lease/heartbeat with owner-CAS writes prevent cross-poller and cross-container
@@ -72,8 +73,30 @@ SQLite queue, ticket worktrees, agent sessions, and durable recovery artifacts.
   loop. Configure `agent_runner: "opencode"`, a non-empty `trusted_authors`
   allowlist, and the target workspace. Set `tickets.max_concurrency` (for
   example `2`) and `tickets.quiet_period_ms` (for example `60000`) in the same
-  config. The global session cap is shared by every worker using the runtime
-  home; a full cap defers work without dropping queued events.
+  config. A repository may also set `tickets.activation_mention` to require an
+  exact mention by a trusted author before its first ticket-agent bootstrap;
+  the intake ticker rechecks issues while they remain in the bounded listing
+  window, and admitted sessions need no repeat mention. When the bounded
+  listing is saturated, a capped mention search also finds late activations
+  outside that window; search indexing lag and matches beyond the cap remain
+  limitations. Activation reads are
+  hard-bounded per poll (at most 20 issues, each with at most 4 comment pages).
+  Durable content-free cursors survive a restart: an ordinary comment re-reads
+  the newest page and continues history, a new page restarts the bounded range,
+  and an incomplete scan is reported as deferred rather than as a negative. One
+  durable time-based API budget (45 requests per minute) is shared by every
+  worker and project for activation reads; a separate durable rolling-window
+  search budget admits at most 30 mention-search requests in any minute across
+  workers and projects. An exhausted budget defers without any provider request.
+  Granted reservations rotate across projects in durable least-recently-served
+  order, so a saturated project cannot starve later ones across polls, intake
+  ticks or restarts. A per-issue activation failure is a local diagnostic; other
+  intake failures (listing, provider/search, association or task) back the
+  shared cadence off, never below the configured base interval. An explicit
+  operator `goal` bypasses the poller gate. The
+  global session cap is shared by every worker
+  using the runtime home; a full cap defers work without dropping queued
+  events.
 - `ISSUE_ORCHESTRATOR_MODE=builder` retains the legacy `run --once` builder
   loop. It requires the preloaded builder image for its OCI sandbox.
 
