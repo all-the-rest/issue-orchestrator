@@ -144,7 +144,7 @@ export function ticketRouteJobId(project: string, issue: number): string {
   return createHash('sha256').update(`ticket-router:${project.toLocaleLowerCase()}#${issue}`).digest('hex');
 }
 
-/** A content-free latch: any of these durable fields proves the session was already admitted. */
+/** A content-free latch; each of these durable fields proves the session was already admitted. */
 export function ticketHasBeenAdmitted(store: ActivationHandoffStore, project: string, issue: number): boolean {
   const state = store.readTicketHandoff(ticketRouteJobId(project, issue))?.state;
   return state?.activationAdmitted === true || state?.initialDispatched === true ||
