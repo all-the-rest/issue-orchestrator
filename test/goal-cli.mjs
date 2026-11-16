@@ -7,6 +7,7 @@ import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { SQLiteStore } from '../dist/core/persistence.js';
 import { IntakePacer, intakeFailureBacksOff, runIntakeTick } from '../dist/core/commands.js';
+import { ticketActivationAdmissionPolicy } from '../dist/core/ticket-activation.js';
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ticket-router-cli-'));
 const bin = path.join(root, 'bin');
@@ -79,6 +80,8 @@ fs.chmodSync(git, 0o700);
 const dod = { commands: { build: null, test: null, lint: null, typecheck: null, security: null },
   required_checks: ['CI'], evidence_class: 'cli', acceptance_source: 'issue_body' };
 const trustedAuthors = ['trusted', 'configured-account', 'tool-bot', 'second-trusted'];
+const activationAdmissionPolicy = ticketActivationAdmissionPolicy('reisi007-jr', trustedAuthors,
+  ['configured-account', 'tool-bot']);
 const routing = { model: 'openai/test-model', accounts: ['configured-account'],
   trusted_authors: trustedAuthors, tool_authors: ['tool-bot'] };
 fs.writeFileSync(config, JSON.stringify({ ...routing,
@@ -184,6 +187,7 @@ try {
         cursor: JSON.stringify({ conversation: 100, review: 0, reviewComment: 0 }), cursorSeeded: true,
         state: 'MERGED', lastPolledAt: null, failures: 0 }],
       routeCursorSeeded: true, routeGoalHashes: [], workflow: 'route-only',
+      activationAdmitted: true, activationAdmissionPolicy,
       sessionId: 'seeded-session', initialDispatched: true, initialProgress: 2,
       state: 'DONE', terminal: true,
       statusKeys: { started: '11111111-1111-1111-1111-111111111111', finished: '22222222-2222-2222-2222-222222222222' },

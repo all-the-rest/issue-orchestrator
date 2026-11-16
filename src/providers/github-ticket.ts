@@ -3,6 +3,7 @@ import type {
   ActivationMentionRequest,
   ActivationScanRequest,
   ActivationScanResult,
+  RepositoryAccess,
   TicketComment,
   TicketIssue,
   TicketPort,
@@ -184,7 +185,8 @@ export function createGithubTicketPort(driver: Driver = cli): TicketPort {
     const policy = [args.login,
       ...args.trustedAuthors.map((author) => author.toLocaleLowerCase()).sort(),
       '\u0000',
-      ...args.excludedAuthors.map((author) => author.toLocaleLowerCase()).sort()].join('\u0000');
+      ...args.excludedAuthors.map((author) => author.toLocaleLowerCase()).sort(),
+      args.issueAuthorTrusted === true ? '\u0000author-trusted' : '\u0000comment-only'].join('\u0000');
     return { key: `${args.project.toLocaleLowerCase()}#${args.number}\u0000${policy}`, policy };
   };
   const cacheActivation = (key: string, result: ActivationScanResult) => {
@@ -226,11 +228,15 @@ export function createGithubTicketPort(driver: Driver = cli): TicketPort {
     const body = nullableString(issueData.body, 'activation issue body') ?? '';
     const revision = typeof issueData.updated_at === 'string' ? issueData.updated_at : '';
     const { key } = activationCacheKey(args);
-    if (containsCompleteMention(title, args.login) || containsCompleteMention(body, args.login)) {
-      return cacheActivation(key, { matched: true, complete: true, nextPage: null, revision, topPage: null });
-    }
     const trustedAuthors = new Set(args.trustedAuthors.map((author) => author.toLocaleLowerCase()));
     const excludedAuthors = new Set(args.excludedAuthors.map((author) => author.toLocaleLowerCase()));
+    // The title/body belong to the issue author. Unless the caller explicitly
+    // marks that author trusted, only a trusted comment may opt the issue in;
+    // an untrusted opener cannot activate by writing @bot.
+    if (args.issueAuthorTrusted === true &&
+        (containsCompleteMention(title, args.login) || containsCompleteMention(body, args.login))) {
+      return cacheActivation(key, { matched: true, complete: true, nextPage: null, revision, topPage: null });
+    }
     const hasMention = (entries: unknown[]): boolean => {
       for (const entry of entries) {
         const row = record(entry, 'activation comment');
@@ -336,6 +342,59 @@ export function createGithubTicketPort(driver: Driver = cli): TicketPort {
       validProject(project);
       if (!Number.isInteger(limit) || limit < 1 || limit > 1000) throw new Error('limit must be between 1 and 1000');
       return listIssues(project, limit);
+    },
+    async listRepositories(owner, limit = 100) {
+      if (typeof owner !== 'string' || !validGitHubLogin.test(owner)) {
+        throw new Error('repository owner must be a GitHub login');
+      }
+      if (!Number.isInteger(limit) || limit < 1 || limit > 1000) {
+        throw new Error('limit must be between 1 and 1000');
+      }
+      // `gh repo list` only lists repositories owned by the requested account or
+      // organization and evaluates access for the authenticated token, so an
+      // inaccessible repository never enters the discovery set. The hard limit
+      // keeps one poll from paging through an unbounded owner namespace.
+      const value = driver.json(['repo', 'list', owner, '--limit', String(limit), '--json',
+        'nameWithOwner,isPrivate,isArchived,isFork,hasIssuesEnabled,viewerPermission']);
+      if (!Array.isArray(value)) throw new Error('Invalid GitHub repository list response');
+      const repositories = value.map((entry): RepositoryAccess => {
+        const repo = record(entry, 'repository');
+        const project = requiredString(repo.nameWithOwner, 'repository name');
+        // The project grammar is stricter than GitHub's repository naming (for
+        // example the special `owner/.github` repository starts with a dot).
+        // Do not reject the whole owner listing for such an entry: keep it in
+        // the result and let discovery report it as `invalid-project`, so the
+        // remaining repositories of the owner are still discovered.
+        const separator = project.indexOf('/');
+        const projectOwner = separator > 0 ? project.slice(0, separator) : '';
+        if (!projectOwner || projectOwner.toLocaleLowerCase() !== owner.toLocaleLowerCase()) {
+          throw new Error('Invalid GitHub repository list owner');
+        }
+        const name = project.slice(separator + 1);
+        for (const field of ['isPrivate', 'isArchived', 'isFork', 'hasIssuesEnabled']) {
+          if (typeof repo[field] !== 'boolean') throw new Error(`Invalid GitHub repository ${field}`);
+        }
+        const permission = repo.viewerPermission === null || repo.viewerPermission === undefined
+          ? null : requiredString(repo.viewerPermission, 'repository permission');
+        return {
+          project, owner: projectOwner, name,
+          private: repo.isPrivate as boolean,
+          archived: repo.isArchived as boolean,
+          disabled: false,
+          fork: repo.isFork as boolean,
+          issues: repo.hasIssuesEnabled as boolean,
+          permission,
+        };
+      });
+      const seen = new Set<string>();
+      return repositories
+        .filter((repo) => {
+          const key = repo.project.toLocaleLowerCase();
+          if (seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        })
+        .sort((left, right) => left.project.toLocaleLowerCase().localeCompare(right.project.toLocaleLowerCase()));
     },
     async selectMentioned(project, login, limit = 100) {
       validProject(project);

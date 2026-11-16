@@ -175,7 +175,7 @@ try {
   assert.equal(Number(store.rows('PRAGMA foreign_keys')[0].foreign_keys), 1);
   assert.equal(store.rows('PRAGMA journal_mode')[0].journal_mode, 'wal');
   assert.equal(Number(store.rows('PRAGMA busy_timeout')[0].timeout), 5000);
-  assert.equal(store.rows('SELECT version FROM schema_migrations').length, 15);
+  assert.equal(store.rows('SELECT version FROM schema_migrations').length, 17);
   assert.ok(columns('jobs').has('lease_pid'), 'jobs should record the OS process that owns its lease');
   assert.ok(columns('jobs').has('lease_start_ticks'), 'jobs should record process identity to detect PID reuse');
   assert.ok(tables.has('job_resource_locks') && tables.has('scheduler_global_limit'));
@@ -187,13 +187,17 @@ try {
   assert.ok(tables.has('ticket_api_budget'), 'the shared activation API budget must be durable');
   assert.ok(tables.has('ticket_api_budget_fairness'),
     'the durable cross-project budget rotation must be persisted');
+  assert.ok(tables.has('ticket_repository_discovery'),
+    'the durable owner-listing rotation must be persisted');
+  assert.ok(tables.has('ticket_repository_discovery_projects'),
+    'the durable discovered-project poll rotation must be persisted');
   assert.ok(tables.has('ticket_search_budget'),
     'the durable rolling-window search budget must be persisted');
   assert.ok(columns('ticket_activation_state').has('top_page'),
     'activation scan state records the observed newest page');
   store.close();
   store = new SQLiteStore(migrationFile);
-  assert.equal(store.rows('SELECT version FROM schema_migrations').length, 15, 'reopening must not reapply migrations');
+  assert.equal(store.rows('SELECT version FROM schema_migrations').length, 17, 'reopening must not reapply migrations');
   store.close();
   ok('empty database receives all schema migrations with WAL/foreign keys, and restart is idempotent');
 
@@ -245,12 +249,13 @@ try {
     DROP TABLE ticket_api_budget;
     DROP TABLE ticket_api_budget_fairness;
     DROP TABLE ticket_search_budget;
-    DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    DROP TABLE ticket_repository_discovery_projects;
+    DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17);
   `);
   store.close();
   store = new SQLiteStore(upgradeFile);
   assert.equal(store.rows('SELECT workflow_state FROM jobs WHERE id=?', upgradeJob.id)[0].workflow_state, 'EVIDENCE_PUBLISHED');
-  assert.equal(store.rows('SELECT MAX(version) AS version FROM schema_migrations')[0].version, 15);
+  assert.equal(store.rows('SELECT MAX(version) AS version FROM schema_migrations')[0].version, 17);
   store.close();
   ok('v1 jobs retain their workflow meaning when the additive migration is applied');
 
@@ -258,11 +263,11 @@ try {
   fs.mkdirSync(path.dirname(futureSchema), { recursive: true });
   const futureDb = new DatabaseSync(futureSchema);
   futureDb.exec('CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)');
-  futureDb.prepare('INSERT INTO schema_migrations(version, applied_at) VALUES (16, ?)').run(new Date().toISOString());
+  futureDb.prepare('INSERT INTO schema_migrations(version, applied_at) VALUES (18, ?)').run(new Date().toISOString());
   futureDb.close();
   assert.throws(() => new SQLiteStore(futureSchema), /newer than supported version/);
   const stillFutureDb = new DatabaseSync(futureSchema);
-  assert.equal(Number(stillFutureDb.prepare('SELECT MAX(version) AS version FROM schema_migrations').get().version), 16);
+  assert.equal(Number(stillFutureDb.prepare('SELECT MAX(version) AS version FROM schema_migrations').get().version), 18);
   stillFutureDb.close();
   ok('a database with a newer schema version is rejected without being downgraded');
 

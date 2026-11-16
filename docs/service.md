@@ -76,7 +76,9 @@ SQLite queue, ticket worktrees, agent sessions, and durable recovery artifacts.
   config. A repository may also set `tickets.activation_mention` to require an
   exact mention by a trusted author before its first ticket-agent bootstrap;
   the intake ticker rechecks issues while they remain in the bounded listing
-  window, and admitted sessions need no repeat mention. When the bounded
+  window, and admitted sessions need no repeat mention while the content-free
+  admission digest (login plus sorted trusted/tool allowlists) still matches the
+  current policy; a policy change re-applies the gate. When the bounded
   listing is saturated, a capped mention search also finds late activations
   outside that window; search indexing lag and matches beyond the cap remain
   limitations. Activation reads are
@@ -90,7 +92,13 @@ SQLite queue, ticket worktrees, agent sessions, and durable recovery artifacts.
   workers and projects. An exhausted budget defers without any provider request.
   Granted reservations rotate across projects in durable least-recently-served
   order, so a saturated project cannot starve later ones across polls, intake
-  ticks or restarts. A per-issue activation failure is a local diagnostic; other
+  ticks or restarts. With `discovery`, private repositories are cloned on first
+  dispatch via `gh repo clone`; the poller therefore needs a working Git
+  credential path for the configured `gh` account (for example the session's
+  managed credential helper or `gh auth setup-git`). API access alone is not
+  sufficient for a private clone. A clone failure fails closed and is retried
+  only through the normal poll cadence; the router does not switch accounts or
+  repair credentials. A per-issue activation failure is a local diagnostic; other
   intake failures (listing, provider/search, association or task) back the
   shared cadence off, never below the configured base interval. An explicit
   operator `goal` bypasses the poller gate. The
@@ -104,8 +112,19 @@ Set `ISSUE_ORCHESTRATOR_INTERVAL_SECONDS` to an integer from 60 through 999999;
 invalid or shorter intervals make the worker exit instead of hot-looping. A
 failed poll is paced by the same interval. Optionally set
 `ISSUE_ORCHESTRATOR_PROJECT` to one `owner/repository` and
-`ISSUE_ORCHESTRATOR_MAX` to limit tickets per poll. The worker starts with
-`--once` for a single cycle, which is useful for a deployment smoke test.
+`ISSUE_ORCHESTRATOR_MAX` to limit tickets per poll. The worker passes that
+project as `--project`, which disables discovery for the process: no owner is
+listed and the discovery access gates are not applied, only the configured-owner
+boundary. The worker starts with `--once` for a single cycle, which is useful
+for a deployment smoke test.
+
+With `discovery`, the persisted project rotation bounds how many newly
+discovered repositories are polled per pass (`discovery.max_projects_per_poll`,
+default 10); the rest are reported as deferred and served on later polls, while
+explicit `repos` entries are always polled. Base clones under `workspace_root`
+and their per-issue worktrees are not automatically cleaned up; `workspace_root`
+defaults under the runtime state directory, so size the state volume for the
+clones and worktrees of every repository that can be dispatched.
 
 ### Required deployment inputs
 

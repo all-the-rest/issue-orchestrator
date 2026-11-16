@@ -106,7 +106,22 @@ instruction not to publish is not an enforced boundary. Delegate only work the
 parent could perform itself. Optional operator acceptance criteria passed to
 `goal` remain separate from GitHub event data.
 
-The router admits only configured trusted authors, excludes the authenticated
+Top-level `discovery` lets `tickets poll` enumerate accessible repositories
+under configured owners instead of requiring an explicit `repos` entry. Each
+poll lists at most `max_owners_per_poll` owners with `gh repo list --limit`,
+rotating durably so large or failing owners cannot starve others. A repository is
+admitted only when the listing proves push capability (`viewerPermission` is
+`ADMIN`, `MAINTAIN`, or `WRITE`) and it is not archived, disabled, issue-disabled,
+or a fork (unless forks are enabled). Listing failures and skips are reported
+without provider response text, and they do not block explicitly configured
+projects. Discovered repositories inherit the default ticket policy and use a
+managed private checkout under `discovery.workspace_root`, cloned lazily on the
+first dispatch with the configured login. Cloning never switches accounts or
+repairs credentials; an existing path must be a private Git checkout with the
+matching origin. `tickets poll --project` scopes to one configured or
+discovery-owned repository without enumerating owners.
+
+The router routes only activity by configured trusted authors, excludes the authenticated
 bot/tool accounts, and stores separate durable cursors for ticket comments and
 PR conversation, inline review, and review submission state. Review cursors also
 retain observed pending review ids and a `submitted_at` watermark with the ids

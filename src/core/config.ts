@@ -66,6 +66,48 @@ interface RawDodConfig {
   timeout_ms?: number;
 }
 
+/**
+ * Configurable repository discovery. The authenticated account lists the
+ * repositories it can access under each configured owner; discovered
+ * repositories inherit the ticket policy below and get a managed checkout.
+ */
+interface RawDiscoveryConfig {
+  owners?: string[];
+  /** GitHub account used for listing; defaults to the first configured account. */
+  account?: string;
+  /** Login whose trusted mention activates a discovered repository's first turn. */
+  activation_mention?: string;
+  /** Trusted human allowlist for discovered repositories; defaults to trusted_authors. */
+  trusted_authors?: string[];
+  /** Private root for managed checkouts; defaults under the runtime directory. */
+  workspace_root?: string;
+  max_repositories_per_owner?: number;
+  max_owners_per_poll?: number;
+  /** Upper bound on newly discovered repositories polled in one pass. */
+  max_projects_per_poll?: number;
+  include_forks?: boolean;
+}
+
+export interface RepositoryDiscoverySettings {
+  owners: string[];
+  account: string;
+  activation_mention: string;
+  trusted_authors: string[];
+  workspace_root: string;
+  max_repositories_per_owner: number;
+  max_owners_per_poll: number;
+  /** Newly discovered repositories polled per pass; explicit projects are always polled. */
+  max_projects_per_poll: number;
+  include_forks: boolean;
+}
+
+export const DEFAULT_DISCOVERY_MAX_REPOSITORIES_PER_OWNER = 100;
+export const MAX_DISCOVERY_REPOSITORIES_PER_OWNER = 1_000;
+export const DEFAULT_DISCOVERY_MAX_OWNERS_PER_POLL = 20;
+export const DEFAULT_DISCOVERY_MAX_PROJECTS_PER_POLL = 10;
+export const MAX_DISCOVERY_PROJECTS_PER_POLL = 100;
+export const MAX_DISCOVERY_OWNERS = 100;
+
 interface RawRepoConfig extends RawTicketSettings {
   [key: string]: unknown;
   enabled?: boolean;
@@ -125,6 +167,8 @@ export interface RepoRuntimeConfig {
   labels: Record<string, string>;
   dod: RawDodConfig;
   workspace: string | null;
+  /** True when a discovered repository has no operator checkout and may be cloned on first use. */
+  workspace_managed?: boolean;
   tickets: TicketAgentSettings;
   evidence_branch_prefix: string;
   merge_method: string;
@@ -307,8 +351,14 @@ function validateConfig(cfg, file) {
   validateTicketSettings(cfg.tickets, 'tickets', false, true);
   validateTicketSettings(cfg.defaults?.tickets, 'defaults.tickets', false, true);
   if (cfg.max_concurrency !== undefined) positiveInteger(cfg.max_concurrency, 'max_concurrency');
-  if (!cfg.repos || typeof cfg.repos !== 'object' || Array.isArray(cfg.repos) ||
-      Object.keys(cfg.repos).length === 0) {
+  if (cfg.repos !== undefined &&
+      (!cfg.repos || typeof cfg.repos !== 'object' || Array.isArray(cfg.repos))) {
+    throw new Error(`${file}: "repos" must be an object keyed by project id`);
+  }
+  if (!cfg.repos && cfg.discovery === undefined) {
+    throw new Error(`${file}: "repos" must be a non-empty object keyed by project id`);
+  }
+  if (cfg.repos && Object.keys(cfg.repos).length === 0 && cfg.discovery === undefined) {
     throw new Error(`${file}: "repos" must be a non-empty object keyed by project id`);
   }
   if (typeof cfg.model !== 'string' || !/^[^\s/]+\/[^\s/]+$/.test(cfg.model)) {
@@ -349,6 +399,65 @@ function validateConfig(cfg, file) {
   if (new Set(toolAuthors.map((author) => author.toLocaleLowerCase())).size !== toolAuthors.length) {
     throw new Error(`${file}: "tool_authors" must not contain duplicates`);
   }
+  const githubLogin = /^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$/;
+  const uniqueLogins = (value: unknown, label: string, allowEmpty = false) => {
+    if (!Array.isArray(value) || (!allowEmpty && value.length === 0) ||
+        value.some((login) => typeof login !== 'string' || !githubLogin.test(login))) {
+      throw new Error(`${file}: "${label}" must be a non-empty array of GitHub logins`);
+    }
+    if (new Set(value.map((login) => login.toLocaleLowerCase())).size !== value.length) {
+      throw new Error(`${file}: "${label}" must not contain duplicate logins`);
+    }
+  };
+  const discovery = cfg.discovery as RawDiscoveryConfig | undefined;
+  if (discovery !== undefined) {
+    if (!discovery || typeof discovery !== 'object' || Array.isArray(discovery)) {
+      throw new Error(`${file}: "discovery" must be an object`);
+    }
+    uniqueLogins(discovery.owners, 'discovery.owners');
+    if ((discovery.owners as string[]).length > MAX_DISCOVERY_OWNERS) {
+      throw new Error(`${file}: "discovery.owners" must contain at most ${MAX_DISCOVERY_OWNERS} owners`);
+    }
+    if (discovery.account !== undefined &&
+        (typeof discovery.account !== 'string' || !discovery.account || !accounts.includes(discovery.account))) {
+      throw new Error(`${file}: "discovery.account" must name a configured account`);
+    }
+    const discoveryAccount = discovery.account ?? accounts[0];
+    if (typeof discoveryAccount !== 'string' || !discoveryAccount) {
+      throw new Error(`${file}: "discovery" requires a configured GitHub account`);
+    }
+    if (discovery.activation_mention !== undefined && !githubLogin.test(discovery.activation_mention)) {
+      throw new Error(`${file}: "discovery.activation_mention" must be a GitHub login without @`);
+    }
+    if (discovery.trusted_authors !== undefined) {
+      uniqueLogins(discovery.trusted_authors, 'discovery.trusted_authors');
+    }
+    if (!(discovery.trusted_authors ?? trusted).length) {
+      throw new Error(`${file}: "discovery" requires trusted_authors at the discovery or top level`);
+    }
+    if (discovery.workspace_root !== undefined &&
+        (typeof discovery.workspace_root !== 'string' || !discovery.workspace_root.trim() || discovery.workspace_root.includes('\0'))) {
+      throw new Error(`${file}: "discovery.workspace_root" must be a non-empty path`);
+    }
+    if (discovery.max_repositories_per_owner !== undefined &&
+        (!Number.isSafeInteger(discovery.max_repositories_per_owner) ||
+         discovery.max_repositories_per_owner < 1 ||
+         discovery.max_repositories_per_owner > MAX_DISCOVERY_REPOSITORIES_PER_OWNER)) {
+      throw new Error(`${file}: "discovery.max_repositories_per_owner" must be an integer from 1 to ${MAX_DISCOVERY_REPOSITORIES_PER_OWNER}`);
+    }
+    if (discovery.max_owners_per_poll !== undefined &&
+        (!Number.isSafeInteger(discovery.max_owners_per_poll) ||
+         discovery.max_owners_per_poll < 1 || discovery.max_owners_per_poll > MAX_DISCOVERY_OWNERS)) {
+      throw new Error(`${file}: "discovery.max_owners_per_poll" must be an integer from 1 to ${MAX_DISCOVERY_OWNERS}`);
+    }
+    if (discovery.max_projects_per_poll !== undefined &&
+        (!Number.isSafeInteger(discovery.max_projects_per_poll) ||
+         discovery.max_projects_per_poll < 1 ||
+         discovery.max_projects_per_poll > MAX_DISCOVERY_PROJECTS_PER_POLL)) {
+      throw new Error(`${file}: "discovery.max_projects_per_poll" must be an integer from 1 to ${MAX_DISCOVERY_PROJECTS_PER_POLL}`);
+    }
+    if (discovery.include_forks !== undefined) requireType(discovery.include_forks, 'boolean', 'discovery.include_forks', file);
+  }
 
   const defaults = (cfg.defaults ?? {}) as Record<string, unknown>;
   if (!defaults || typeof defaults !== 'object' || Array.isArray(defaults)) {
@@ -382,7 +491,19 @@ function validateConfig(cfg, file) {
     throw new Error(`${file}: "evidence.branch_prefix" contains unsafe branch characters`);
   }
 
-  for (const [project, rawRepo] of Object.entries(cfg.repos)) {
+  const discoveryTicketSettings = {
+    ...((defaults.tickets as RawTicketSettings | undefined) ?? {}), ...(cfg.tickets ?? {}),
+  };
+  // The ticket delivery cooldown is one durable, DB-wide value, so every polled
+  // project must agree on it. Discovered repositories inherit this value; an
+  // explicit repository that overrides it would make every poll fail for all
+  // projects. Reject that configuration here with the concrete conflict.
+  const discoveryDelivery = cfg.discovery === undefined ? null
+    : discoveryTicketSettings.delivery === undefined
+      ? { ...DEFAULT_DELIVERY_SCHEDULE, windows: [] }
+      : normalizeDeliverySchedule(discoveryTicketSettings.delivery, 'discovery tickets.delivery');
+
+  for (const [project, rawRepo] of Object.entries(cfg.repos ?? {})) {
     const repo = rawRepo as RawRepoConfig;
     if (!/^[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)+$/.test(project)) {
       throw new Error(`${file}: invalid project id "${project}"`);
@@ -456,6 +577,21 @@ function validateConfig(cfg, file) {
       throw new Error(`${file}: repos.${project}.workspace must be a non-empty path`);
     }
     validateTicketSettings(repo.tickets, `repos.${project}.tickets`, true, false, true);
+    if (discoveryDelivery) {
+      const repoTicketSettings = {
+        ...((defaults.tickets as RawTicketSettings | undefined) ?? {}), ...(cfg.tickets ?? {}),
+        ...(repo.tickets ?? {}),
+      };
+      const repoDelivery = repoTicketSettings.delivery === undefined
+        ? { ...DEFAULT_DELIVERY_SCHEDULE, windows: [] }
+        : normalizeDeliverySchedule(repoTicketSettings.delivery, `repos.${project}.tickets.delivery`);
+      if (repoDelivery.cooldownMs !== discoveryDelivery.cooldownMs) {
+        throw new Error(`${file}: repos.${project}.tickets.delivery.cooldown_ms ` +
+          `(${repoDelivery.cooldownMs}) conflicts with the inherited discovery delivery cooldown_ms ` +
+          `(${discoveryDelivery.cooldownMs}); the ticket delivery cooldown is shared by every polled ` +
+          'project, so explicit and discovered repositories must agree');
+      }
+    }
     if (repo.tickets?.workspace !== undefined && repo.workspace !== undefined) {
       throw new Error(`${file}: repos.${project} must not set both "workspace" and "tickets.workspace"`);
     }
@@ -512,6 +648,95 @@ function validateConfig(cfg, file) {
     }
   };
   rejectCredentials(cfg);
+}
+
+/** Resolve optional configurable owner discovery. Returns null when disabled. */
+export function repositoryDiscoverySettings(cfg): RepositoryDiscoverySettings | null {
+  const raw = cfg.discovery as RawDiscoveryConfig | undefined;
+  if (!raw) return null;
+  const account = raw.account ?? cfg.accounts?.[0];
+  return {
+    owners: [...raw.owners],
+    account,
+    activation_mention: raw.activation_mention ?? account,
+    trusted_authors: [...(raw.trusted_authors ?? cfg.trusted_authors ?? [])],
+    workspace_root: path.resolve(raw.workspace_root ?? path.join(path.dirname(databasePath()), 'repositories')),
+    max_repositories_per_owner: raw.max_repositories_per_owner ?? DEFAULT_DISCOVERY_MAX_REPOSITORIES_PER_OWNER,
+    max_owners_per_poll: raw.max_owners_per_poll ?? DEFAULT_DISCOVERY_MAX_OWNERS_PER_POLL,
+    max_projects_per_poll: raw.max_projects_per_poll ?? DEFAULT_DISCOVERY_MAX_PROJECTS_PER_POLL,
+    include_forks: raw.include_forks ?? false,
+  };
+}
+
+/**
+ * Build the runtime policy for a repository found by owner discovery. A
+ * discovered repository has no operator-authored `repos` entry, so it inherits
+ * global/default ticket policy and receives a private managed checkout. An
+ * explicit `repos.<project>` entry always takes precedence over this template.
+ */
+export function discoveredRepoConfig(cfg, project: string,
+  discovery: RepositoryDiscoverySettings): RepoRuntimeConfig {
+  if (typeof project !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(project)) {
+    throw new Error(`Invalid discovered project "${project}"`);
+  }
+  const owner = project.split('/')[0].toLocaleLowerCase();
+  if (!discovery.owners.some((candidate) => candidate.toLocaleLowerCase() === owner)) {
+    throw new Error(`Discovered project "${project}" is outside the configured discovery owners`);
+  }
+  const defaults = cfg.defaults ?? {};
+  const ticketSettings = { ...(defaults.tickets ?? {}), ...(cfg.tickets ?? {}) };
+  const maxConcurrentTickets = (ticketSettings as RawTicketSettings).max_concurrency ??
+    DEFAULT_TICKET_MAX_CONCURRENCY;
+  const delivery = ticketSettings.delivery === undefined
+    ? { ...DEFAULT_DELIVERY_SCHEDULE, windows: [] }
+    : normalizeDeliverySchedule(ticketSettings.delivery, 'tickets.delivery');
+  const labels = { ...(defaults.labels ?? {}) };
+  const enabled = defaults.enabled ?? true;
+  const slug = project.toLocaleLowerCase().replace(/[^a-z0-9_.-]+/g, '__');
+  const dod: RawDodConfig = {
+    commands: { build: null, test: null, lint: null, typecheck: null, security: null },
+    required_checks: [],
+    evidence_class: 'cli',
+    acceptance_source: 'issue_body',
+  };
+  return {
+    project,
+    provider: 'github',
+    tracker: 'github',
+    code_host: 'github',
+    agent_runner: cfg.agent_runner ?? defaults.agent_runner ?? 'opencode',
+    command_runner: cfg.command_runner ?? defaults.command_runner,
+    code_host_project: project,
+    account: discovery.account,
+    tracker_account: discovery.account,
+    code_host_account: discovery.account,
+    enabled,
+    local_only: defaults.local_only ?? false,
+    auto_merge: enabled && (defaults.auto_merge ?? true),
+    base_branch: defaults.base_branch ?? 'main',
+    trusted_authors: discovery.trusted_authors,
+    tool_authors: [...new Set((cfg.tool_authors ?? []) as string[])],
+    labels,
+    dod,
+    workspace: path.join(discovery.workspace_root, slug),
+    workspace_managed: true,
+    tickets: {
+      bootstrap: Array.isArray(ticketSettings.bootstrap) && ticketSettings.bootstrap.length
+        ? ticketSettings.bootstrap
+        : DEFAULT_TICKET_BOOTSTRAP,
+      system_prompt: ticketSettings.system_prompt ?? TICKET_AGENT_SYSTEM_PROMPT,
+      activation_mention: discovery.activation_mention,
+      max_concurrency: maxConcurrentTickets,
+      quiet_period_ms: ticketSettings.quiet_period_ms ?? DEFAULT_TICKET_QUIET_PERIOD_MS,
+      intake_poll_ms: ticketSettings.intake_poll_ms ?? DEFAULT_TICKET_INTAKE_POLL_MS,
+      post_merge_poll_ms: ticketSettings.post_merge_poll_ms ?? DEFAULT_TICKET_POST_MERGE_POLL_MS,
+      post_merge_poll_limit: ticketSettings.post_merge_poll_limit ?? DEFAULT_TICKET_POST_MERGE_POLL_LIMIT,
+      delivery,
+    },
+    evidence_branch_prefix: cfg.evidence?.branch_prefix ?? 'agent-evidence',
+    merge_method: cfg.merge?.method ?? 'squash',
+    raw: { dod },
+  };
 }
 
 export function repoConfig(cfg, project): RepoRuntimeConfig {
@@ -582,7 +807,7 @@ export function repoConfig(cfg, project): RepoRuntimeConfig {
 }
 
 export function enabledRepos(cfg) {
-  return Object.keys(cfg.repos).filter((project) => repoConfig(cfg, project).enabled);
+  return Object.keys(cfg.repos ?? {}).filter((project) => repoConfig(cfg, project).enabled);
 }
 
 export function readState(configFile) {

@@ -18,6 +18,11 @@ export interface TicketIssue {
   url: string;
   updatedAt: string | null;
   comments: TicketComment[];
+  /**
+   * Router policy bit set by discovery: the issue author is a trusted human.
+   * It is never provider-controlled, and false disables title/body activation.
+   */
+  authorTrusted?: boolean;
 }
 
 export interface TicketUpdateBatch {
@@ -32,6 +37,23 @@ export interface TicketIdentity {
   url: string;
 }
 
+/**
+ * Access-checked repository metadata used by configurable owner discovery.
+ * Only metadata is returned; no repository content is read.
+ */
+export interface RepositoryAccess {
+  project: string;
+  owner: string;
+  name: string;
+  private: boolean;
+  archived: boolean;
+  disabled: boolean;
+  fork: boolean;
+  issues: boolean;
+  /** GitHub `viewerPermission`: ADMIN, MAINTAIN, WRITE, TRIAGE, READ or null. */
+  permission: string | null;
+}
+
 export interface ActivationMentionRequest {
   project: string;
   number: number;
@@ -39,6 +61,13 @@ export interface ActivationMentionRequest {
   trustedAuthors: string[];
   excludedAuthors: string[];
   updatedAt?: string | null;
+  /**
+   * Whether the issue author may activate via the issue title/body. A mention
+   * in a comment is always evaluated by its own author. Discovery passes false
+   * for issues opened by someone other than a trusted human, so only the
+   * trusted commenter can opt the issue in.
+   */
+  issueAuthorTrusted?: boolean;
 }
 
 /**
@@ -80,6 +109,8 @@ export interface ActivationScanResult {
 
 export interface TicketPort {
   select(project: string, limit?: number): Promise<TicketIssue[]>;
+  /** Bounded discovery of accessible repositories owned by one account/org. */
+  listRepositories?(owner: string, limit?: number): Promise<RepositoryAccess[]>;
   /** Bounded discovery of open issues that mention an activation login. */
   selectMentioned?(project: string, login: string, limit?: number): Promise<TicketIssue[]>;
   /** Read issue identity/author only; never loads the title or body. */

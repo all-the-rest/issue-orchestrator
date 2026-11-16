@@ -863,6 +863,25 @@ const MIGRATIONS = [
     CREATE INDEX IF NOT EXISTS ticket_search_budget_granted
       ON ticket_search_budget(granted_at_ms);
   `,
+  `
+    -- Durable owner rotation for bounded repository discovery. Only owner
+    -- names, a monotonic sequence and an attempt time are stored.
+    CREATE TABLE IF NOT EXISTS ticket_repository_discovery (
+      owner TEXT PRIMARY KEY,
+      last_seq INTEGER NOT NULL CHECK(last_seq >= 0),
+      listed_at_ms INTEGER NOT NULL CHECK(listed_at_ms >= 0)
+    );
+  `,
+  `
+    -- Durable fair rotation for the bounded set of discovered repositories
+    -- that are polled in one pass. Only project names, a monotonic sequence
+    -- and a poll time are stored.
+    CREATE TABLE IF NOT EXISTS ticket_repository_discovery_projects (
+      project TEXT PRIMARY KEY,
+      last_seq INTEGER NOT NULL CHECK(last_seq >= 0),
+      polled_at_ms INTEGER NOT NULL CHECK(polled_at_ms >= 0)
+    );
+  `,
 ];
 
 export interface TicketHandoffRecord {
@@ -1295,6 +1314,87 @@ export class SQLiteStore {
         (left.key < right.key ? -1 : left.key > right.key ? 1 : 0) ||
         left.index - right.index)
       .map((entry) => entry.project);
+  }
+
+  /**
+   * Durable fair order for bounded repository discovery: the least recently
+   * served owner first, never-served owners before any served owner, and a
+   * stable case-insensitive tie-break. Read-only and restart-safe.
+   */
+  repositoryDiscoveryFairOrder(owners: string[]): string[] {
+    if (!Array.isArray(owners)) throw new Error('invalid repository discovery owner list');
+    const entries: Array<{ owner: string; key: string; index: number }> = [];
+    owners.forEach((owner, index) => {
+      if (typeof owner !== 'string' || !owner.trim()) throw new Error('invalid repository discovery owner');
+      entries.push({ owner, key: owner.trim().toLocaleLowerCase(), index });
+    });
+    const served = new Map<string, number>();
+    const rows = this.db.prepare('SELECT owner,last_seq FROM ticket_repository_discovery')
+      .all() as Array<{ owner: string; last_seq: number | bigint }>;
+    for (const row of rows) served.set(String(row.owner).toLocaleLowerCase(), Number(row.last_seq));
+    return entries
+      .sort((left, right) =>
+        (served.get(left.key) ?? 0) - (served.get(right.key) ?? 0) ||
+        (left.key < right.key ? -1 : left.key > right.key ? 1 : 0) ||
+        left.index - right.index)
+      .map((entry) => entry.owner);
+  }
+
+  /** Advance one owner's durable discovery rotation after a listing attempt. */
+  recordRepositoryDiscovery(owner: string, at = Date.now()): void {
+    if (typeof owner !== 'string' || !owner.trim() || owner.length > 200 ||
+        !Number.isSafeInteger(at) || at < 0) {
+      throw new Error('invalid repository discovery owner');
+    }
+    this.transaction(() => {
+      const next = Number(asSqlRow<{ seq: number | bigint }>(
+        this.db.prepare('SELECT COALESCE(MAX(last_seq),0)+1 AS seq FROM ticket_repository_discovery').get())?.seq ?? 1);
+      this.db.prepare(`INSERT INTO ticket_repository_discovery(owner,last_seq,listed_at_ms)
+        VALUES (?,?,?) ON CONFLICT(owner) DO UPDATE SET
+          last_seq=excluded.last_seq, listed_at_ms=excluded.listed_at_ms`)
+        .run(owner.trim().toLocaleLowerCase(), next, at);
+    });
+  }
+
+  /**
+   * Durable fair order for the bounded set of discovered repositories polled
+   * in one pass: least recently polled first, never-polled projects before any
+   * polled project, stable case-insensitive tie-break. Read-only and
+   * restart-safe; this is the project-level counterpart of the owner rotation.
+   */
+  repositoryDiscoveryProjectFairOrder(projects: string[]): string[] {
+    if (!Array.isArray(projects)) throw new Error('invalid repository discovery project list');
+    const entries: Array<{ project: string; key: string; index: number }> = [];
+    projects.forEach((project, index) => {
+      if (typeof project !== 'string' || !project.trim()) throw new Error('invalid repository discovery project');
+      entries.push({ project, key: project.trim().toLocaleLowerCase(), index });
+    });
+    const served = new Map<string, number>();
+    const rows = this.db.prepare('SELECT project,last_seq FROM ticket_repository_discovery_projects')
+      .all() as Array<{ project: string; last_seq: number | bigint }>;
+    for (const row of rows) served.set(String(row.project).toLocaleLowerCase(), Number(row.last_seq));
+    return entries
+      .sort((left, right) =>
+        (served.get(left.key) ?? 0) - (served.get(right.key) ?? 0) ||
+        (left.key < right.key ? -1 : left.key > right.key ? 1 : 0) ||
+        left.index - right.index)
+      .map((entry) => entry.project);
+  }
+
+  /** Advance one discovered project's durable poll rotation after it was served. */
+  recordRepositoryDiscoveryProject(project: string, at = Date.now()): void {
+    if (typeof project !== 'string' || !project.includes('/') || project.length > 300 ||
+        !Number.isSafeInteger(at) || at < 0) {
+      throw new Error('invalid repository discovery project');
+    }
+    this.transaction(() => {
+      const next = Number(asSqlRow<{ seq: number | bigint }>(
+        this.db.prepare('SELECT COALESCE(MAX(last_seq),0)+1 AS seq FROM ticket_repository_discovery_projects').get())?.seq ?? 1);
+      this.db.prepare(`INSERT INTO ticket_repository_discovery_projects(project,last_seq,polled_at_ms)
+        VALUES (?,?,?) ON CONFLICT(project) DO UPDATE SET
+          last_seq=excluded.last_seq, polled_at_ms=excluded.polled_at_ms`)
+        .run(project.trim().toLocaleLowerCase(), next, at);
+    });
   }
 
   /**

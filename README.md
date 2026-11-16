@@ -164,12 +164,18 @@ terminal and a new output file, and writes a JSON sidecar with the exact argv an
 exit status; it uses Node streams and does not depend on platform-specific
 `script` flags.
 
-`tickets poll` discovers open issues authored by configured `trusted_authors`
-and routes trusted ticket comments plus PR conversation/review events to each
-issue's persistent OpenCode chat. The agent reads full context using `gh`; the
-router sends event IDs and URLs only, posts no status/question comments, and
-does not claim it observed CI. Configure `tickets.bootstrap` to select the
-ordered messages used for both initial and update turns. `tickets.delivery`
+`tickets poll` watches trusted activity on configured repositories. Top-level
+`discovery` can instead find accessible repositories under one or more owners;
+those repositories inherit the configured trusted authors and activation login
+and get a private managed checkout that is cloned lazily on first dispatch. The
+poller routes trusted ticket comments plus PR conversation/review events to each
+issue's persistent OpenCode chat. Discovery admits only repositories the
+configured account can push to, and its bounded owner listing rotates durably so
+one large owner cannot starve the others. The agent reads full context using
+`gh`; the router sends event IDs and URLs only, posts no status/question
+comments, and does not claim it observed CI. Configure `tickets.bootstrap` to
+select the ordered messages used for both initial and update turns.
+`tickets.delivery`
 optionally limits automated dispatches to weekly windows in an explicit IANA
 zone and adds a global start-to-start cooldown that gates every bootstrap and
 follow-up dispatch; there is no default window, so without it polling stays
