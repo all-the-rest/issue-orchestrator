@@ -92,7 +92,9 @@ function macPs(args: string[]) {
 function processInfo(pid: number): ProcessIdentity | null {
   if (process.platform === 'linux') {
     let stat: string;
-    try { stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8'); } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error; }
+    // A process can exit between the /proc snapshot and this read. ESRCH means
+    // the same thing as ENOENT here: the member is gone and can be omitted.
+    try { stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8'); } catch (error) { if (['ENOENT', 'ESRCH'].includes((error as NodeJS.ErrnoException).code ?? '')) return null; throw error; }
     const fields = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/);
     if (!fields[0] || !/^\d+$/.test(fields[19] ?? '')) throw new Error('invalid Linux process identity');
     return { pid, pgid: Number(fields[2]), state: fields[0], start: fields[19] };

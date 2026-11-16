@@ -16,6 +16,25 @@ contribution workflow.
   `docs/providers.md` and `README.md`.
 - Do not include credentials, real customer data, or generated build artifacts.
 
+### Test runner
+
+`pnpm test` lints and builds first, then runs the standalone scripts listed in
+`test/run-parallel.mjs`. Those scripts are hermetic (each one that touches the filesystem works in its
+own `mkdtempSync` directory and none changes the shared cwd), so the runner starts
+up to four at a time and prints one buffered stdout/stderr block per script when
+it finishes. Set `TEST_CONCURRENCY` (1–8) to change the limit.
+
+- The runner fails fast: after the first failing script no new script starts,
+  already running ones are awaited, and the run exits non-zero with a list of
+  the failed scripts.
+- For a local partial run, pass scripts from the canonical list, e.g.
+  `pnpm build && node test/run-parallel.mjs test/persistence.mjs test/e2e.mjs`.
+  The list in `test/run-parallel.mjs` is authoritative; it mirrors the same
+  scripts and order that previously formed a sequential `&&` chain.
+- `test/test-parallel.mjs` self-tests the runner with throwaway scripts via
+  `TEST_FILES`; that override exists only for this self-test and cannot target
+  the runner itself.
+
 ## Changes and review
 
 Open a GitHub issue for substantial proposals and submit changes as a pull
