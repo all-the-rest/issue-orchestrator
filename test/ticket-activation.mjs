@@ -4,10 +4,12 @@ import os from 'node:os';
 import path from 'node:path';
 import { SQLiteStore } from '../dist/core/persistence.js';
 import {
+  ACTIVATION_API_BUDGET,
   ACTIVATION_NEGATIVE_CACHE_MS,
   ACTIVATION_SEARCH_BUDGET,
   MAX_ACTIVATION_CHECKS_PER_POLL,
   MAX_ACTIVATION_COMMENT_PAGES_PER_CHECK,
+  activationCheckCost,
   activationEligibleCandidates,
   activationSearchCost,
   checkTicketActivation,
@@ -18,7 +20,7 @@ import {
   ticketHasBeenAdmitted,
   ticketRouteJobId,
 } from '../dist/core/ticket-activation.js';
-import { ticketPolicy } from '../dist/core/commands.js';
+import { activationGuaranteedProjects, ticketPolicy } from '../dist/core/commands.js';
 import { runTicketHandoff } from '../dist/core/ticket-runtime.js';
 
 const candidate = (number, updatedAt = `2026-05-0${number}T00:00:00Z`) => ({
@@ -448,7 +450,7 @@ assert.equal(activationSearchCost(1000), 10, 'search cost conservatively assumes
 
 const apiBudgetFile = path.join(boundsDir, 'activation-api-budget.sqlite3');
 let apiBudgetStore = new SQLiteStore(apiBudgetFile);
-const tinyBudget = { limit: 10, windowMs: 60_000 };
+const tinyBudget = { limit: 10, windowMs: 60_000, capacity: 10 };
 const budgetCandidates = [61, 62, 63, 64].map((number) =>
   candidate(number, `2026-09-01T00:00:0${number % 10}Z`));
 let budgetNow = 500_000;
@@ -511,6 +513,104 @@ try {
   apiBudgetStore.close();
 }
 
+// --- Per-project floor: every project in one fair-order round gets a check ---
+// A 15-token burst at a 5-token sustained limit can pay for exactly three
+// worst-case checks; the reserve keeps one for each later project.
+const floorFile = path.join(boundsDir, 'activation-api-floor.sqlite3');
+const floorStore = new SQLiteStore(floorFile);
+try {
+  assert.equal(activationCheckCost(true), 5,
+    'one scan check reserves one issue read plus four comment pages');
+  const floorBudget = { limit: 5, windowMs: 60_000, capacity: 15 };
+  const floorProjects = ['owner/alpha', 'owner/beta', 'owner/gamma'];
+  const floorNow = 9_000_000;
+  const calls = [];
+  const outcomes = [];
+  for (const [index, project] of floorProjects.entries()) {
+    const reserveTokens = (floorProjects.length - index - 1) * activationCheckCost(true);
+    const outcome = await activationEligibleCandidates({
+      candidates: [candidate(100 + index * 2), candidate(101 + index * 2)],
+      project, login: 'reisi007-jr', trustedAuthors: ['human'], excludedAuthors: [],
+      store: floorStore, now: () => floorNow, maxChecks: 2, apiBudget: floorBudget, reserveTokens,
+      scanActivationMention: async ({ number }) => {
+        calls.push({ project, number });
+        return { matched: false, complete: true, nextPage: null,
+          revision: `rev-${number}`, topPage: null };
+      },
+    });
+    outcomes.push({ project, outcome, reserveTokens });
+  }
+  assert.deepEqual(calls, [
+    { project: 'owner/alpha', number: 100 },
+    { project: 'owner/beta', number: 102 },
+    { project: 'owner/gamma', number: 104 },
+  ], 'each project receives exactly one provider check in the fair-order round');
+  for (const [index, entry] of outcomes.entries()) {
+    assert.equal(entry.outcome.checks, 1, `${entry.project} performs exactly one provider check`);
+    assert.deepEqual(entry.outcome.budgetDenied, [101 + index * 2],
+      `${entry.project} defers its second candidate instead of starving a later project`);
+  }
+} finally {
+  floorStore.close();
+}
+
+// --- Large project sets guarantee only what the poll interval can refill ---
+// With 50 projects and a 9/minute sustained refill, reserving for all 50 would
+// require 250 tokens at once and permanently deny the first project; the floor
+// covers only the leading projects that fit one 300-second interval, while the
+// rotation serves the rest.
+const scaleFile = path.join(boundsDir, 'activation-api-scale.sqlite3');
+const scaleBudget = { limit: 9, windowMs: 60_000, capacity: 50 };
+const scalePerCheck = activationCheckCost(true);
+const scaleGuaranteed = Math.min(40,
+  Math.floor((scaleBudget.limit / scalePerCheck) * (300 / 60)));
+assert.equal(scaleGuaranteed, 9, 'the floor is bounded by the sustained refill per interval');
+const scaleProjects = Array.from({ length: 50 }, (_, index) =>
+  `owner/project-${String(index).padStart(2, '0')}`);
+const scaleCalls = new Map();
+const scaleFirstServed = new Map();
+let scaleNow = 10_000_000;
+try {
+  for (let poll = 0; poll < 12; poll += 1) {
+    // A fresh handle per poll mirrors separate worker runs and proves the
+    // rotation and bucket are durable rather than in-process.
+    const pollStore = new SQLiteStore(scaleFile);
+    try {
+      const order = pollStore.activationBudgetFairOrder(scaleProjects);
+      for (const [index, project] of order.entries()) {
+        const issue = 1_000 + scaleProjects.indexOf(project);
+        const reserveTokens = index < scaleGuaranteed
+          ? (scaleGuaranteed - index - 1) * scalePerCheck
+          : 0;
+        await activationEligibleCandidates({
+          candidates: [candidate(issue, `rev-${issue}`)],
+          project, login: 'reisi007-jr', trustedAuthors: ['human'], excludedAuthors: [],
+          store: pollStore, now: () => scaleNow, maxChecks: 1, apiBudget: scaleBudget,
+          reserveTokens,
+          scanActivationMention: async () => {
+            scaleCalls.set(project, (scaleCalls.get(project) ?? 0) + 1);
+            if (!scaleFirstServed.has(project)) scaleFirstServed.set(project, poll);
+            return { matched: false, complete: true, nextPage: null,
+              revision: `rev-${issue}`, topPage: null };
+          },
+        });
+      }
+    } finally {
+      pollStore.close();
+    }
+    scaleNow += 300_000;
+  }
+} finally {
+  fs.rmSync(scaleFile, { force: true });
+}
+assert.equal(scaleFirstServed.get('owner/project-00'), 0,
+  'the first project still receives its check in the first poll instead of waiting forever');
+assert.equal(scaleFirstServed.size, 50, 'every one of the 50 projects is served across polls');
+assert.ok([...scaleFirstServed.values()].every((poll) => poll <= 6),
+  'no project waits more than a few polls for its first check');
+assert.ok((scaleCalls.get('owner/project-00') ?? 0) >= 2,
+  'a front project is served again by the rotation, not permanently denied');
+
 // --- Separate shared search budget across more than four saturated projects ---
 // A token bucket with capacity 30 would still allow a burst plus refill in one
 // minute. The separate durable rolling log keeps every rolling minute within
@@ -558,7 +658,7 @@ try {
 // so the first configured project cannot starve later projects across polls.
 const fairFile = path.join(boundsDir, 'activation-api-fair.sqlite3');
 let fairStore = new SQLiteStore(fairFile);
-const fairBudget = { limit: 10, windowMs: 60_000 };
+const fairBudget = { limit: 10, windowMs: 60_000, capacity: 10 };
 const fairProjects = ['owner/alpha', 'owner/beta'];
 let fairNow = 2_000_000;
 const runFairProject = async (project, base, revision) => {
@@ -622,6 +722,27 @@ try {
     'a search reservation moves its project behind the other project');
 } finally {
   fairStore.close();
+}
+
+// Exercise the production formula directly: a regression to the old "reserve
+// for every project" scaling (capacity = 5n) would change these numbers and is
+// not caught by the store-level 50-project case.
+assert.equal(activationCheckCost(true), 5);
+const savedInterval = process.env.ISSUE_ORCHESTRATOR_INTERVAL_SECONDS;
+try {
+  process.env.ISSUE_ORCHESTRATOR_INTERVAL_SECONDS = '300';
+  const guaranteed = activationGuaranteedProjects(activationCheckCost(true));
+  assert.equal(guaranteed, 40, '45 tokens/min / 5 per check * 5 min is capped at 40');
+  assert.equal(Math.min(21, guaranteed), 21, 'the production 21-project poll keeps full coverage');
+  assert.ok(guaranteed * activationCheckCost(true) <= ACTIVATION_API_BUDGET.limit * 5,
+    'the reserved first checks never exceed what one poll interval can refill');
+  process.env.ISSUE_ORCHESTRATOR_INTERVAL_SECONDS = '60';
+  assert.equal(activationGuaranteedProjects(activationCheckCost(true)), 9);
+  process.env.ISSUE_ORCHESTRATOR_INTERVAL_SECONDS = '3000';
+  assert.equal(activationGuaranteedProjects(activationCheckCost(true)), 40);
+} finally {
+  if (savedInterval === undefined) delete process.env.ISSUE_ORCHESTRATOR_INTERVAL_SECONDS;
+  else process.env.ISSUE_ORCHESTRATOR_INTERVAL_SECONDS = savedInterval;
 }
 
 fs.rmSync(boundsDir, { recursive: true, force: true });

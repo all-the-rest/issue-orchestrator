@@ -1374,6 +1374,91 @@ try {
   budgetA.close();
   budgetB.close();
 
+  // --- Burst capacity is separate from the sustained refill rate.
+  // A saved burst lets one poll check every project, while refill stays at
+  // limit/window so the long-term GitHub quota is unchanged.
+  const burstPath = path.join(TMP, 'ticket-api-burst', 'orchestrator.sqlite3');
+  const burst = new SQLiteStore(burstPath);
+  try {
+    const burstOptions = (now, overrides = {}) => ({
+      now, limit: 10, windowMs: 60_000, capacity: 30, project: 'owner/alpha', ...overrides });
+    assert.deepEqual(burst.consumeTicketActivationBudget(20, burstOptions(100_000)),
+      { granted: true, remaining: 10, retryAt: null },
+      'a fresh bucket starts at its burst capacity, so one poll may spend more than the per-window limit');
+    assert.deepEqual(burst.consumeTicketActivationBudget(10, burstOptions(100_000)),
+      { granted: true, remaining: 0, retryAt: null },
+      'the full burst capacity is usable in the same instant');
+    assert.equal(burst.consumeTicketActivationBudget(1, burstOptions(100_000)).granted, false,
+      'the bucket is empty after the burst');
+    assert.equal(burst.consumeTicketActivationBudget(5, burstOptions(130_000)).granted, true,
+      'half a window refills half of the sustained limit, not half of the capacity');
+    assert.equal(burst.consumeTicketActivationBudget(1, burstOptions(130_000)).granted, false,
+      'the refilled amount is exact and is not proportional to the larger capacity');
+    assert.deepEqual(burst.consumeTicketActivationBudget(6, burstOptions(190_000)),
+      { granted: true, remaining: 4, retryAt: null },
+      'refill continues at limit/window after the burst');
+    assert.deepEqual(burst.consumeTicketActivationBudget(1, burstOptions(10_000_000)),
+      { granted: true, remaining: 29, retryAt: null },
+      'idle time fills the bucket only up to its capacity');
+  } finally {
+    burst.close();
+  }
+
+  // --- A reserve keeps tokens for later projects in the same fair order.
+  const reservePath = path.join(TMP, 'ticket-api-reserve', 'orchestrator.sqlite3');
+  const reserved = new SQLiteStore(reservePath);
+  try {
+    const reserveOptions = (now, overrides = {}) => ({
+      now, limit: 10, windowMs: 60_000, capacity: 20, reserve: 15,
+      project: 'owner/alpha', ...overrides });
+    assert.deepEqual(reserved.consumeTicketActivationBudget(5, reserveOptions(200_000)),
+      { granted: true, remaining: 15, retryAt: null },
+      'a grant that leaves the whole reserve is admitted');
+    assert.deepEqual(reserved.consumeTicketActivationBudget(5, reserveOptions(200_000)),
+      { granted: false, remaining: 15, retryAt: 230_000 },
+      'a grant that would dip into the reserve is denied; retryAt waits for requests plus reserve');
+    assert.deepEqual(reserved.consumeTicketActivationBudget(5, reserveOptions(230_000)),
+      { granted: true, remaining: 15, retryAt: null },
+      'the denied reservation consumed nothing and the reported retry time admits the same grant');
+    assert.deepEqual(reserved.consumeTicketActivationBudget(21, reserveOptions(230_000, { reserve: 0 })).granted,
+      false, 'an oversized reservation still fails closed');
+  } finally {
+    reserved.close();
+  }
+
+  // --- A reservation that cannot fit even with the reserve fails closed.
+  const impossiblePath = path.join(TMP, 'ticket-api-impossible', 'orchestrator.sqlite3');
+  const impossible = new SQLiteStore(impossiblePath);
+  try {
+    assert.deepEqual(impossible.consumeTicketActivationBudget(5, {
+      now: 300_000, limit: 10, windowMs: 60_000, capacity: 10, reserve: 10,
+      project: 'owner/alpha',
+    }), { granted: false, remaining: 10, retryAt: null },
+    'requests plus reserve above capacity has no retry time instead of growing one forever');
+  } finally {
+    impossible.close();
+  }
+
+  // --- A smaller later capacity preserves tokens saved by a wider caller.
+  const carryPath = path.join(TMP, 'ticket-api-carry', 'orchestrator.sqlite3');
+  const carried = new SQLiteStore(carryPath);
+  try {
+    assert.deepEqual(carried.consumeTicketActivationBudget(1, {
+      now: 1_000_000, limit: 10, windowMs: 60_000, capacity: 30, project: 'owner/wide',
+    }), { granted: true, remaining: 29, retryAt: null },
+    'a wide caller fills a larger burst bucket');
+    assert.deepEqual(carried.consumeTicketActivationBudget(1, {
+      now: 1_000_000, limit: 10, windowMs: 60_000, capacity: 10, project: 'owner/narrow',
+    }), { granted: true, remaining: 28, retryAt: null },
+    'a later narrower caller does not discard the saved balance');
+    assert.deepEqual(carried.consumeTicketActivationBudget(1, {
+      now: 1_060_000, limit: 10, windowMs: 60_000, capacity: 10, project: 'owner/narrow',
+    }), { granted: true, remaining: 27, retryAt: null },
+    'a narrower caller neither refills above its capacity nor above the saved balance');
+  } finally {
+    carried.close();
+  }
+
   // --- Separate shared search budget with a provable rolling-minute bound.
   // GitHub allows 30 search requests per minute. A token bucket would admit a
   // capacity burst plus refill inside one minute, so the durable store keeps a

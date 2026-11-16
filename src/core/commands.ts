@@ -43,8 +43,9 @@ import {
 } from './dod.js';
 import { getCodeHost, getTracker } from '../providers/index.js';
 import { githubTicket } from '../providers/github-ticket.js';
-import { activationEligibleCandidates, activationSearchCost, reserveActivationSearchBudget,
-  ticketActivationAdmissionPolicy } from './ticket-activation.js';
+import { activationCheckCost, activationEligibleCandidates, activationSearchCost,
+  reserveActivationSearchBudget, ACTIVATION_API_BUDGET, ticketActivationAdmissionPolicy,
+  type ActivationApiBudget } from './ticket-activation.js';
 import {
   discoverRepositories,
   ensureManagedRepositoryCheckout,
@@ -2817,7 +2818,8 @@ interface TicketCandidateDiscovery {
  * mention on an issue that has fallen outside that window.
  */
 async function discoverTicketCandidates(cfg: TicketRouterConfig, rc: RepoRuntimeConfig,
-  listed: TicketIssue[], max: number, store?: ReturnType<typeof getRuntimeStore>): Promise<TicketCandidateDiscovery> {
+  listed: TicketIssue[], max: number, store?: ReturnType<typeof getRuntimeStore>,
+  apiBudget?: ActivationApiBudget, reserveTokens = 0): Promise<TicketCandidateDiscovery> {
   const login = rc.tickets.activation_mention;
   const trusted = (issue: TicketIssue) => eligibleTicketAuthor(cfg, rc, issue.author);
   // With an activation gate, an issue opened by someone else is still a
@@ -2875,6 +2877,8 @@ async function discoverTicketCandidates(cfg: TicketRouterConfig, rc: RepoRuntime
     ...(githubTicket.hasActivationMention
       ? { hasActivationMention: (request) => githubTicket.hasActivationMention!(request) }
       : {}),
+    ...(apiBudget ? { apiBudget } : {}),
+    ...(reserveTokens > 0 ? { reserveTokens } : {}),
   });
   return {
     candidates: eligible.candidates,
@@ -3515,12 +3519,23 @@ export async function runIntakeTick(deps: IntakeTickDeps): Promise<boolean> {
   const recordFault = (kind: IntakeFailureKind) => {
     if (intakeFailureBacksOff(kind)) ok = false;
   };
-  for (const context of fairIntakeContexts(deps.contexts)) {
+  const contexts = fairIntakeContexts(deps.contexts);
+  // Enrichment only: the tick reserves no floor for later projects, but it
+  // shares the same burst capacity and sustained rate as the activation path.
+  const intakePerCheck = activationCheckCost(true);
+  const intakeGuaranteed = Math.min(contexts.length,
+    activationGuaranteedProjects(intakePerCheck));
+  const intakeBudget: ActivationApiBudget = {
+    ...ACTIVATION_API_BUDGET,
+    capacity: Math.max(ACTIVATION_API_BUDGET.capacity, intakeGuaranteed * intakePerCheck),
+  };
+  for (const context of contexts) {
     let candidates: TicketIssue[] = [];
     let listedNumbers = new Set<number>();
     try {
       const listed = await select(context.project, Math.min(1000, deps.max));
-      const discovery = await discover(deps.cfg, context.rc, listed, deps.max, context.store);
+      const discovery = await discover(deps.cfg, context.rc, listed, deps.max, context.store,
+        intakeBudget, 0);
       candidates = discovery.candidates;
       listedNumbers = new Set(listed.map((issue) => issue.number));
       // A per-issue activation failure (or an unavailable check) is a local
@@ -3597,6 +3612,26 @@ export async function runIntakeTick(deps: IntakeTickDeps): Promise<boolean> {
   const outcomes = await mapLimit([...deps.tasks], Math.min(8, deps.tasks.length), deps.runTask);
   if (outcomes.some((entry) => !entry)) recordFault('task');
   return ok;
+}
+
+/** Conservative ceiling so scheduler jitter cannot overcommit the per-poll floor. */
+const MAX_GUARANTEED_ACTIVATION_PROJECTS = 40;
+const DEFAULT_ROUTER_INTERVAL_SECONDS = 300;
+
+/**
+ * How many leading projects in the fair order the sustained refill can
+ * guarantee one check each per poll. The floor must fit the tokens the bucket
+ * can actually hold between two polls; reserving for more projects than that
+ * would make the first project wait for a reservation that never fits and,
+ * because the rotation only advances on a grant, keep it at the front forever.
+ * The cap absorbs scheduling jitter; later projects are served by rotation.
+ */
+export function activationGuaranteedProjects(perCheck: number): number {
+  const configured = Number(process.env.ISSUE_ORCHESTRATOR_INTERVAL_SECONDS);
+  const intervalSeconds = Number.isFinite(configured) && configured >= 60
+    ? configured : DEFAULT_ROUTER_INTERVAL_SECONDS;
+  const checksPerInterval = (ACTIVATION_API_BUDGET.limit / perCheck) * (intervalSeconds / 60);
+  return Math.min(MAX_GUARANTEED_ACTIVATION_PROJECTS, Math.floor(checksPerInterval));
 }
 
 async function cmdTickets(opts: ParsedArgs) {
@@ -3705,7 +3740,28 @@ async function cmdTickets(opts: ParsedArgs) {
   // on an earlier poll goes behind projects that have waited longer, so the
   // first configured project cannot starve all later ones across polls.
   const fairProjects = dryRun ? [...projects] : getRuntimeStore().activationBudgetFairOrder(projects);
-  for (const project of fairProjects) {
+  // The rotation alone cannot guarantee progress within one poll: while a
+  // large set is catching up, the first projects in the order can spend the
+  // entire bucket at one instant and every later project is denied. Reserve
+  // one worst-case check for every project still behind this one in the fair
+  // order, but only for as many projects as the sustained refill can actually
+  // hold per poll. Projects beyond that bound use the rotation instead, so a
+  // very large set cannot pin the first project on a reservation that never
+  // fits. The sustained refill stays at ACTIVATION_API_BUDGET.limit
+  // (45/minute = 2700/hour, below GitHub's 5000/hour ceiling).
+  const perCheck = activationCheckCost(true);
+  const guaranteedProjects = Math.min(fairProjects.length,
+    activationGuaranteedProjects(perCheck));
+  const activationBudget: ActivationApiBudget = {
+    ...ACTIVATION_API_BUDGET,
+    capacity: Math.max(ACTIVATION_API_BUDGET.capacity, guaranteedProjects * perCheck),
+  };
+  for (let projectIndex = 0; projectIndex < fairProjects.length; projectIndex += 1) {
+    const project = fairProjects[projectIndex];
+    // Every still-unguaranteed project behind this one keeps its check.
+    const reserveTokens = projectIndex < guaranteedProjects
+      ? (guaranteedProjects - projectIndex - 1) * perCheck
+      : 0;
     try {
       let rc = discoveredConfigs.get(project.toLocaleLowerCase()) ?? repoConfig(cfg, project);
       if (!rc.enabled) { results.push({ project, outcome: 'SKIPPED', reason: 'disabled' }); continue; }
@@ -3741,7 +3797,8 @@ async function cmdTickets(opts: ParsedArgs) {
         incomplete: [], activationChecks: 0,
       };
       try {
-        discovery = await discoverTicketCandidates(cfg, rc, listed, max, store);
+        discovery = await discoverTicketCandidates(cfg, rc, listed, max, store,
+          activationBudget, reserveTokens);
       } catch (error) {
         // Candidate discovery must never prevent the retained-association path
         // below from draining already admitted issue chats.

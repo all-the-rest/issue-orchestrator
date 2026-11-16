@@ -284,7 +284,24 @@ persisted associations or the shared intake cadence.
 All activation reads draw from one durable, time-based API budget shared by
 every project and poller process that uses the runtime database: 45 requests
 per 60-second window, refilled continuously, with the bucket persisted across
-restarts. The optional mention search has its own durable, shared rolling-window
+restarts. The bucket may accumulate up to a larger burst capacity (250 requests)
+so a single poll can spend saved tokens, but refill stays at 45 requests per
+minute and never exceeds that capacity; the sustained quota is 2700 requests
+per hour, well below GitHub's 5000-per-hour ceiling. The per-poll floor covers
+only as many leading projects as the sustained refill can hold during one poll
+interval: `guaranteedProjects = min(40, floor((45 / perCheck) * (intervalSeconds
+/ 60)))`, where `perCheck` is the worst-case scan cost and `intervalSeconds`
+comes from `ISSUE_ORCHESTRATOR_INTERVAL_SECONDS` (default 300). The first
+`guaranteedProjects` entries of the fair order are guaranteed one worst-case
+activation check each while the bucket holds enough tokens: every reservation
+must leave one check behind for the remaining guaranteed projects. Projects
+past that bound use the durable rotation instead, so a very large set cannot
+pin the first project on a reservation that can never fit. The burst capacity
+is `max(250, guaranteedProjects * perCheck)`; it does not grow with the raw
+project count. The floor is per poller without competing consumption: the
+intake ticker deliberately runs without a reserve and can spend tokens between
+activation polls. The optional
+mention search has its own durable, shared rolling-window
 budget of 30 requests per minute, matching GitHub's search limit. Because a
 grant is admitted only while the summed cost of every grant in the preceding
 minute stays within 30, no burst, refill or extra project can exceed the search
@@ -301,8 +318,10 @@ reserves one read plus eight pages, and the mention search reserves one request
 per 100 results (at most 10) from the search budget only. A reservation that
 does not fit makes no provider request: the affected candidates are reported as
 deferred with the next `retry_at`, and the search is skipped. The rotation is
-work-conserving: a project with pending work may use the whole remaining bucket
-during its turn, but its next turn starts behind every other project. That keeps
+work-conserving across turns: a project with pending work may use the remaining
+burst during its turn, but its next turn starts behind every other project and
+it must leave the per-project floor for the projects still covered behind it in
+the same poll. That keeps
 a saturated or adversarial listing from turning into a request storm, but it is
 deliberately slower than GitHub's own limits: under sustained demand the router
 can check roughly nine four-page scans or five boolean checks per minute, and

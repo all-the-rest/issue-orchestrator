@@ -47,6 +47,7 @@ export interface ActivationStateStore extends ActivationHandoffStore {
 export interface ActivationBudgetStore {
   consumeTicketActivationBudget(requests: number, options: {
     now?: number; limit: number; windowMs: number; project: string;
+    capacity?: number; reserve?: number;
   }): ActivationBudgetDecision;
 }
 
@@ -64,9 +65,15 @@ export interface ActivationBudgetDecision {
 }
 
 export interface ActivationApiBudget {
-  /** Requests available per window across every poller and project. */
+  /** Requests available per window across every poller and project (sustained rate). */
   limit: number;
   windowMs: number;
+  /**
+   * Tokens that may accumulate for one burst. Required so no caller silently
+   * inherits a burst it did not ask for; passes the sustained rate for paths
+   * that must not spend saved tokens.
+   */
+  capacity: number;
 }
 
 export interface ActivationIncomplete {
@@ -117,11 +124,18 @@ export const ACTIVATION_BOOLEAN_COMMENT_PAGES = 8;
  * Shared activation API budget for issue reads. GitHub allows far more, but
  * ticket agents use the same token for their own reads and writes, and the
  * search endpoint has its own limit (see `ACTIVATION_SEARCH_BUDGET` below).
- * 45 requests/minute leaves most provider headroom while still allowing
- * roughly nine four-page scans or five boolean checks per minute across every
- * project and poller. This bucket never pays for mention searches.
+ * The sustained rate stays 45 requests/minute, which leaves most provider
+ * headroom while allowing roughly nine four-page scans or five boolean checks
+ * per minute across every project and poller. The larger capacity is only a
+ * burst allowance: a poll may spend up to ~50 saved checks; the router reserves
+ * a first check only for the projects covered by `activationGuaranteedProjects`
+ * (40 at the default 300 s interval), while refill — and therefore the long-term
+ * quota — stays 45/minute. Larger namespaces rotate across polls. This bucket
+ * never pays for mention searches.
  */
-export const ACTIVATION_API_BUDGET: ActivationApiBudget = { limit: 45, windowMs: 60_000 };
+export const ACTIVATION_API_BUDGET: ActivationApiBudget = {
+  limit: 45, windowMs: 60_000, capacity: 250,
+};
 
 /**
  * Shared budget for the GitHub search endpoint, 30 requests per minute for one
@@ -130,14 +144,26 @@ export const ACTIVATION_API_BUDGET: ActivationApiBudget = { limit: 45, windowMs:
  * the durable store keeps a rolling-window log instead: a grant is admitted
  * only while the summed cost of every grant in the preceding minute stays
  * within 30, which bounds any rolling minute across projects, pollers and
- * restarts, burst included.
+ * restarts, burst included. The shared `ActivationApiBudget` type requires a
+ * capacity, but the search path ignores it; only the rolling log applies.
  */
-export const ACTIVATION_SEARCH_BUDGET: ActivationApiBudget = { limit: 30, windowMs: 60_000 };
+export const ACTIVATION_SEARCH_BUDGET: ActivationApiBudget = {
+  limit: 30, windowMs: 60_000, capacity: 30,
+};
 
 /** Conservative request cost of one bounded mention search (100 results/page). */
 export function activationSearchCost(results: number): number {
   const bounded = Number.isSafeInteger(results) ? Math.max(1, Math.min(results, 1000)) : 1000;
   return Math.min(10, Math.ceil(bounded / 100));
+}
+
+/**
+ * Conservative request cost of one activation check. Callers use it to size
+ * the per-poll burst capacity and the per-project reserve without duplicating
+ * the page bounds.
+ */
+export function activationCheckCost(scan: boolean): number {
+  return 1 + (scan ? MAX_ACTIVATION_COMMENT_PAGES_PER_CHECK : ACTIVATION_BOOLEAN_COMMENT_PAGES);
 }
 
 export function ticketRouteJobId(project: string, issue: number): string {
@@ -227,15 +253,20 @@ function searchBudgetStore(store: ActivationStateStore | undefined): ActivationS
  * durable cross-project rotation, so separate polls and intake ticks serve the
  * least recently served project first. Without a durable budget store (for
  * example a `--dry-run` or a test double) nothing is spent.
+ *
+ * `reserve` leaves that many tokens untouched so later projects in the same
+ * poll still get their guaranteed check.
  */
 export function reserveActivationApiBudget(store: ActivationStateStore | undefined, requests: number,
-  options: { now?: number; budget?: ActivationApiBudget; project: string }): ActivationBudgetDecision {
+  options: { now?: number; budget?: ActivationApiBudget; project: string; reserve?: number }): ActivationBudgetDecision {
   const durable = budgetStore(store);
   if (!durable) return { granted: true, remaining: Number.MAX_SAFE_INTEGER, retryAt: null };
   const budget = options.budget ?? ACTIVATION_API_BUDGET;
   return durable.consumeTicketActivationBudget(requests, {
     project: options.project,
     now: options.now ?? Date.now(), limit: budget.limit, windowMs: budget.windowMs,
+    capacity: budget.capacity,
+    ...(options.reserve !== undefined && options.reserve > 0 ? { reserve: options.reserve } : {}),
   });
 }
 
@@ -298,6 +329,8 @@ export async function checkTicketActivation(args: {
   maxCommentPages?: number;
   /** Shared budget override; exposed for tests. */
   apiBudget?: ActivationApiBudget;
+  /** Tokens a granted check must leave for later projects in the same poll. */
+  reserveTokens?: number;
 }): Promise<ActivationCheckOutcome> {
   const now = args.now ?? Date.now;
   const maxCommentPages = Math.max(1, Math.min(args.maxCommentPages ?? MAX_ACTIVATION_COMMENT_PAGES_PER_CHECK,
@@ -334,6 +367,8 @@ export async function checkTicketActivation(args: {
     project: args.project,
     now: now(),
     ...(args.apiBudget ? { budget: args.apiBudget } : {}),
+    ...(args.reserveTokens !== undefined && args.reserveTokens > 0
+      ? { reserve: args.reserveTokens } : {}),
   });
   if (!reservation.granted) {
     return { status: 'budget', retryAt: reservation.retryAt, requested: false };
@@ -479,6 +514,8 @@ export async function activationEligibleCandidates(args: {
   maxCommentPages?: number;
   /** Shared budget override; exposed for tests. */
   apiBudget?: ActivationApiBudget;
+  /** Tokens every granted check must leave for the remaining projects. */
+  reserveTokens?: number;
 }): Promise<ActivationEligibility> {
   const result: ActivationEligibility = {
     candidates: [], failures: [], deferred: [], retrying: [], incomplete: [],
@@ -553,6 +590,8 @@ export async function activationEligibleCandidates(args: {
       now,
       ...(args.maxCommentPages !== undefined ? { maxCommentPages: args.maxCommentPages } : {}),
       ...(args.apiBudget ? { apiBudget: args.apiBudget } : {}),
+      ...(args.reserveTokens !== undefined && args.reserveTokens > 0
+        ? { reserveTokens: args.reserveTokens } : {}),
     });
     if (outcome.status === 'budget') {
       // Stop before any further reservation or provider call so an exhausted

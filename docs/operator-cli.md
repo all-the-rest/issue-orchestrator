@@ -69,7 +69,20 @@ restarts resume an incomplete scan and a page cap is reported as deferred rather
 than as a negative decision. One durable, time-based budget (45 requests per
 minute by default) is shared by every poller process and project for issue
 reads. Each scan reserves one issue read plus four comment pages, a boolean-only
-provider one read plus eight pages. The optional mention search uses a separate
+provider one read plus eight pages. The bucket may hold a larger burst (250
+requests by default) than its 45-per-minute refill rate, so one poll can spend
+saved tokens; the sustained quota is 2700 requests per hour, below GitHub's
+5000-per-hour ceiling. The per-poll floor covers the first `guaranteedProjects`
+entries of the fair order (at most 40, derived from the sustained refill and
+`ISSUE_ORCHESTRATOR_INTERVAL_SECONDS`), each guaranteed one worst-case check
+while the bucket holds enough tokens; a reservation must leave one check for
+each remaining guaranteed project behind it. Projects past that bound are served
+by the durable rotation in later polls, so a very large set cannot permanently
+deny the front project. The burst capacity is `max(250, guaranteedProjects *
+perCheck)` and does not grow with the raw project count. The guarantee is per
+poller without competing consumption: the intake ticker deliberately runs
+without a reserve and can spend tokens between activation polls. The optional
+mention search uses a separate
 durable rolling-window budget of 30 requests per minute, matching GitHub's
 search limit, because a token bucket of that capacity could spend a full burst
 plus its refill inside one minute; only grants whose summed cost stays within
@@ -82,8 +95,8 @@ window after their own timestamp, and both survive restarts. Reservations are
 also scheduled in durable cross-project round-robin order: a project that
 received budget (including a mention search reservation) moves behind projects
 that have waited longer, so the first configured project cannot starve later
-ones across polls, intake ticks or restarts. Expect roughly nine
-four-page scans per minute under sustained demand. Candidates beyond the
+ones across polls, intake ticks or restarts. The 45-per-minute refill still
+means roughly nine four-page scans per minute under sustained demand. Candidates beyond the
 per-pass budget are reported and retried fairly on later polls (issues opened by
 a trusted author first, then changed revisions, then least recently checked).
 Per-issue activation failures
