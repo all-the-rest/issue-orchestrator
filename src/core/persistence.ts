@@ -1149,6 +1149,15 @@ export class SQLiteStore {
    * resetting it. A denial consumes nothing and returns the earliest retry
    * time; callers must make no provider request in that case.
    *
+   * `capacity` bounds how many tokens may accumulate and thus how large a
+   * single burst may be; it is not the sustained rate. The refill stays at
+   * `limit` per `windowMs`, so a larger capacity only lets a caller spend
+   * saved tokens earlier, never exceed the long-term quota. `reserve` keeps
+   * tokens untouched for later callers: a grant is admitted only when at least
+   * `reserve` tokens remain afterwards. Polls use it to guarantee one check per
+   * project in the fair order instead of letting the first projects spend the
+   * whole burst.
+   *
    * Every granted reservation also advances a durable round-robin rotation:
    * the charged project receives the next monotonic grant sequence and
    * therefore moves behind every project that has not been served recently.
@@ -1158,13 +1167,18 @@ export class SQLiteStore {
    */
   consumeTicketActivationBudget(requests: number, options: {
     now?: number; limit: number; windowMs: number; project: string;
+    capacity?: number; reserve?: number;
   }): { granted: boolean; remaining: number; retryAt: number | null } {
     const { limit, windowMs } = options;
+    const capacity = options.capacity ?? limit;
+    const reserve = options.reserve ?? 0;
     const project = typeof options.project === 'string' ? options.project.trim().toLocaleLowerCase() : '';
     const now = options.now ?? Date.now();
     if (!Number.isSafeInteger(requests) || requests < 1 ||
         !Number.isSafeInteger(limit) || limit < 1 ||
         !Number.isSafeInteger(windowMs) || windowMs < 1 ||
+        !Number.isSafeInteger(capacity) || capacity < 1 ||
+        !Number.isSafeInteger(reserve) || reserve < 0 ||
         !Number.isSafeInteger(now) || now < 0 ||
         !project || project.length > 200) {
       throw new Error('invalid ticket activation API budget arguments');
@@ -1173,11 +1187,17 @@ export class SQLiteStore {
       const row = asSqlRow<{ tokens: number | bigint; updated_ms: number | bigint }>(
         this.db.prepare('SELECT tokens,updated_ms FROM ticket_api_budget WHERE singleton=1').get());
       const anchor = row ? Number(row.updated_ms) : now;
-      const stored = row ? Number(row.tokens) : limit;
+      // A fresh bucket starts at its full burst capacity, not at the
+      // sustained per-window limit.
+      const stored = row ? Number(row.tokens) : capacity;
       // A process whose clock is behind the persisted anchor must not inflate
       // the bucket; elapsed time is simply treated as zero until clocks agree.
       const elapsed = Math.max(0, now - anchor);
-      const tokens = Math.min(limit, stored + (elapsed * limit) / windowMs);
+      // A larger saved balance from an earlier, wider caller must not be
+      // destroyed by a later caller with a smaller capacity. Refill is still
+      // capped at the current capacity, and the balance can never grow above
+      // the highest previously persisted value.
+      const tokens = Math.min(Math.max(capacity, stored), stored + (elapsed * limit) / windowMs);
       const epsilon = 1e-9;
       const write = (value: number) => {
         this.db.prepare(`INSERT INTO ticket_api_budget(singleton,tokens,updated_ms) VALUES (1,?,?)
@@ -1188,20 +1208,21 @@ export class SQLiteStore {
       // consumption, so a crash cannot grant budget without charging the
       // rotation (or vice versa).
       const advanceRotation = () => this.advanceActivationBudgetRotation(project, Math.max(anchor, now));
-      if (requests > limit) {
-        // A reservation larger than the whole bucket could never be granted;
-        // persist refill progress and fail closed without a provider request.
+      if (requests > capacity || requests + reserve > capacity) {
+        // A reservation that cannot fit even in a full bucket (including the
+        // tokens later callers must keep) could never be granted; persist
+        // refill progress and fail closed without a provider request.
         write(tokens);
         return { granted: false, remaining: Math.floor(tokens), retryAt: null };
       }
-      if (tokens + epsilon >= requests) {
+      if (tokens + epsilon >= requests + reserve) {
         const remaining = Math.max(0, tokens - requests);
         write(remaining);
         advanceRotation();
         return { granted: true, remaining: Math.floor(remaining), retryAt: null };
       }
       write(tokens);
-      const missing = requests - tokens;
+      const missing = requests + reserve - tokens;
       return {
         granted: false,
         remaining: Math.floor(tokens),

@@ -461,7 +461,9 @@ const issues={
 const activation={
   'reisi007/alpha#1':{title:'issue opened by someone else',body:'',comments:1,commentsPage:[{body:'approved @reisi007-jr',user:{login:'reisi007',type:'User'}}]},
   'reisi007/alpha#2':{title:'no activation',body:'',comments:1,commentsPage:[{body:'hello',user:{login:'stranger',type:'User'}}]},
-  'reisinger-pictures/pictures#3':{title:'',body:'',comments:0},
+  'reisinger-pictures/pictures#3':process.env.FAKE_GH_PICTURES_MENTION==='1'
+    ?{title:'',body:'',comments:1,commentsPage:[{body:'approved @reisi007-jr',user:{login:'picture-reviewer',type:'User'}}]}
+    :{title:'',body:'',comments:0},
   'all-the-rest/issue-orchestrator#4':{title:'@reisi007-jr please',body:'',comments:0}
 };
 if(a[0]==='api'&&a[1]==='user'){
@@ -576,6 +578,53 @@ process.stderr.write('unexpected gh invocation: '+a.join(' ')+'\\n');process.exi
   ], 'the discovery account failure is content-free');
   assert.ok(accountFailureOutput.results.some((entry) => entry.project === 'reisi007/alpha'),
     'configured projects still run after discovery account verification fails');
+
+  // --- Per-poll floor: the last project in the fair order is not starved ---
+  // Seed a partially filled shared bucket. The first two projects could spend
+  // it (5 worst-case requests each) and deny the last one, which is exactly
+  // the production failure. With no served project yet, the fair-order
+  // comparator ties alphabetically: all-the-rest/issue-orchestrator, then
+  // reisi007/alpha, then reisinger-pictures/pictures. Only the actual last
+  // project carries the trusted comment mention, so the floor is what keeps
+  // its activation check alive.
+  const floorHome = path.join(cliRoot, 'runtime-floor');
+  fs.mkdirSync(floorHome, { recursive: true, mode: 0o700 });
+  fs.chmodSync(floorHome, 0o700);
+  const floorStore = new SQLiteStore(path.join(floorHome, 'orchestrator.sqlite3'));
+  // Pin the refill anchor in the future so wall-clock time cannot add tokens
+  // between seeding and the subprocess poll; the store clamps elapsed to zero.
+  floorStore.db.prepare('INSERT INTO ticket_api_budget(singleton,tokens,updated_ms) VALUES (1,?,?)')
+    .run(10, Date.now() + 60_000);
+  floorStore.close();
+  const floorClosedDay = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'][
+    (new Date().getUTCDay() + 3) % 7];
+  writeConfig({
+    ...baseConfig,
+    trusted_authors: ['picture-reviewer'],
+    tickets: {
+      quiet_period_ms: 0,
+      delivery: { timezone: 'UTC', windows: [{ days: [floorClosedDay],
+        start: '00:00', end: '23:59' }], cooldown_ms: 0 },
+    },
+    discovery: { ...baseConfig.discovery,
+      workspace_root: path.join(cliRoot, 'repositories-floor') },
+  });
+  const floorPoll = run(['tickets', 'poll'], { ISSUE_ORCHESTRATOR_HOME: floorHome,
+    FAKE_GH_PICTURES_MENTION: '1' });
+  assert.equal(floorPoll.status, 0, floorPoll.stderr || floorPoll.stdout);
+  const floorOutput = JSON.parse(floorPoll.stdout);
+  assert.ok(floorOutput.results.some((entry) => entry.project === 'all-the-rest/issue-orchestrator' &&
+    /shared activation API budget exhausted/.test(String(entry.reason))),
+  'the first project yields its check to the per-project floor');
+  assert.ok(floorOutput.results.some((entry) => entry.issue === 3 &&
+    entry.state === 'deferred' && entry.reason === 'delivery-window'),
+  'the actual last project in the fair order receives its activation check and routes its trusted mention');
+  assert.ok(!floorOutput.results.some((entry) => entry.project === 'reisinger-pictures/pictures' &&
+    /shared activation API budget exhausted/.test(String(entry.reason)) &&
+    Array.isArray(entry.issues) && entry.issues.includes(3)),
+  'the last project\'s mention candidate is not denied by the shared budget');
+  assert.ok(!floorOutput.results.some((entry) => entry.issue === 1),
+    'an earlier project without a trusted mention is not activated');
 } finally {
   fs.rmSync(root, { recursive: true, force: true });
 }

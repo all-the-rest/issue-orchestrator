@@ -17,7 +17,8 @@ import {
   type EventMetadata,
 } from './event-metadata.js';
 import { evaluateDelivery, type DeliveryDecision, type DeliverySchedule } from './delivery-window.js';
-import { checkTicketActivation, ticketActivationAdmissionPolicy } from './ticket-activation.js';
+import { ACTIVATION_API_BUDGET, checkTicketActivation,
+  ticketActivationAdmissionPolicy } from './ticket-activation.js';
 
 type TicketSnapshot = Omit<NormalizedTicket, 'updatedAt' | 'comments'>;
 type StatusName = 'started' | 'finished';
@@ -597,6 +598,11 @@ export async function runTicketHandoff(args: {
         ? { scanActivationMention: (request) => port.scanActivationMention!(request) }
         : { hasActivationMention: (request) => port.hasActivationMention!(request) }),
       now: clock,
+      // A retained-association recheck is not part of the per-poll floor. Use
+      // the sustained bucket capacity (no burst) and reserve nothing for other
+      // projects, so this path cannot silently spend the poll's burst.
+      apiBudget: { ...ACTIVATION_API_BUDGET, capacity: ACTIVATION_API_BUDGET.limit },
+      reserveTokens: 0,
     });
     if (outcome.status === 'budget') {
       return { jobId: routeJobId, sessionId: null, state: 'deferred', deferred: true, reason: 'activation-budget',
