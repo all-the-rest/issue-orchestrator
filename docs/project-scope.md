@@ -9,6 +9,9 @@ the corresponding OpenCode agent can continue the work.
 
 1. The router reads GitHub issue/PR event identities, authors, timestamps and
    URLs, then applies the configured trusted-author and tool-account filters.
+   Repositories may be explicitly configured or discovered under configured
+   owners; discovery admits only repositories the bot account can push to and
+   never widens the configured trust policy.
 2. It persists event cursors and sends only the accepted metadata to the
    persistent OpenCode session. Ticket and comment bodies are not routing
    payloads; the ticket agent fetches GitHub context itself with its configured

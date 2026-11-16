@@ -357,6 +357,83 @@ try {
   assert.equal(validation.status, 2);
   assert.match(validation.stderr, /does not exist/);
 
+  // Discovery-only configs have no repos object. The validator still checks
+  // account, inherited trusted authors, and a private writable workspace_root
+  // (or a creatable path under a writable parent) with enough free space.
+  const discoveryRoot = path.join(temporary, 'discovered-repositories');
+  fs.mkdirSync(discoveryRoot, { mode: 0o700 });
+  const discoveryConfig = {
+    model: 'openai/gpt-6.1-sol',
+    agent_runner: 'opencode',
+    accounts: ['bot'],
+    trusted_authors: ['alice'],
+    discovery: {
+      owners: ['alice', 'acme'],
+      workspace_root: discoveryRoot,
+    },
+  };
+  fs.writeFileSync(fixtureConfig, JSON.stringify(discoveryConfig, null, 2), { mode: 0o600 });
+  validation = validate();
+  assert.equal(validation.status, 0, validation.stderr);
+
+  fs.writeFileSync(fixtureConfig, JSON.stringify({
+    ...discoveryConfig,
+    accounts: ['other'],
+    discovery: { ...discoveryConfig.discovery, account: 'bot' },
+  }, null, 2), { mode: 0o600 });
+  validation = validate();
+  assert.equal(validation.status, 2);
+  assert.match(validation.stderr, /discovery\.account" must name a configured account/);
+
+  fs.writeFileSync(fixtureConfig, JSON.stringify({
+    ...discoveryConfig,
+    trusted_authors: [],
+  }, null, 2), { mode: 0o600 });
+  validation = validate();
+  assert.equal(validation.status, 2);
+  assert.match(validation.stderr, /trusted_authors/);
+
+  const notADirectory = path.join(temporary, 'discovery-root-file');
+  fs.writeFileSync(notADirectory, 'not a directory', { mode: 0o600 });
+  fs.writeFileSync(fixtureConfig, JSON.stringify({
+    ...discoveryConfig,
+    discovery: { ...discoveryConfig.discovery, workspace_root: notADirectory },
+  }, null, 2), { mode: 0o600 });
+  validation = validate();
+  assert.equal(validation.status, 2);
+  assert.match(validation.stderr, /discovery workspace_root is not a directory/);
+
+  const publicRoot = path.join(temporary, 'public-repositories');
+  fs.mkdirSync(publicRoot, { mode: 0o755 });
+  fs.chmodSync(publicRoot, 0o755);
+  fs.writeFileSync(fixtureConfig, JSON.stringify({
+    ...discoveryConfig,
+    discovery: { ...discoveryConfig.discovery, workspace_root: publicRoot },
+  }, null, 2), { mode: 0o600 });
+  validation = validate();
+  assert.equal(validation.status, 2);
+  assert.match(validation.stderr, /discovery workspace_root must be private/);
+
+  // A missing lazily-created root is accepted when its nearest existing parent
+  // is writable and has enough space; preflight must not create it.
+  const creatableRoot = path.join(temporary, 'new-parent', 'repositories');
+  fs.writeFileSync(fixtureConfig, JSON.stringify({
+    ...discoveryConfig,
+    discovery: { ...discoveryConfig.discovery, workspace_root: creatableRoot },
+  }, null, 2), { mode: 0o600 });
+  validation = validate();
+  assert.equal(validation.status, 0, validation.stderr);
+  assert.equal(fs.existsSync(creatableRoot), false, 'preflight must not create the managed workspace root');
+
+  // A discovery-only deployment that inherits enabled=false would poll nothing.
+  fs.writeFileSync(fixtureConfig, JSON.stringify({
+    ...discoveryConfig,
+    defaults: { enabled: false },
+  }, null, 2), { mode: 0o600 });
+  validation = validate();
+  assert.equal(validation.status, 2);
+  assert.match(validation.stderr, /defaults\.enabled is false, so no repository would be polled/);
+
   // The stop script verifies PID reuse, session identity and cmdline, removes
   // the pid file only after a clean stop, and never sends SIGKILL.
   const stop = fs.readFileSync(path.join(deploy, 'stop-container.sh'), 'utf8');

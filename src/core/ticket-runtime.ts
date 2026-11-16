@@ -17,7 +17,7 @@ import {
   type EventMetadata,
 } from './event-metadata.js';
 import { evaluateDelivery, type DeliveryDecision, type DeliverySchedule } from './delivery-window.js';
-import { checkTicketActivation } from './ticket-activation.js';
+import { checkTicketActivation, ticketActivationAdmissionPolicy } from './ticket-activation.js';
 
 type TicketSnapshot = Omit<NormalizedTicket, 'updatedAt' | 'comments'>;
 type StatusName = 'started' | 'finished';
@@ -97,6 +97,8 @@ interface TicketHandoffState {
   workflow?: 'route-only' | 'goal';
   /** Content-free latch: a configured activation mention was observed before first admission. */
   activationAdmitted?: boolean;
+  /** Admission digest binding the latch to the login and author allowlists. */
+  activationAdmissionPolicy?: string;
   sessionId: string | null;
   initialDispatched: boolean;
   /** Bootstrap messages already dispatched for the initial turn. */
@@ -159,6 +161,11 @@ export interface TicketRuntimePolicy {
   activationPreverified?: boolean;
   /** Listing/identity timestamp used only for the provider's in-memory mention cache. */
   activationUpdatedAt?: string | null;
+  /**
+   * Whether the issue author may activate via title/body. Discovery sets false
+   * when another user opened the issue and only a trusted comment may opt in.
+   */
+  activationIssueAuthorTrusted?: boolean;
   /** Ordered turn instructions; each entry becomes one turn in the same session. */
   bootstrap?: string[];
   systemPrompt?: string;
@@ -553,9 +560,16 @@ export async function runTicketHandoff(args: {
   const routeJobId = createHash('sha256').update(`ticket-router:${projectKey}#${issue}`).digest('hex');
   const priorRoute = policy.routeOnly ? store.readTicketHandoff(routeJobId) : null;
   const priorRouteState = priorRoute?.state as unknown as TicketHandoffState | undefined;
-  const alreadyAdmitted = priorRouteState?.activationAdmitted === true || priorRouteState?.initialDispatched === true ||
-    (typeof priorRouteState?.initialProgress === 'number' && priorRouteState.initialProgress > 0) ||
-    (typeof priorRouteState?.sessionId === 'string' && !!priorRouteState.sessionId);
+  const admissionPolicy = policy.routeOnly && policy.activationMention
+    ? ticketActivationAdmissionPolicy(policy.activationMention, policy.trustedAuthors ?? [],
+      policy.toolAuthors ?? [])
+    : null;
+  // A previous turn is not proof of admission under the current activation
+  // policy. The latch only survives if its content-free digest still matches;
+  // legacy rows without a digest, or rows from before a login was removed,
+  // fall back to the mention gate instead of routing silently.
+  const alreadyAdmitted = admissionPolicy !== null && priorRouteState?.activationAdmitted === true &&
+    priorRouteState.activationAdmissionPolicy === admissionPolicy;
   let activationAdmitted = false;
   if (policy.routeOnly && policy.activationMention && policy.activationPreverified) {
     // Discovery already proved admission under the hard per-pass budget. Persist
@@ -576,6 +590,8 @@ export async function runTicketHandoff(args: {
       login: policy.activationMention,
       trustedAuthors: policy.trustedAuthors ?? [],
       excludedAuthors: policy.toolAuthors ?? [],
+      ...(policy.activationIssueAuthorTrusted === true ? { issueAuthorTrusted: true }
+        : { issueAuthorTrusted: false }),
       store,
       ...(port.scanActivationMention
         ? { scanActivationMention: (request) => port.scanActivationMention!(request) }
@@ -643,7 +659,8 @@ export async function runTicketHandoff(args: {
     changeCursor: null as string | null, pullRequest: null, pendingPullRequest: null, retiredPullRequests: [],
     routeCursorSeeded: policy.routeOnly ? !routeSeedFailed : true,
     workflow: policy.routeOnly ? 'route-only' : 'goal',
-    ...(activationAdmitted || priorRouteState?.activationAdmitted === true ? { activationAdmitted: true } : {}),
+    ...(activationAdmitted && admissionPolicy !== null
+      ? { activationAdmitted: true, activationAdmissionPolicy: admissionPolicy } : {}),
     sessionId: null as string | null, initialDispatched: false, initialProgress: 0, state: 'active', terminal: false,
     statusKeys: { started: randomUUID(), finished: randomUUID() }, statusIds: {} as Record<string, string>,
     turns: [], pendingTurn: null, result: null, summary: '', finalStatusBody: '',
@@ -706,8 +723,10 @@ export async function runTicketHandoff(args: {
   // These pre-dispatch writes happen outside the main try/finally; release the
   // lease explicitly if they fail so a setup error cannot leak ownership.
   try {
-    if (activationAdmitted && !state.activationAdmitted) {
+    if (activationAdmitted && admissionPolicy !== null &&
+        (state.activationAdmitted !== true || state.activationAdmissionPolicy !== admissionPolicy)) {
       state.activationAdmitted = true;
+      state.activationAdmissionPolicy = admissionPolicy;
       persistState();
     }
     if (tightenedMergePolicy) persistState();

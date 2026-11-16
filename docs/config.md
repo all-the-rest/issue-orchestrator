@@ -15,7 +15,8 @@ and known token values are rejected.
 ## Current schema
 
 The following is a shape overview, not a complete copy-paste config. `model`
-and a nonempty `repos` object are required. Every repository requires `dod`
+and a nonempty `repos` object are required unless top-level `discovery` is
+configured. Every explicitly configured repository requires `dod`
 with all five command categories, a nonempty unique list of exact required
 check names, an evidence class, and an acceptance source. See
 [`providers.md`](providers.md) and the README's [DoD example](../README.md#project-definition-of-done)
@@ -24,7 +25,17 @@ for current behavior and examples.
 Top-level fields:
 
 - `model`: required `provider/model` string.
-- `repos`: required nonempty object keyed by `owner/repository`.
+- `repos`: nonempty object keyed by `owner/repository`, unless top-level
+  `discovery` supplies the repository set.
+- `discovery`: optional owner discovery for `tickets poll`. `owners` is a
+  required unique array of at most 100 GitHub logins. `account` defaults to the
+  first configured account and must name a configured account.
+  `activation_mention` defaults to that account login. `trusted_authors`
+  defaults to top-level `trusted_authors`.
+  `workspace_root` defaults to `<runtime>/repositories`.
+  `max_repositories_per_owner` defaults to `100` (range `1..1000`),
+  `max_owners_per_poll` defaults to `20` (range `1..100`), and `include_forks`
+  defaults to `false`. See [Repository discovery](#repository-discovery).
 - `agent_runner`: optional selected AgentRunner name; defaults to `opencode`.
 - `command_runner`: optional trusted executable configuration used when
   `agent_runner` is `command`; fields are `executable`, optional `args`, and
@@ -56,6 +67,7 @@ Top-level fields:
   `tickets.activation_mention` optionally names a GitHub login whose exact
   mention must activate the first ticket-agent turn; it is valid only under
   `repos.<project>.tickets`, not globally or in `defaults.tickets`.
+  Discovered repositories use `discovery.activation_mention` instead.
   `tickets.delivery` optionally restricts automated dispatches to weekly windows
   in an explicit IANA zone and sets a global start-to-start cooldown; see
   [Delivery windows and global cooldown](#delivery-windows-and-global-cooldown).
@@ -101,9 +113,13 @@ nonempty argv array or `null` to skip; commands run without a shell.
 1 through 3,600,000 (default 300,000). For `triage_comment`, current behavior
 requires exactly one marked acceptance comment from a trusted author.
 
-`tickets poll` requires a non-empty `trusted_authors` allowlist at the global or
-repository level; repository values replace the global list. It discovers
-trusted issue authors, then routes only trusted ticket/PR events. The authenticated
+`tickets poll` requires a non-empty `trusted_authors` allowlist at the discovery,
+global, or repository level; explicit repository values replace the global list,
+and discovery values replace the global list for discovered repositories. For
+configured repositories it discovers trusted issue authors; with
+`activation_mention`, an issue opened by anyone is a candidate but only a
+trusted author's activation can admit it. The router then routes only trusted
+ticket/PR events. The authenticated
 bot and configured `tool_authors` are always filtered out. `workspace` may also
 be specified as `tickets.workspace`, but not both ways for one repository.
 
@@ -121,17 +137,111 @@ login (without `@`) to activate that repository's first ticket-agent bootstrap:
 ```
 
 When configured, the exact complete `@reisi007-jr` mention (case-insensitive)
-must appear in the issue title/body or in a comment by a trusted, non-bot,
-non-tool author before the first route-only handoff is created. The issue
-author remains subject to the existing `trusted_authors` and account/tool
-exclusions. The mention is checked again during intake when the issue's
-`updatedAt` changes, so a later trusted comment can activate it. An explicit
-operator `goal` command is already affirmative and bypasses this poller gate.
-The router privately reads the text only to compute a boolean; bodies and
-mention text are not persisted, forwarded, or logged. Once admitted, the
-persistent ticket session continues to receive its normal issue, PR, merge, and
-close updates without another mention. If unset, existing dispatch behavior is
-unchanged.
+must appear before the first route-only handoff is created. A mention in the
+issue title/body counts only when the issue author is a trusted human; discovery
+marks every other opener untrusted, so an untrusted author cannot activate an
+issue by writing the bot login into its own title or body. A comment activates
+regardless of who opened the issue, but only when its author is trusted, not a
+bot, and not a configured tool/account. The mention is checked again during
+intake when the issue's `updatedAt` changes, so a later trusted comment can
+activate it. An explicit operator `goal` command is already affirmative and
+bypasses this poller gate. The router privately reads the text only to compute a
+boolean; bodies and mention text are not persisted, forwarded, or logged. Once
+admitted, the persistent ticket session continues to receive its normal issue,
+PR, merge, and close updates without another mention, as long as the admission
+digest (login plus the sorted trusted/tool allowlists) still matches the current
+policy. A policy change re-applies the gate; legacy latches without a digest are
+rechecked. If unset, existing
+dispatch behavior is unchanged.
+
+## Repository discovery
+
+Top-level `discovery` makes `tickets poll` find repositories under configured
+owners instead of requiring an explicit `repos` entry for every one:
+
+```jsonc
+"discovery": {
+  "owners": ["reisi007", "reisinger-pictures", "all-the-rest"],
+  "account": "reisi007-jr",
+  "activation_mention": "reisi007-jr",
+  "trusted_authors": ["reisi007"],
+  "workspace_root": "/var/lib/issue-orchestrator/repositories",
+  "max_repositories_per_owner": 100,
+  "max_owners_per_poll": 20,
+  "max_projects_per_poll": 10,
+  "include_forks": false
+}
+```
+
+A poll without `--project` verifies the configured account once, then lists at
+most `max_owners_per_poll` owners in durable least-recently-served order, with
+one bounded `gh repo list --limit` call per owner. Owners that do not fit are
+deferred to later polls and reported in `repository_discovery.deferred_owners`;
+a failing owner is reported and advances the rotation so it cannot block the
+rest. Of the newly discovered repositories, at most `max_projects_per_poll`
+(1–100, default 10) are polled in one pass; the rest are reported in
+`repository_discovery.deferred_projects` and rotate in by durable
+least-recently-served order on later polls and after a restart, so no project
+starves. An explicitly configured `repos.<project>` entry is always polled and
+never counts against that bound. Without this bound a large owner namespace
+would multiply every poll's and every intake tick's issue listings.
+
+Only repositories returned by that owner listing are considered. A listing entry
+whose `nameWithOwner` names a foreign or malformed owner cannot be attributed to
+the listed owner; that is a provider-integrity error, so the whole owner listing
+fails closed and is reported generically as a `repository listing failed` for
+that owner (the owner advances its rotation and is retried later), not as a
+per-repository skip. `outside-owner` in `repository_discovery.skipped` remains a
+defensive reason for a list implementation that returns a validated project for
+another owner. A repository name outside the project grammar — for example the
+special `owner/.github` repository, whose name starts with a dot — is skipped as
+`invalid-project` without failing the rest of its owner's listing. Archived,
+disabled, issue-disabled, and fork repositories (unless `include_forks` is
+`true`) are skipped, as are repositories whose authenticated `viewerPermission`
+is not `ADMIN`, `MAINTAIN`, or `WRITE`. Duplicate listing results are skipped
+rather than added twice.
+Every skip is reported by reason in `repository_discovery.skipped`. A listing
+error is reported as a generic `repository listing failed` without provider
+response text and does not stop explicitly configured projects.
+
+Discovered repositories inherit the top-level/default ticket policy, including
+`tickets.delivery`, quiet period, and the discovery `trusted_authors` and
+`activation_mention`. They also inherit `defaults.auto_merge` (default `true`),
+so a discovered repository merges autonomously once its agent reports a green
+result; the synthesized template carries `dod.required_checks: []`, so discovery
+adds no repository-specific check gate (the ticket path does not execute DoD
+gates at all). Set `defaults.auto_merge: false` if discovered repositories must
+stop at review instead, and keep in mind that `defaults.enabled: false` disables
+every discovered repository. A discovered repository needs no `dod` block; an
+explicit `repos.<project>` entry still requires it. A `repos.<project>` entry
+always wins over the discovered template, and an explicitly configured but
+disabled repository stays disabled.
+Discovery adds repositories but never removes or re-enables an operator entry.
+
+Discovered repositories use a managed private checkout under
+`workspace_root/<owner__repository>`. The base checkout is cloned lazily on the
+first dispatch with `gh repo clone`, into a unique temporary sibling that is
+verified and atomically renamed; existing directories must already be private
+Git checkouts whose origin matches the repository, and are never cloned over.
+Cloning uses the configured provider login only. It never switches accounts,
+extracts credentials, or repairs authentication; a failure is reported
+generically and leaves durable work for an operator retry. Per-issue ticket
+worktrees are created from that base as for configured repositories. Base
+checkouts and worktrees are never garbage-collected: `workspace_root` defaults
+under the runtime state directory (alongside the SQLite database) and grows with
+every discovered repository that is dispatched, so keep that volume sized for
+clones plus per-issue worktrees and prune it consciously when retiring a
+repository.
+
+`--project owner/repository` skips owner enumeration and scopes the poll to
+exactly that repository. It may name a discovered repository inside a configured
+discovery owner, which is accepted without listing the owner first; a project
+outside the discovery owners remains invalid. A `--project` poll also skips the
+discovery access gates: it checks only the owner boundary and then polls the
+named repository directly, so an operator can target a repository the listing
+would omit (archived, read-only, issues-disabled). The same applies when
+`ISSUE_ORCHESTRATOR_PROJECT` is set in the deployment: the worker passes
+`--project`, which disables owner discovery entirely for that process.
 
 When the bounded open-issue listing is saturated, the router also runs one
 bounded GitHub `mentions:<login>` search per project poll to find a late
@@ -162,8 +272,9 @@ because appends cannot alter older pages. A scan that reaches the page cap
 without a decision is reported as deferred (`activation comment scan
 incomplete`) and is never treated as a negative, so a mention deeper in a long
 thread is delayed, not silently lost. Unchecked candidates beyond the per-pass
-budget are reported as deferred and prioritized on later polls: a changed issue
-revision is checked first, then the least recently checked issue. Completed
+budget are reported as deferred and prioritized on later polls: issues opened by
+a trusted author are checked first, then a changed issue revision, then the least
+recently checked issue. Completed
 negative results are reused for the same revision for five minutes (GitHub
 timestamps have second precision); positive results are permanent and
 content-free. A per-issue activation read failure is reported, backs that issue

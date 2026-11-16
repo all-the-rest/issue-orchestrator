@@ -84,8 +84,11 @@ assert.equal(await activationPort.hasActivationMention(activationRequest), false
   'a mention embedded in another token is not accepted');
 activationIssue = { ...activationIssue, title: 'Question for @REISI007-JR!', body: '', updated_at: '2026-04-01T00:03:00Z' };
 activationRequest.updatedAt = activationIssue.updated_at;
+activationRequest.issueAuthorTrusted = true;
 assert.equal(await activationPort.hasActivationMention(activationRequest), true,
-  'the title/body accept an exact case-insensitive handle');
+  'the title/body accept an exact case-insensitive handle from a trusted issue author');
+assert.equal(await activationPort.hasActivationMention({ ...activationRequest, issueAuthorTrusted: false }), false,
+  'the same title/body mention is refused when the caller does not mark the author trusted');
 assert.equal(typeof await activationPort.hasActivationMention(activationRequest), 'boolean',
   'the detector returns only a boolean, never issue text');
 activationIssue = { ...activationIssue, title: 'Routing request', updated_at: '2026-04-01T00:04:00Z' };
@@ -519,4 +522,70 @@ try {
   delete process.env.FAKE_GH_LOG;
   fs.rmSync(fakeDir, { recursive: true, force: true });
 }
+// --- Configurable owner discovery: permission-checked repository metadata ---
+const repositoryCalls = [];
+const repositoryPort = createGithubTicketPort({
+  json(args) {
+    repositoryCalls.push(args);
+    if (args[0] === 'repo' && args[1] === 'list') {
+      return [
+        { nameWithOwner: 'reisi007/write', isPrivate: true, isArchived: false, isFork: false,
+          hasIssuesEnabled: true, viewerPermission: 'WRITE' },
+        { nameWithOwner: 'reisi007/read-only', isPrivate: false, isArchived: false, isFork: false,
+          hasIssuesEnabled: true, viewerPermission: 'READ' },
+        { nameWithOwner: 'reisi007/write', isPrivate: true, isArchived: false, isFork: false,
+          hasIssuesEnabled: true, viewerPermission: 'ADMIN' },
+      ];
+    }
+    throw new Error('unexpected repository fixture request');
+  },
+  run() {},
+});
+const repositories = await repositoryPort.listRepositories('reisi007', 50);
+assert.deepEqual(repositories.map((entry) => entry.project), ['reisi007/read-only', 'reisi007/write'],
+  'repository discovery returns bounded, access-evaluated metadata and deduplicates stable project ids');
+assert.equal(repositories.find((entry) => entry.project === 'reisi007/read-only').permission, 'READ');
+assert.equal(repositories.find((entry) => entry.project === 'reisi007/write').permission, 'WRITE');
+const repositoryArgs = repositoryCalls.find((args) => args[0] === 'repo' && args[1] === 'list');
+assert.equal(repositoryArgs[repositoryArgs.indexOf('--limit') + 1], '50');
+assert.match(repositoryArgs[repositoryArgs.indexOf('--json') + 1], /viewerPermission/);
+assert.doesNotMatch(repositoryArgs[repositoryArgs.indexOf('--json') + 1], /body|content/,
+  'repository discovery requests metadata only');
+await assert.rejects(repositoryPort.listRepositories('--injection', 50), /GitHub login/);
+await assert.rejects(repositoryPort.listRepositories('reisi007', 0), /limit/);
+const foreignOwnerPort = createGithubTicketPort({
+  json: () => [{ nameWithOwner: 'other/repo', isPrivate: false, isArchived: false, isFork: false,
+    hasIssuesEnabled: true, viewerPermission: 'WRITE' }],
+  run() {},
+});
+await assert.rejects(foreignOwnerPort.listRepositories('reisi007', 10), /repository list owner/,
+  'a provider response outside the requested owner fails closed');
+
+// --- A trusted comment, not an untrusted opener, honours an activation mention ---
+let openerIssue = { title: 'Please implement @reisi007-jr', body: 'opened by a stranger',
+  updated_at: '2026-05-01T00:00:00Z', comments: 1 };
+let openerComments = [{ body: 'no activation here', user: { login: 'stranger', type: 'User' } }];
+const openerPort = createGithubTicketPort({ json(args) {
+  if (args[0] === 'api' && args.at(-1) === 'repos/owner/repo/issues/7') return openerIssue;
+  if (args[0] === 'api' && String(args.at(-1)).startsWith('repos/owner/repo/issues/7/comments')) {
+    return [openerComments];
+  }
+  throw new Error('unexpected opener activation fixture request');
+}, run() {} });
+const openerRequest = { project: 'owner/repo', number: 7, login: 'reisi007-jr',
+  trustedAuthors: ['reisi007'], excludedAuthors: ['reisi007-jr'], updatedAt: openerIssue.updated_at,
+  issueAuthorTrusted: false };
+assert.equal(await openerPort.hasActivationMention(openerRequest), false,
+  'an untrusted opener cannot activate an issue from its title/body');
+openerComments = [{ body: 'please handle this @reisi007-jr', user: { login: 'reisi007', type: 'User' } }];
+openerIssue = { ...openerIssue, updated_at: '2026-05-01T00:01:00Z' };
+openerRequest.updatedAt = openerIssue.updated_at;
+assert.equal(await openerPort.hasActivationMention(openerRequest), true,
+  'a trusted commenter explicitly mentioning the bot activates an issue opened by someone else');
+openerComments = [{ body: 'please handle this @reisi007-jr', user: { login: 'stranger', type: 'User' } }];
+openerIssue = { ...openerIssue, updated_at: '2026-05-01T00:02:00Z' };
+openerRequest.updatedAt = openerIssue.updated_at;
+assert.equal(await openerPort.hasActivationMention(openerRequest), false,
+  'an untrusted commenter cannot activate even with the exact mention');
+
 console.log('github-ticket tests passed');

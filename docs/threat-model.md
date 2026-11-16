@@ -39,9 +39,12 @@ The OCI controls above apply only to the retained legacy `run --once` builder.
 The V1 `goal` and `tickets poll` paths are route-only, as tracked in
 [issues #61–#64](https://github.com/all-the-rest/issue-orchestrator/issues/61).
 They send event IDs/URLs, not copied ticket/comment bodies. One deliberate
-exception is the optional per-repository activation gate: the provider reads
+exception is the optional activation gate: the provider reads
 the issue title/body and comments privately to decide whether a configured
-login was mentioned by a trusted author. Only a boolean leaves that function;
+login was mentioned by a trusted author. A title/body mention is honored only
+when the issue opener is a trusted human; discovery marks any other opener
+untrusted so it cannot self-activate by writing the bot login. Only a boolean
+leaves that function;
 the text is not persisted in router state, forwarded in an event payload, or
 included in diagnostics. GitHub content remains untrusted data, and an
 activation read failure fails closed for that issue without blocking others;
@@ -57,6 +60,27 @@ latch, replace a newer revision, undo a completed scan or move a cursor
 backwards. Only content-free
 revisions, policy digests, booleans, failure counts, page numbers and token
 counts are cached durably.
+
+With an active activation gate, every open issue in an accessible repository is
+a potential activation candidate, including issues opened by untrusted users.
+That increases the set that can consume the shared activation budget. The
+per-project check cap (20 per poll), the bounded comment scan, the durable
+negative cache, and the fair cross-project rotation bound that pressure. Trusted
+issue authors are checked before untrusted openers and trust outranks a changed
+revision, so an untrusted opener cannot bump `updatedAt` to crowd trusted
+mentions out of the budget. An untrusted opener still cannot activate by title
+or body, and an exhausted budget defers work rather than dispatching it.
+
+Owner discovery is also fail-closed. It lists only repositories the configured
+account can access, admits only `ADMIN`/`MAINTAIN`/`WRITE` push capability, and
+skips archived, disabled, issue-disabled, read-only, and (by default) forked
+repositories. Listing errors are reduced to a generic diagnostic so provider
+response text cannot leak through poll output. A discovered repository gets a
+private managed checkout; an existing path is used only if it is a private Git
+checkout with the exact origin, and a failed clone is not retried with another
+account or credential. Discovery never widens trust: a discovered repository
+inherits the configured trusted authors and activation login, and an untrusted
+issue opener still cannot activate a route.
 The ticket-agent OpenCode role runs directly in the existing `code-dev`
 container without a nested OCI sandbox. It receives a private per-session copy of the configured
 GitHub CLI authentication, narrowed to the `github.com` host block, and can use

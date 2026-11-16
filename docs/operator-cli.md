@@ -84,8 +84,9 @@ received budget (including a mention search reservation) moves behind projects
 that have waited longer, so the first configured project cannot starve later
 ones across polls, intake ticks or restarts. Expect roughly nine
 four-page scans per minute under sustained demand. Candidates beyond the
-per-pass budget are reported and retried fairly on later polls (changed
-revisions first, then least recently checked). Per-issue activation failures
+per-pass budget are reported and retried fairly on later polls (issues opened by
+a trusted author first, then changed revisions, then least recently checked).
+Per-issue activation failures
 are diagnostics with a bounded retry delay and never slow the shared intake
 cadence. Persisted route-only
 handoffs with active or retained PR associations are

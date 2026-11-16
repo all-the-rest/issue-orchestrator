@@ -10,8 +10,11 @@ import {
   MAX_ACTIVATION_COMMENT_PAGES_PER_CHECK,
   activationEligibleCandidates,
   activationSearchCost,
+  checkTicketActivation,
   reserveActivationApiBudget,
   reserveActivationSearchBudget,
+  ticketActivationStateKey,
+  ticketActivationAdmissionPolicy,
   ticketHasBeenAdmitted,
   ticketRouteJobId,
 } from '../dist/core/ticket-activation.js';
@@ -41,14 +44,37 @@ assert.deepEqual(result.failures, [{ issue: 1, error: 'temporary activation read
   'the failed issue is reported for the next poll');
 
 let admittedChecks = 0;
-const admittedStore = {
+const admissionPolicy = ticketActivationAdmissionPolicy('reisi007-jr', ['human'], []);
+const legacyStore = {
   readTicketHandoff(id) {
     return id === ticketRouteJobId('owner/repo', 3)
       ? { state: { activationAdmitted: true, sessionId: 'persisted-session' } }
       : null;
   },
 };
-assert.equal(ticketHasBeenAdmitted(admittedStore, 'OWNER/RepO', 3), true,
+assert.equal(ticketHasBeenAdmitted(legacyStore, 'OWNER/RepO', 3, admissionPolicy), false,
+  'a legacy latch without a policy digest is not accepted');
+let legacyChecks = 0;
+const legacy = await activationEligibleCandidates({
+  candidates: [candidate(3, '2026-05-04T00:00:00Z')],
+  project: 'owner/repo',
+  login: 'reisi007-jr',
+  trustedAuthors: ['human'],
+  excludedAuthors: [],
+  store: legacyStore,
+  hasActivationMention: async () => { legacyChecks += 1; return false; },
+});
+assert.deepEqual(legacy.candidates, []);
+assert.equal(legacyChecks, 1, 'a legacy latch falls back to the activation gate');
+const admittedStore = {
+  readTicketHandoff(id) {
+    return id === ticketRouteJobId('owner/repo', 3)
+      ? { state: { activationAdmitted: true, activationAdmissionPolicy: admissionPolicy,
+        sessionId: 'persisted-session' } }
+      : null;
+  },
+};
+assert.equal(ticketHasBeenAdmitted(admittedStore, 'OWNER/RepO', 3, admissionPolicy), true,
   'the durable admission latch is found through a case-insensitive project key');
 const admitted = await activationEligibleCandidates({
   candidates: [candidate(3, '2026-05-04T00:00:00Z')],
@@ -156,6 +182,95 @@ assert.equal(budgeted.checks, MAX_ACTIVATION_CHECKS_PER_POLL);
 assert.deepEqual(budgeted.deferred, many.slice(MAX_ACTIVATION_CHECKS_PER_POLL).map((issue) => issue.number),
   'candidates beyond the budget are reported instead of silently dropped');
 assert.deepEqual(budgeted.candidates, [], 'no unmentioned candidate is admitted by the bounded pass');
+
+// A trusted issue author is checked before an untrusted opener, so a flood of
+// stranger-opened issues cannot spend the shared budget ahead of legitimate
+// trusted mentions. Both are unseen at the same revision, so only the author
+// trust can break the tie.
+const priorityCalls = [];
+const priorityCandidates = [
+  { ...candidate(51, '2026-05-01T00:00:00Z'), author: 'stranger', authorTrusted: false },
+  { ...candidate(52, '2026-05-01T00:00:00Z'), author: 'human', authorTrusted: true },
+];
+const prioritized = await activationEligibleCandidates({
+  candidates: priorityCandidates,
+  project: 'owner/repo',
+  login: 'reisi007-jr',
+  trustedAuthors: ['human'],
+  excludedAuthors: [],
+  maxChecks: 1,
+  now: () => 2_000,
+  hasActivationMention: async ({ number }) => { priorityCalls.push(number); return false; },
+});
+assert.deepEqual(priorityCalls, [52],
+  'the trusted issue author wins the single activation check over an untrusted opener');
+assert.deepEqual(prioritized.deferred, [51],
+  'the untrusted candidate stays deferred for a later poll');
+
+// An untrusted opener can bump `updatedAt` with an edit or comment at any time.
+// Trust must outrank the revision preference, otherwise that bump would keep
+// unchanged trusted issues out of the shared budget indefinitely.
+const attackDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ticket-activation-revision-'));
+const attackStore = new SQLiteStore(path.join(attackDir, 'attack.sqlite3'));
+try {
+  const trustedRevision = '2026-10-01T00:00:00Z';
+  const trustedLocation = ticketActivationStateKey('owner/repo', 72, 'reisi007-jr', ['human'], [], true);
+  attackStore.writeTicketActivationState({
+    key: trustedLocation.key, project: 'owner/repo', issue: 72, policy: trustedLocation.policy,
+    revision: trustedRevision, matched: false, completeRevision: null,
+    nextPage: 3, topPage: 5, checkedAt: 1_000, lastCompleteAt: null, failures: 0,
+  });
+  const attackCalls = [];
+  const attacked = await activationEligibleCandidates({
+    candidates: [
+      { ...candidate(71, '2026-10-02T00:00:00Z'), author: 'stranger', authorTrusted: false },
+      { ...candidate(72, trustedRevision), author: 'human', authorTrusted: true },
+    ],
+    project: 'owner/repo',
+    login: 'reisi007-jr',
+    trustedAuthors: ['human'],
+    excludedAuthors: [],
+    store: attackStore,
+    maxChecks: 1,
+    now: () => 1_000 + ACTIVATION_NEGATIVE_CACHE_MS + 1,
+    hasActivationMention: async ({ number }) => { attackCalls.push(number); return false; },
+  });
+  assert.deepEqual(attackCalls, [72],
+    'a trusted issue wins even when an untrusted opener bumped its revision');
+  assert.deepEqual(attacked.deferred, [71],
+    'the untrusted revision bump cannot displace the trusted candidate');
+} finally {
+  attackStore.close();
+  fs.rmSync(attackDir, { recursive: true, force: true });
+}
+
+// Fail closed: an omitted issueAuthorTrusted flag means comment-only, so a
+// future caller cannot accidentally allow title/body activation by a stranger.
+const defaultPolicy = ticketActivationStateKey('owner/repo', 9, 'reisi007-jr', ['human'], []);
+assert.deepEqual(defaultPolicy,
+  ticketActivationStateKey('owner/repo', 9, 'reisi007-jr', ['human'], [], false),
+  'the default activation state key is comment-only');
+assert.notDeepEqual(defaultPolicy,
+  ticketActivationStateKey('owner/repo', 9, 'reisi007-jr', ['human'], [], true),
+  'the author-trusted bit keeps its own policy digest');
+const defaultScanRequests = [];
+await checkTicketActivation({
+  project: 'owner/repo',
+  issue: 9,
+  updatedAt: '2026-08-01T00:00:00Z',
+  login: 'reisi007-jr',
+  trustedAuthors: ['human'],
+  excludedAuthors: [],
+  now: () => 3_000,
+  scanActivationMention: async (request) => {
+    defaultScanRequests.push(request);
+    return { matched: false, complete: true, nextPage: null,
+      revision: '2026-08-01T00:00:00Z', topPage: null };
+  },
+});
+assert.equal(defaultScanRequests.length, 1);
+assert.equal(defaultScanRequests[0].issueAuthorTrusted, false,
+  'the provider is told comment-only when the caller omits the flag');
 
 const boundsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ticket-activation-bounds-'));
 const rotationFile = path.join(boundsDir, 'activation-rotation.sqlite3');

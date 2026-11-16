@@ -2,10 +2,14 @@
 
 ## V1 ticket-to-agent path
 
-`tickets poll` watches enabled GitHub repositories for issues authored by
-configured trusted authors. A repository may set `tickets.activation_mention`
-so the first ticket-agent turn starts only after that login is explicitly
-mentioned by a trusted author in the issue title/body or a comment. The provider
+`tickets poll` watches enabled GitHub repositories for trusted issue activity.
+Repositories may be configured explicitly or found through top-level owner
+discovery, which lists only repositories the configured account can write to and
+rotates bounded owner listings durably. A repository may set
+`tickets.activation_mention` (or `discovery.activation_mention`) so the first
+ticket-agent turn starts only after that login is explicitly mentioned by a
+trusted human. An issue opened by someone else cannot activate through its title
+or body; only a trusted comment can opt it in. The provider
 privately reads those fields solely to compute an activation boolean; the text
 is not persisted, forwarded, or logged. An explicit operator `goal` command is
 already affirmative and bypasses this poller gate. The route-only `goal`
@@ -45,6 +49,16 @@ a retry time and makes no request. Granted reservations also advance a durable
 per-project rotation, so the least recently served project goes first in the
 next poll or intake tick and a saturated project cannot starve the others.
 Candidates beyond either budget rotate fairly on later polls.
+
+Owner discovery and ticket policy are separate from workspace authority.
+Discovery only synthesizes policy for repositories proven accessible and
+push-capable by the authenticated listing; explicit `repos` policy always wins.
+Discovered repositories get a private managed checkout that is cloned lazily on
+first dispatch into a temporary sibling and atomically renamed after origin
+verification. The router never reuses an operator-visible non-checkout path,
+switches accounts, or repairs provider authentication; unavailable access fails
+closed and remains an operator action. Discovery results and deferred owners are
+reported in the poll output for observability.
 
 Only trusted-author activity can start or resume a ticket chat; the authenticated
 bot and configured tool accounts are ignored. Issue comments and conversation,

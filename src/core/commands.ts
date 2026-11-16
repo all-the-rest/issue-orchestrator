@@ -8,6 +8,8 @@ import {
   loadConfig,
   repoConfig,
   enabledRepos,
+  repositoryDiscoverySettings,
+  discoveredRepoConfig,
   readState,
   readResumableLock,
   readLockByOwner,
@@ -41,7 +43,13 @@ import {
 } from './dod.js';
 import { getCodeHost, getTracker } from '../providers/index.js';
 import { githubTicket } from '../providers/github-ticket.js';
-import { activationEligibleCandidates, activationSearchCost, reserveActivationSearchBudget } from './ticket-activation.js';
+import { activationEligibleCandidates, activationSearchCost, reserveActivationSearchBudget,
+  ticketActivationAdmissionPolicy } from './ticket-activation.js';
+import {
+  discoverRepositories,
+  ensureManagedRepositoryCheckout,
+  type RepositoryDiscoveryOutcome,
+} from './ticket-repository-discovery.js';
 import type { TicketIssue } from '../providers/ticket-port.js';
 import { runTicketHandoff, type TicketDispatch } from './ticket-runtime.js';
 import {
@@ -1037,7 +1045,7 @@ function requirePositional(values, usage) {
 function cmdStatus(opts) {
   const cfg = requireConfig(opts);
   const state = readState(configFile(opts));
-  const projects = Object.keys(cfg.repos).map((project) => {
+  const projects = Object.keys(cfg.repos ?? {}).map((project) => {
     const rc = repoConfig(cfg, project);
     return {
       project,
@@ -1209,14 +1217,14 @@ function cmdProject(opts) {
   const close = findJsoncClose(text, open);
   const members = scanJsoncObject(text, open);
   if (close < 0 || !members) throw new CliError('Cannot safely parse repos object; config unchanged');
-  const has = Object.hasOwn(cfg.repos, id);
+  const has = Object.hasOwn(cfg.repos ?? {}, id);
   let replacement;
   if (action === 'add') {
     const source = String(opts.from ?? '');
-    if (has || !source || !Object.hasOwn(cfg.repos, source)) throw new CliError('project add requires a new id and --from <existing project>');
+    if (has || !source || !Object.hasOwn(cfg.repos ?? {}, source)) throw new CliError('project add requires a new id and --from <existing project>');
     if (!/^[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)+$/.test(id)) throw new CliError(`Invalid project id "${id}"`);
     // Clone a validated project and insert it beside existing entries.
-    const clone = JSON.stringify(cfg.repos[source], null, 2).replace(/^/gm, '  ');
+    const clone = JSON.stringify((cfg.repos ?? {})[source], null, 2).replace(/^/gm, '  ');
     if (!members.length) {
       if (containsJsoncComment(text.slice(open + 1, close))) throw new CliError('Comments in the empty repos object prevent a safe append; config unchanged');
       replacement = text.slice(0, open + 1) + `\n  ${JSON.stringify(id)}: ${clone}\n` + text.slice(close);
@@ -1230,7 +1238,7 @@ function cmdProject(opts) {
     }
   } else {
     if (!has) throw new CliError(`Project "${id}" is not configured`);
-    if (action === 'remove' && Object.keys(cfg.repos).length <= 1) throw new CliError('Cannot remove the last configured project');
+    if (action === 'remove' && Object.keys(cfg.repos ?? {}).length <= 1) throw new CliError('Cannot remove the last configured project');
     const projectMembers = members.filter((member) => member.key === id);
     if (projectMembers.length !== 1) throw new CliError('Cannot safely locate unique project entry; config unchanged');
     const project = projectMembers[0];
@@ -1389,7 +1397,7 @@ function findJsoncClose(text, open) {
 function cmdDoctor(opts) {
   const cfg = requireConfig(opts);
   const checks = [];
-  const repoConfigs = Object.keys(cfg.repos).map((project) => repoConfig(cfg, project));
+  const repoConfigs = Object.keys(cfg.repos ?? {}).map((project) => repoConfig(cfg, project));
   const githubAccounts = [...new Set(repoConfigs.flatMap((rc) => [
     ...(rc.tracker === 'github' && rc.tracker_account ? [rc.tracker_account] : []),
     ...(rc.code_host === 'github' && rc.code_host_account ? [rc.code_host_account] : []),
@@ -2810,10 +2818,16 @@ interface TicketCandidateDiscovery {
  */
 async function discoverTicketCandidates(cfg: TicketRouterConfig, rc: RepoRuntimeConfig,
   listed: TicketIssue[], max: number, store?: ReturnType<typeof getRuntimeStore>): Promise<TicketCandidateDiscovery> {
-  const merged = listed.filter((issue) => eligibleTicketAuthor(cfg, rc, issue.author)).slice(0, max);
+  const login = rc.tickets.activation_mention;
+  const trusted = (issue: TicketIssue) => eligibleTicketAuthor(cfg, rc, issue.author);
+  // With an activation gate, an issue opened by someone else is still a
+  // candidate: a trusted human's explicit mention can opt it in. Without the
+  // gate, the trusted-author filter remains the only admission route.
+  const merged = login
+    ? listed.slice(0, max).map((issue) => ({ ...issue, authorTrusted: trusted(issue) }))
+    : listed.filter(trusted).slice(0, max).map((issue) => ({ ...issue, authorTrusted: true }));
   let searchFailure: string | null = null;
   let searchBudgetRetryAt: number | null = null;
-  const login = rc.tickets.activation_mention;
   if (login && listed.length >= Math.min(1000, max) && githubTicket.selectMentioned) {
     const searchResults = Math.min(1000, max);
     // The search is optional enrichment; reserve its conservative worst-case
@@ -2829,10 +2843,9 @@ async function discoverTicketCandidates(cfg: TicketRouterConfig, rc: RepoRuntime
         const mentioned = await githubTicket.selectMentioned(rc.project, login, searchResults);
         const known = new Set(merged.map((issue) => issue.number));
         for (const issue of mentioned) {
-          if (known.has(issue.number) || issue.state !== 'OPEN' ||
-              !eligibleTicketAuthor(cfg, rc, issue.author)) continue;
+          if (known.has(issue.number) || issue.state !== 'OPEN') continue;
           known.add(issue.number);
-          merged.push(issue);
+          merged.push({ ...issue, authorTrusted: trusted(issue) });
         }
       } catch (error) {
         searchFailure = error instanceof Error ? error.message : String(error);
@@ -3043,7 +3056,7 @@ export function createTicketDispatch(args: {
 export function ticketPolicy(cfg: TicketRouterConfig, rc: RepoRuntimeConfig, goal: string | undefined,
   options: { routeOnly?: boolean; ticketUrl?: string; retryBlocked?: boolean; delivery?: DeliverySchedule;
     activationMention?: string | null; activationUpdatedAt?: string | null;
-    activationPreverified?: boolean } = {}): TicketRuntimePolicy {
+    activationPreverified?: boolean; activationIssueAuthorTrusted?: boolean } = {}): TicketRuntimePolicy {
   // An explicit operator goal is already an affirmative action and must not
   // wait for a poller activation mention. `null` disables the configured gate.
   const activationMention = options.activationMention === null
@@ -3060,6 +3073,8 @@ export function ticketPolicy(cfg: TicketRouterConfig, rc: RepoRuntimeConfig, goa
     ...(activationMention ? { activationMention } : {}),
     ...(options.activationPreverified ? { activationPreverified: true } : {}),
     ...(options.activationUpdatedAt !== undefined ? { activationUpdatedAt: options.activationUpdatedAt } : {}),
+    ...(options.activationIssueAuthorTrusted !== undefined
+      ? { activationIssueAuthorTrusted: options.activationIssueAuthorTrusted } : {}),
     bootstrap: rc.tickets.bootstrap,
     systemPrompt: rc.tickets.system_prompt,
     maxConcurrentSessions: rc.tickets.max_concurrency,
@@ -3284,7 +3299,17 @@ async function cmdGoal(opts: ParsedArgs) {
   return jobResult.state === 'failed' || jobResult.state === 'deferred' || jobResult.statusPending ? 1 : 0;
 }
 
-function ticketWorkspace(project: string, rc: RepoRuntimeConfig) {
+interface TicketWorkspacePlan {
+  base: string;
+  /** True when discovery owns the base checkout and may clone it on first use. */
+  managed: boolean;
+}
+
+function ticketWorkspace(project: string, rc: RepoRuntimeConfig): TicketWorkspacePlan {
+  if (rc.workspace_managed === true) {
+    if (!rc.workspace) throw new CliError(`Discovered workspace for ${project} is not configured`);
+    return { base: path.resolve(rc.workspace), managed: true };
+  }
   const base = path.resolve(rc.workspace ?? process.cwd());
   let stat: fs.Stats;
   try { stat = fs.statSync(base); } catch { throw new CliError(`OpenCode workspace for ${project} does not exist: ${base}`); }
@@ -3292,7 +3317,7 @@ function ticketWorkspace(project: string, rc: RepoRuntimeConfig) {
     throw new CliError(`OpenCode workspace for ${project} is not a Git checkout: ${base}`);
   }
   verifyOrigin(project, base);
-  return fs.realpathSync(base);
+  return { base: fs.realpathSync(base), managed: false };
 }
 
 function ticketWorktreePath(project: string, issue: number) {
@@ -3301,8 +3326,15 @@ function ticketWorktreePath(project: string, issue: number) {
   return path.join(root, `${slug}-issue-${issue}`);
 }
 
-function ensureTicketWorktree(project: string, issue: number, base: string) {
+function ensureTicketWorktree(project: string, issue: number, workspace: TicketWorkspacePlan) {
   const directory = ticketWorktreePath(project, issue);
+  const base = workspace.managed
+    ? ensureManagedRepositoryCheckout({
+      project,
+      directory: workspace.base,
+      deps: { ensurePrivateDirectory: runPrivateDirectory },
+    })
+    : workspace.base;
   if (fs.existsSync(directory)) {
     runPrivateDirectory(directory);
     if (!fs.existsSync(path.join(directory, '.git'))) {
@@ -3334,7 +3366,7 @@ async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T, index: nu
 export interface TicketProjectContext {
   project: string;
   rc: RepoRuntimeConfig;
-  base: string;
+  base: TicketWorkspacePlan;
   store: ReturnType<typeof getRuntimeStore>;
   runner: ReturnType<typeof getAgentRunner>;
   routingPort: ReturnType<typeof ticketRoutingPort>;
@@ -3347,6 +3379,8 @@ export interface TicketTask extends TicketProjectContext {
   activationUpdatedAt: string | null;
   /** Discovery in this poll proved activation; retained legacy rows may still need a check. */
   activationPreverified: boolean;
+  /** Whether the issue author may activate through title/body text. */
+  activationIssueAuthorTrusted: boolean;
   retryBlocked: boolean;
 }
 
@@ -3365,6 +3399,11 @@ async function appendKnownRouteTasks(cfg: TicketRouterConfig, context: TicketPro
   target: TicketTask[], skip?: (project: string, issue: number) => boolean) {
   const existing = new Set(target.map((task) => ticketTaskKey(task.project, task.issue)));
   const rows = context.store.listTicketHandoffs(context.project, 5000);
+  const login = context.rc.tickets.activation_mention;
+  const admissionPolicy = login
+    ? ticketActivationAdmissionPolicy(login, context.rc.trusted_authors,
+      ticketToolAuthors(cfg, context.rc))
+    : null;
   let added = 0;
   let unverified = 0;
   let rejected = 0;
@@ -3392,7 +3431,12 @@ async function appendKnownRouteTasks(cfg: TicketRouterConfig, context: TicketPro
       unverified += 1;
       continue;
     }
-    if (!eligibleTicketAuthor(cfg, context.rc, identity.author)) {
+    const admitted = admissionPolicy !== null && state.activationAdmitted === true &&
+      state.activationAdmissionPolicy === admissionPolicy;
+    if (!eligibleTicketAuthor(cfg, context.rc, identity.author) && !admitted) {
+      // Only a policy-bound durable activation latch proves that a trusted
+      // commenter explicitly opted in an issue opened by someone else. A latch
+      // from an older allowlist does not count and must pass the gate again.
       rejected += 1;
       continue;
     }
@@ -3407,7 +3451,9 @@ async function appendKnownRouteTasks(cfg: TicketRouterConfig, context: TicketPro
       ? ticket.url : identity.url;
     existing.add(ticketTaskKey(record.project, record.issue));
     target.push({ ...context, issue: record.issue, ticketUrl, activationUpdatedAt: null,
-      activationPreverified: false, retryBlocked: false });
+      activationPreverified: admitted,
+      activationIssueAuthorTrusted: eligibleTicketAuthor(cfg, context.rc, identity.author),
+      retryBlocked: false });
     added += 1;
   }
   return { added, unverified, rejected, truncated: rows.length >= 5000 };
@@ -3536,7 +3582,8 @@ export async function runIntakeTick(deps: IntakeTickDeps): Promise<boolean> {
         if (deps.knownTasks.has(key)) continue;
         deps.knownTasks.add(key);
         discovered.push({ ...context, issue: issue.number, ticketUrl: issue.url,
-          activationUpdatedAt: issue.updatedAt, activationPreverified: true, retryBlocked: false });
+          activationUpdatedAt: issue.updatedAt, activationPreverified: true,
+          activationIssueAuthorTrusted: issue.authorTrusted === true, retryBlocked: false });
       }
     } catch (error) {
       // Retained-association verification reads provider identity. A failure
@@ -3585,13 +3632,72 @@ async function cmdTickets(opts: ParsedArgs) {
     throw new CliError('--project must be owner/repository');
   }
   const cfg = requireConfig(opts);
-  const projects = opts.project ? [String(opts.project)] : enabledRepos(cfg);
   const dryRun = opts['dry-run'] === true;
+  const discoverySettings = repositoryDiscoverySettings(cfg);
+  const configuredProjects = opts.project ? [String(opts.project)] : enabledRepos(cfg);
+  const configuredByKey = new Map(Object.entries(cfg.repos ?? {})
+    .map(([project, value]) => [project.toLocaleLowerCase(), { project, value }]));
+  const discoveredConfigs = new Map<string, RepoRuntimeConfig>();
+  // An explicit --project scopes the search to one repository and therefore
+  // skips owner enumeration. It may still name a repository that discovery
+  // would have found; the owner check keeps that path inside the configured
+  // discovery boundary without trusting an arbitrary project string.
+  if (opts.project && discoverySettings && !configuredByKey.has(String(opts.project).toLocaleLowerCase())) {
+    discoveredConfigs.set(String(opts.project).toLocaleLowerCase(),
+      discoveredRepoConfig(cfg, String(opts.project), discoverySettings));
+  }
+  const projects = [...configuredProjects];
+  let repositoryDiscovery: RepositoryDiscoveryOutcome | null = null;
   const results: Array<Record<string, unknown>> = [];
   let intakeReport: Record<string, unknown> | null = null;
   let deliveryReport: Array<Record<string, unknown>> | null = null;
   let deliveryReconfiguration: Record<string, unknown> | null = null;
   let failed = false;
+  if (!opts.project && discoverySettings) {
+    if (!githubTicket.listRepositories) {
+      throw new CliError('GitHub repository discovery is unavailable in this provider');
+    }
+    // Verify the token identity once before listing. Discovery never tries a
+    // second login or repairs credentials; an access failure is reported and
+    // configured projects still proceed.
+    let discoveryAccountAvailable = true;
+    try {
+      getTracker('github').verifyAccount(discoverySettings.account);
+    } catch {
+      discoveryAccountAvailable = false;
+    }
+    let outcome: RepositoryDiscoveryOutcome;
+    if (!discoveryAccountAvailable) {
+      outcome = {
+        projects: [], checkedOwners: [], deferredOwners: [], deferredProjects: [],
+        failures: [{ owner: discoverySettings.account, error: 'repository discovery account unavailable' }],
+        skipped: [], checks: 0,
+      };
+    } else {
+      outcome = await discoverRepositories({
+        owners: discoverySettings.owners,
+        list: (owner, limit) => githubTicket.listRepositories!(owner, limit),
+        limitPerOwner: discoverySettings.max_repositories_per_owner,
+        maxOwnersPerPoll: discoverySettings.max_owners_per_poll,
+        maxProjectsPerPoll: discoverySettings.max_projects_per_poll,
+        includeForks: discoverySettings.include_forks,
+        isConfigured: (project) => configuredByKey.has(project.toLocaleLowerCase()),
+        isConfiguredEnabled: (project) => {
+          const entry = configuredByKey.get(project.toLocaleLowerCase());
+          return entry ? repoConfig(cfg, entry.project).enabled : true;
+        },
+        ...(dryRun ? {} : { store: getRuntimeStore() }),
+      });
+    }
+    repositoryDiscovery = outcome;
+    if (outcome.failures.length) failed = true;
+    for (const discovered of outcome.projects) {
+      const key = discovered.project.toLocaleLowerCase();
+      if (configuredByKey.has(key) || discoveredConfigs.has(key)) continue;
+      discoveredConfigs.set(key, discoveredRepoConfig(cfg, discovered.project, discoverySettings));
+      projects.push(discovered.project);
+    }
+  }
   const tasks: TicketTask[] = [];
   const projectContexts: TicketProjectContext[] = [];
   const taskKeyOf = ticketTaskKey;
@@ -3601,7 +3707,7 @@ async function cmdTickets(opts: ParsedArgs) {
   const fairProjects = dryRun ? [...projects] : getRuntimeStore().activationBudgetFairOrder(projects);
   for (const project of fairProjects) {
     try {
-      let rc = repoConfig(cfg, project);
+      let rc = discoveredConfigs.get(project.toLocaleLowerCase()) ?? repoConfig(cfg, project);
       if (!rc.enabled) { results.push({ project, outcome: 'SKIPPED', reason: 'disabled' }); continue; }
       rc = { ...rc, tickets: ticketSettingsWithOverrides(rc, opts) };
       const delivery = effectiveDelivery(rc, opts);
@@ -3732,7 +3838,8 @@ async function cmdTickets(opts: ParsedArgs) {
         if (known.has(key)) continue;
         known.add(key);
         tasks.push({ project, rc, base, issue: issue.number, ticketUrl: issue.url,
-          activationUpdatedAt: issue.updatedAt, activationPreverified: true, store, runner, routingPort,
+          activationUpdatedAt: issue.updatedAt, activationPreverified: true,
+          activationIssueAuthorTrusted: issue.authorTrusted === true, store, runner, routingPort,
           delivery, retryBlocked: opts['retry-blocked'] === true });
       }
       if (listFailure) results.push({ project, outcome: 'DEFERRED',
@@ -3745,17 +3852,32 @@ async function cmdTickets(opts: ParsedArgs) {
       results.push({ project, outcome: 'FAILED', error: (error as Error).message });
     }
   }
+  // The delivery cooldown is one durable, database-wide value, so every polled
+  // project must agree. Name the conflicting projects and values instead of a
+  // generic error, which is otherwise indistinguishable from a discovery fault.
+  const deliveryCooldownMismatch = (contexts: TicketProjectContext[]): string | null => {
+    const groups = new Map<number, string[]>();
+    for (const context of contexts) {
+      const projects = groups.get(context.delivery.cooldownMs) ?? [];
+      projects.push(context.project);
+      groups.set(context.delivery.cooldownMs, projects);
+    }
+    if (groups.size <= 1) return null;
+    return [...groups.entries()]
+      .map(([cooldownMs, projects]) => `${projects.join(', ')} (cooldown_ms ${cooldownMs})`)
+      .join('; ');
+  };
   // A changed cooldown needs an explicit transition because the durable row
   // pins the value every poller must agree on. The last-start anchor is
   // preserved, but the new cooldown applies to it immediately; the report
   // exposes the resulting next allowed start so a lowering is not silent.
   if (!dryRun && opts['delivery-reconfigure'] === true) {
     if (!projectContexts.length) throw new CliError('--delivery-reconfigure requires at least one enabled project');
-    const configuredCooldowns = new Set(projectContexts.map((context) => context.delivery.cooldownMs));
-    if (configuredCooldowns.size !== 1) {
-      throw new CliError('ticket delivery cooldown must be identical for every polled project');
+    const cooldownConflict = deliveryCooldownMismatch(projectContexts);
+    if (cooldownConflict) {
+      throw new CliError(`ticket delivery cooldown must be identical for every polled project: ${cooldownConflict}`);
     }
-    const cooldownMs = [...configuredCooldowns][0];
+    const cooldownMs = projectContexts[0].delivery.cooldownMs;
     try {
       const reconfigured = projectContexts[0].store.reconfigureTicketDelivery({ cooldownMs });
       deliveryReconfiguration = {
@@ -3777,9 +3899,9 @@ async function cmdTickets(opts: ParsedArgs) {
     if (configuredCaps.size !== 1) {
       throw new CliError('ticket session cap must be identical for every polled project');
     }
-    const configuredCooldowns = new Set(projectContexts.map((context) => context.delivery.cooldownMs));
-    if (configuredCooldowns.size !== 1) {
-      throw new CliError('ticket delivery cooldown must be identical for every polled project');
+    const cooldownConflict = deliveryCooldownMismatch(projectContexts);
+    if (cooldownConflict) {
+      throw new CliError(`ticket delivery cooldown must be identical for every polled project: ${cooldownConflict}`);
     }
     const ticketCap = [...configuredCaps][0];
     const deliveryReportEntries = projectContexts.map((context) => {
@@ -3818,7 +3940,8 @@ async function cmdTickets(opts: ParsedArgs) {
         await runTicketHandoff({
           port: task.routingPort, store: task.store, project: task.project, issue: task.issue,
           policy: { ...ticketPolicy(cfg, task.rc, undefined, { routeOnly: true, ticketUrl: task.ticketUrl,
-            activationUpdatedAt: task.activationUpdatedAt, activationPreverified: task.activationPreverified }),
+            activationUpdatedAt: task.activationUpdatedAt, activationPreverified: task.activationPreverified,
+            activationIssueAuthorTrusted: task.activationIssueAuthorTrusted }),
             intakeOnly: true, maxConcurrentSessions: undefined },
           dispatch: async () => { throw new Error('intake must never dispatch an agent'); },
         });
@@ -3893,6 +4016,7 @@ async function cmdTickets(opts: ParsedArgs) {
             issue: task.issue,
             policy: ticketPolicy(cfg, task.rc, undefined, { routeOnly: true, ticketUrl: task.ticketUrl,
               activationUpdatedAt: task.activationUpdatedAt, activationPreverified: task.activationPreverified,
+              activationIssueAuthorTrusted: task.activationIssueAuthorTrusted,
               retryBlocked: task.retryBlocked, delivery: task.delivery }),
             dispatch: async (request) => {
               // Lazy: capacity-deferred issues never allocate a worktree or session.
@@ -3920,6 +4044,15 @@ async function cmdTickets(opts: ParsedArgs) {
     }
   }
   console.log(JSON.stringify({ outcome: dryRun ? 'DRY_RUN' : 'POLL', results,
+    ...(repositoryDiscovery ? { repository_discovery: {
+      checked_owners: repositoryDiscovery.checkedOwners,
+      deferred_owners: repositoryDiscovery.deferredOwners,
+      projects: repositoryDiscovery.projects.map((entry) => entry.project),
+      deferred_projects: repositoryDiscovery.deferredProjects,
+      failures: repositoryDiscovery.failures,
+      skipped: repositoryDiscovery.skipped,
+      checks: repositoryDiscovery.checks,
+    } } : {}),
     ...(deliveryReport ? { delivery: deliveryReport } : {}),
     ...(deliveryReconfiguration ? { delivery_reconfiguration: deliveryReconfiguration } : {}),
     ...(intakeReport ? { intake: intakeReport } : {}) }, null, 2));
@@ -3936,13 +4069,13 @@ function runPrivateDirectory(directory: string) {
   let stat = fs.lstatSync(directory);
   if (!stat.isDirectory() || stat.isSymbolicLink() ||
       (typeof process.getuid === 'function' && stat.uid !== process.getuid())) {
-    throw new CliError(`run-once storage must be an owned, real directory: ${directory}`);
+    throw new CliError(`runtime storage must be an owned, real directory (run-once jobs, ticket worktrees and discovery checkouts): ${directory}`);
   }
   fs.chmodSync(directory, 0o700);
   stat = fs.lstatSync(directory);
   if (!stat.isDirectory() || stat.isSymbolicLink() ||
       (process.platform !== 'win32' && (stat.mode & 0o077) !== 0)) {
-    throw new CliError(`run-once storage is not private: ${directory}`);
+    throw new CliError(`runtime storage is not private (run-once jobs, ticket worktrees and discovery checkouts): ${directory}`);
   }
   return fs.realpathSync(directory);
 }
@@ -4544,7 +4677,7 @@ async function cmdRun(opts: RunCliOptions) {
   let claimBlocked = false;
   if (!dryRun) {
     const globalCap = Number((cfg as RunConfig & { max_concurrency?: number }).max_concurrency ?? 1);
-    const resumeLimits = Object.fromEntries(Object.entries(cfg.repos).map(([project, raw]) => [project, {
+    const resumeLimits = Object.fromEntries(Object.entries(cfg.repos ?? {}).map(([project, raw]) => [project, {
       maxConcurrency: globalCap,
       projectConcurrency: Number((raw as Record<string, unknown>).max_concurrency ?? globalCap),
       resourceLocks: Array.isArray((raw as Record<string, unknown>).resource_locks)
@@ -4592,7 +4725,10 @@ async function cmdRun(opts: RunCliOptions) {
         }
         throw new CliError(error.message);
       }
-      const rawRepo = cfg.repos[candidate.project] as Record<string, unknown>;
+      const rawRepo = (cfg.repos ?? {})[candidate.project] as Record<string, unknown> | undefined;
+      if (!rawRepo) {
+        throw new CliError(`Project "${candidate.project}" is not configured for run --once`);
+      }
       const globalCap = Number((cfg as RunConfig & { max_concurrency?: number }).max_concurrency ?? 1);
       const now = new Date().toISOString();
       const proposed = {

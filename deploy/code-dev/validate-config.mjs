@@ -34,8 +34,9 @@ for (const [name, value] of [
 
 let loadConfig;
 let repoConfig;
+let repositoryDiscoverySettings;
 try {
-  ({ loadConfig, repoConfig } = await import(
+  ({ loadConfig, repoConfig, repositoryDiscoverySettings } = await import(
     pathToFileURL(path.join(checkout, 'dist/core/config.js')).href
   ));
 } catch {
@@ -49,8 +50,44 @@ try {
   fail(error.message);
 }
 
-const projects = Object.keys(cfg.repos).filter((project) => repoConfig(cfg, project).enabled);
-if (projects.length === 0) fail('no enabled repositories are configured');
+function freeSpace(directory, label) {
+  let free;
+  try {
+    free = fs.statfsSync(directory);
+  } catch {
+    fail(`cannot read free space for ${label}: ${directory}`);
+  }
+  const available = Number(free.bavail) * Number(free.bsize);
+  if (available < 1024 * 1024 * 1024) {
+    fail(`${label} has less than 1 GiB free`);
+  }
+}
+
+function privateWritableDirectory(directory, label) {
+  let stat;
+  try {
+    stat = fs.lstatSync(directory);
+  } catch {
+    fail(`${label} does not exist: ${directory}`);
+  }
+  if (stat.isSymbolicLink() || !stat.isDirectory()) fail(`${label} is not a directory: ${directory}`);
+  if ((stat.mode & 0o077) !== 0) fail(`${label} must be private (mode 0700): ${directory}`);
+  try {
+    fs.accessSync(directory, fs.constants.W_OK | fs.constants.X_OK);
+  } catch {
+    fail(`${label} is not writable: ${directory}`);
+  }
+  freeSpace(directory, label);
+}
+
+const projects = Object.keys(cfg.repos ?? {}).filter((project) => repoConfig(cfg, project).enabled);
+const discovery = repositoryDiscoverySettings(cfg);
+if (projects.length === 0 && !discovery) fail('no enabled repositories are configured');
+// Discovery alone does not poll anything when the inherited default disables
+// every discovered repository; that deployment would start and idle.
+if (discovery && projects.length === 0 && cfg.defaults?.enabled === false) {
+  fail('discovery is enabled but defaults.enabled is false, so no repository would be polled');
+}
 
 for (const project of projects) {
   const rc = repoConfig(cfg, project);
@@ -76,10 +113,48 @@ for (const project of projects) {
   if (!stat.isDirectory() || !fs.existsSync(path.join(base, '.git'))) {
     fail(`workspace for ${project} is not a Git checkout: ${base}`);
   }
-  const free = fs.statfsSync(base);
-  const available = Number(free.bavail) * Number(free.bsize);
-  if (available < 1024 * 1024 * 1024) {
-    fail(`workspace filesystem for ${project} has less than 1 GiB free`);
+  freeSpace(base, `workspace filesystem for ${project}`);
+}
+
+if (discovery) {
+  const accounts = Array.isArray(cfg.accounts) ? cfg.accounts : [];
+  if (!discovery.account || !accounts.includes(discovery.account)) {
+    fail('discovery.account must name a configured account');
+  }
+  if (!Array.isArray(discovery.trusted_authors) || discovery.trusted_authors.length === 0) {
+    fail('discovery needs a non-empty trusted_authors allowlist');
+  }
+  if (typeof discovery.workspace_root !== 'string' || !path.isAbsolute(discovery.workspace_root)) {
+    fail('discovery.workspace_root must be an absolute path');
+  }
+  if (fs.existsSync(discovery.workspace_root)) {
+    privateWritableDirectory(discovery.workspace_root, 'discovery workspace_root');
+  } else {
+    // The checkout is created lazily on first dispatch. Validate that the
+    // nearest existing ancestor can hold it and has enough free space, without
+    // creating anything during preflight.
+    let parent = path.dirname(discovery.workspace_root);
+    for (;;) {
+      if (fs.existsSync(parent)) break;
+      const next = path.dirname(parent);
+      if (next === parent) fail(`discovery workspace_root has no existing parent: ${discovery.workspace_root}`);
+      parent = next;
+    }
+    let stat;
+    try {
+      stat = fs.lstatSync(parent);
+    } catch {
+      fail(`discovery workspace_root parent is unavailable: ${parent}`);
+    }
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+      fail(`discovery workspace_root parent is not a directory: ${parent}`);
+    }
+    try {
+      fs.accessSync(parent, fs.constants.W_OK | fs.constants.X_OK);
+    } catch {
+      fail(`discovery workspace_root parent is not writable: ${parent}`);
+    }
+    freeSpace(parent, 'discovery workspace_root parent');
   }
 }
 

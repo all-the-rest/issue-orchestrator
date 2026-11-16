@@ -144,16 +144,14 @@ export function ticketRouteJobId(project: string, issue: number): string {
   return createHash('sha256').update(`ticket-router:${project.toLocaleLowerCase()}#${issue}`).digest('hex');
 }
 
-/** A content-free latch; each of these durable fields proves the session was already admitted. */
-export function ticketHasBeenAdmitted(store: ActivationHandoffStore, project: string, issue: number): boolean {
-  const state = store.readTicketHandoff(ticketRouteJobId(project, issue))?.state;
-  return state?.activationAdmitted === true || state?.initialDispatched === true ||
-    (typeof state?.initialProgress === 'number' && state.initialProgress > 0) ||
-    (typeof state?.sessionId === 'string' && !!state.sessionId);
-}
-
-/** Policy digest keeps a cached boolean from crossing login or author-policy changes. */
-function policyDigest(login: string, trustedAuthors: string[], excludedAuthors: string[]): string {
+/**
+ * Content-free admission digest. It binds a durable activation latch to the
+ * login and the sorted author allowlists that justified it. The per-issue
+ * author-trust bit is deliberately excluded because a trusted commenter, not
+ * the opener, is the admitting authority.
+ */
+export function ticketActivationAdmissionPolicy(login: string, trustedAuthors: string[],
+  excludedAuthors: string[]): string {
   return createHash('sha256').update([
     login.toLocaleLowerCase(),
     ...trustedAuthors.map((author) => author.toLocaleLowerCase()).sort(),
@@ -162,9 +160,34 @@ function policyDigest(login: string, trustedAuthors: string[], excludedAuthors: 
   ].join('\u0000')).digest('hex').slice(0, 32);
 }
 
+/**
+ * A content-free latch is valid only when it still matches the current
+ * activation policy. Legacy rows without a digest do not count and are checked
+ * again, so removing a login from the allowlist cannot silently keep routing.
+ */
+export function ticketHasBeenAdmitted(store: ActivationHandoffStore, project: string, issue: number,
+  policy: string): boolean {
+  const state = store.readTicketHandoff(ticketRouteJobId(project, issue))?.state;
+  return typeof policy === 'string' && policy.length > 0 &&
+    state?.activationAdmitted === true && state.activationAdmissionPolicy === policy;
+}
+
+/** Policy digest keeps a cached boolean from crossing login or author-policy changes. */
+function policyDigest(login: string, trustedAuthors: string[], excludedAuthors: string[],
+  issueAuthorTrusted: boolean): string {
+  return createHash('sha256').update([
+    login.toLocaleLowerCase(),
+    ...trustedAuthors.map((author) => author.toLocaleLowerCase()).sort(),
+    '\u0000',
+    ...excludedAuthors.map((author) => author.toLocaleLowerCase()).sort(),
+    issueAuthorTrusted ? '\u0000author-trusted' : '\u0000comment-only',
+  ].join('\u0000')).digest('hex').slice(0, 32);
+}
+
 export function ticketActivationStateKey(project: string, issue: number, login: string,
-  trustedAuthors: string[], excludedAuthors: string[]): { key: string; policy: string } {
-  const policy = policyDigest(login, trustedAuthors, excludedAuthors);
+  trustedAuthors: string[], excludedAuthors: string[],
+  issueAuthorTrusted = false): { key: string; policy: string } {
+  const policy = policyDigest(login, trustedAuthors, excludedAuthors, issueAuthorTrusted);
   return { key: `${project.toLocaleLowerCase()}#${issue}\u0000${policy}`, policy };
 }
 
@@ -264,6 +287,8 @@ export async function checkTicketActivation(args: {
   login: string;
   trustedAuthors: string[];
   excludedAuthors: string[];
+  /** True only when the issue author may activate by title/body; omitted means false. */
+  issueAuthorTrusted?: boolean;
   store?: ActivationStateStore;
   hasActivationMention?: (request: ActivationMentionRequest) => Promise<boolean>;
   scanActivationMention?: (request: ActivationScanRequest) => Promise<ActivationScanResult>;
@@ -279,8 +304,12 @@ export async function checkTicketActivation(args: {
     MAX_ACTIVATION_COMMENT_PAGES_PER_CHECK));
   const store = args.store;
   const durable = durableStateStore(store);
+  // Fail closed: only an explicit `true` lets the issue opener's title/body
+  // activate. An omitted flag is comment-only, so a future caller cannot widen
+  // the gate by forgetting it.
+  const issueAuthorTrusted = args.issueAuthorTrusted === true;
   const location = ticketActivationStateKey(args.project, args.issue, args.login,
-    args.trustedAuthors, args.excludedAuthors);
+    args.trustedAuthors, args.excludedAuthors, issueAuthorTrusted);
   const state = durable?.readTicketActivationState(location.key) ?? null;
   // A retained association is rediscovered without an issue timestamp (the
   // listing read only fetches identity). The durable revision is then the best
@@ -338,6 +367,7 @@ export async function checkTicketActivation(args: {
         trustedAuthors: args.trustedAuthors,
         excludedAuthors: args.excludedAuthors,
         updatedAt: args.updatedAt,
+        issueAuthorTrusted,
         page: state?.nextPage ?? null,
         knownTop: state?.topPage ?? null,
         // Once any revision was scanned to the end, every page up to the saved
@@ -357,6 +387,7 @@ export async function checkTicketActivation(args: {
         trustedAuthors: args.trustedAuthors,
         excludedAuthors: args.excludedAuthors,
         updatedAt: args.updatedAt,
+        issueAuthorTrusted,
       });
       scan = { matched, complete: true, nextPage: null, revision, topPage: null };
     } else {
@@ -420,9 +451,11 @@ export async function checkTicketActivation(args: {
 /**
  * Check the activation mention per issue under a hard per-pass budget.
  *
- * Checks are ordered by a durable, content-free rotation: an issue whose
- * `updatedAt` revision changed is checked first, then the least recently
- * checked issue. An exhausted per-pass or shared API budget is reported so a
+ * Checks are ordered by a durable, content-free rotation: trusted issue authors
+ * are checked first, then an issue whose `updatedAt` revision changed, then the
+ * least recently checked issue. Trust outranks revision so an untrusted opener
+ * cannot bump its timestamp to drain the shared budget ahead of legitimate
+ * trusted mentions. An exhausted per-pass or shared API budget is reported so a
  * later poll continues fairly instead of silently skipping candidates. Comment
  * scans are bounded and their descending page cursor is durable, so a mention
  * deeper in a long (and attacker-amplifiable) thread is reachable across polls
@@ -459,17 +492,19 @@ export async function activationEligibleCandidates(args: {
     MAX_ACTIVATION_CHECKS_PER_POLL));
   const store = args.store;
   const durable = durableStateStore(store);
+  const admissionPolicy = ticketActivationAdmissionPolicy(args.login, args.trustedAuthors,
+    args.excludedAuthors);
 
   type Pending = { issue: TicketIssue; state: ActivationStateRecord | null; revisionChanged: boolean };
   const pending: Pending[] = [];
   for (const issue of args.candidates) {
-    if (store && ticketHasBeenAdmitted(store, args.project, issue.number)) {
+    if (store && ticketHasBeenAdmitted(store, args.project, issue.number, admissionPolicy)) {
       result.candidates.push(issue);
       continue;
     }
     const revision = issue.updatedAt ?? '';
     const location = ticketActivationStateKey(args.project, issue.number, args.login,
-      args.trustedAuthors, args.excludedAuthors);
+      args.trustedAuthors, args.excludedAuthors, issue.authorTrusted === true);
     const state = durable?.readTicketActivationState(location.key) ?? null;
     if (state?.matched) {
       result.candidates.push(issue);
@@ -486,10 +521,14 @@ export async function activationEligibleCandidates(args: {
     pending.push({ issue, state, revisionChanged: !state || state.revision !== revision });
   }
 
-  // Revision changes win, then least-recently checked, then issue number. The
-  // stable order means every candidate is eventually reached even when the
-  // budget is smaller than the candidate set.
+  // Trusted issue authors go first, then revision changes, then least-recently
+  // checked, then issue number. Trust is the top priority: an untrusted opener
+  // can bump `updatedAt` with an edit or comment at any time, and a revision
+  // preference would let it crowd unchanged trusted issues out of the shared
+  // budget indefinitely. The stable remainder means every candidate is
+  // eventually reached.
   pending.sort((a, b) =>
+    Number(b.issue.authorTrusted === true) - Number(a.issue.authorTrusted === true) ||
     Number(b.revisionChanged) - Number(a.revisionChanged) ||
     (a.state?.checkedAt ?? 0) - (b.state?.checkedAt ?? 0) ||
     a.issue.number - b.issue.number);
@@ -505,6 +544,9 @@ export async function activationEligibleCandidates(args: {
       login: args.login,
       trustedAuthors: args.trustedAuthors,
       excludedAuthors: args.excludedAuthors,
+      ...(entry.issue.authorTrusted === true
+        ? { issueAuthorTrusted: true }
+        : { issueAuthorTrusted: false }),
       ...(store ? { store } : {}),
       ...(args.scanActivationMention ? { scanActivationMention: args.scanActivationMention } : {}),
       ...(args.hasActivationMention ? { hasActivationMention: args.hasActivationMention } : {}),
