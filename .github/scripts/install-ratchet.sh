@@ -7,7 +7,7 @@ fail() {
 }
 
 version="${RATCHET_VERSION:-}"
-[[ "$version" == v0.6.3 ]] || fail "unsupported Ratchet version '${version:-}' (expected v0.6.3)"
+[[ "$version" == v0.8.0 ]] || fail "unsupported Ratchet version '${version:-}' (expected v0.8.0)"
 version="${version#v}"
 
 case "${RUNNER_OS:-}" in
