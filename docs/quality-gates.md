@@ -21,17 +21,22 @@ actual check-run names emitted by `.github/workflows/ci.yml`.
 
 ## Run Ratchet locally
 
-When Ratchet v0.6.3 is installed, run:
+When Ratchet v0.8.0 is installed, run:
 
 ```sh
-ratchet check --config=ratchet.config.jsonc --tier=fast
+ratchet check --config=ratchet.config.jsonc --tier=fast --no-ratchet
 ```
 
-CI pins Ratchet at v0.6.3, installs its platform binary through
+CI pins Ratchet at v0.8.0, installs its platform binary through
 `.github/scripts/install-ratchet.sh` with checksum verification, and appends a
-Markdown report to the Actions job summary after a successful check. If the CLI
-is unavailable or a different version is installed, CI is authoritative; merge
-only after every required context is green.
+Markdown report to the Actions job summary after a successful check. The
+`--no-ratchet` flag keeps the check a dry run: CI must not write a tightened
+baseline into the tree. A rule whose limit is a constant (an architectural
+limit rather than debt) carries an explicit `"baseline": "fixed"` in
+`ratchet.config.jsonc`; debt and test-count rules stay on the default `auto`
+and tighten on a green run. If the CLI is unavailable or a different version is
+installed, CI is authoritative; merge only after every required context is
+green.
 
 ## Baseline changes
 

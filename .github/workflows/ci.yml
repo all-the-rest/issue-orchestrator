@@ -66,13 +66,13 @@ jobs:
       - name: Install pinned Ratchet CLI
         env:
           GH_TOKEN: ${{ github.token }}
-          RATCHET_VERSION: v0.6.3
+          RATCHET_VERSION: v0.8.0
         run: bash .github/scripts/install-ratchet.sh
       - name: Validate gates
         id: ratchet
         env:
           RATCHET_NO_UPDATE_CHECK: '1'
-        run: ratchet check --config=ratchet.config.jsonc --tier=fast
+        run: ratchet check --config=ratchet.config.jsonc --tier=fast --no-ratchet
       - name: Render the report
         if: always() && steps.ratchet.outcome == 'success'
         shell: bash
